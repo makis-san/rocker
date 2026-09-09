@@ -17,8 +17,10 @@ finish-args:
   - --device=dri
   # Network access for Docker API
   - --share=network
-  # Docker socket access
-  - --filesystem=/var/run/docker.sock
+  # Docker socket access (must be /run, not /var/run: bwrap's symlink setup
+  # for /var/run conflicts with a --filesystem path that traverses through
+  # it on some hosts, e.g. https://github.com/flatpak/flatpak/issues/3477)
+  - --filesystem=/run/docker.sock
   # Home directory access for Docker config
   - --filesystem=home/.docker:create
   # NOTE: rocker-secrets is currently an in-memory stub (real keyring/
