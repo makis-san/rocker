@@ -1,0 +1,29 @@
+[package]
+name = "rocker"
+description = "Rocker: a native desktop client for the Docker Engine API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+default-run = "rocker"
+
+[package.metadata.wix]
+upgrade-guid = "09C61034-1A38-42C6-A46E-5D93A3A4F798"
+path-guid = "1035E96C-4E12-405E-89FA-92FF9D32625D"
+license = false
+eula = false
+
+[[bin]]
+name = "rocker"
+path = "src/main.rs"
+
+[dependencies]
+rocker-ui = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+eframe = "0.33.3"
+egui = "0.33.3"
+tokio = "1.53.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

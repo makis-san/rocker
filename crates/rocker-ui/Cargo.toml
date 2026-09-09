@@ -1,0 +1,23 @@
+[package]
+name = "rocker-ui"
+description = "egui widgets, panels, layout, and style for Rocker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rocker-core = { workspace = true }
+rocker-engine = { workspace = true }
+rocker-store = { workspace = true }
+rocker-term = { workspace = true }
+rocker-theme = { workspace = true }
+eframe = "0.33.3"
+egui = "0.33.3"
+tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Drives the real engine while the `screenshot` example captures a frame.
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread"] }

@@ -1,0 +1,12 @@
+[package]
+name = "rocker-ext-api"
+description = "Extension surface: capabilities, manifest, and the declarative UI node tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

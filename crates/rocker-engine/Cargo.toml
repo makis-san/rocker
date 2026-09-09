@@ -1,0 +1,17 @@
+[package]
+name = "rocker-engine"
+description = "Docker Engine API client, connection manager, and event bus."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bollard = "0.21.1"
+rocker-core = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net"] }
+tracing = { workspace = true }

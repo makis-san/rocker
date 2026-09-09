@@ -1,0 +1,13 @@
+[package]
+name = "rocker-ext-host"
+description = "Supervised extension host: rhai and wasmtime runtimes, capability gate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rocker-ext-api = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

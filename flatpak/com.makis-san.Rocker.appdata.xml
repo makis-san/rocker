@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.makis-san.Rocker</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+
+  <name>Rocker</name>
+  <summary>A native desktop client for the Docker Engine API</summary>
+
+  <description>
+    <p>
+      Rocker is a native, performant desktop client for managing Docker containers,
+      images, volumes, and networks. Built with Rust and egui for a fast, responsive
+      experience across Linux, macOS, and Windows.
+    </p>
+    <p>
+      Features include:
+    </p>
+    <ul>
+      <li>Container management with real-time logs</li>
+      <li>Image browsing and management</li>
+      <li>Volume and network configuration</li>
+      <li>Native performance with minimal resource usage</li>
+      <li>Cross-platform support (Linux, macOS, Windows)</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.makis-san.Rocker.desktop</launchable>
+
+  <url type="homepage">https://github.com/makis-san/rocker</url>
+  <url type="bugtracker">https://github.com/makis-san/rocker/issues</url>
+  <url type="vcs-browser">https://github.com/makis-san/rocker</url>
+
+  <developer id="com.makis-san">
+    <name>Rocker contributors</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.0.0" date="2026-01-01">
+      <description>
+        <p>Initial release of Rocker.</p>
+      </description>
+    </release>
+  </releases>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#ffffff</color>
+    <color type="primary" scheme_preference="dark">#1e1e1e</color>
+  </branding>
+</component>

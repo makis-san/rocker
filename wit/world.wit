@@ -1,0 +1,73 @@
+// Rocker component-extension world (PLAN §5.5, Phase 5b).
+//
+// Sketch, not frozen. Imports are capability-gated: the host only satisfies the
+// interfaces an extension was granted at install time. Extensions never run
+// render code against the immediate-mode UI; `render-panel` returns a
+// declarative node tree the host draws.
+
+package rocker:extension@0.1.0;
+
+interface types {
+    enum lifecycle-action {
+        start,
+        stop,
+        restart,
+        pause,
+        unpause,
+        kill,
+    }
+
+    record container {
+        id: string,
+        name: string,
+        image: string,
+        state: string,
+        status: string,
+    }
+
+    enum toast-level {
+        info,
+        warn,
+        error,
+    }
+
+    // Declarative UI: a JSON-encoded node tree (see rocker-ext-api::UiNode).
+    // Kept as a string in the sketch to avoid churning the WIT while the
+    // vocabulary is still driven by real extension needs.
+    type ui-node = string;
+    type ui-context = string;
+}
+
+interface containers {
+    use types.{container, lifecycle-action};
+
+    list: func() -> list<container>;
+    lifecycle: func(id: string, action: lifecycle-action) -> result<_, string>;
+    logs-tail: func(id: string, lines: u32) -> list<string>;
+}
+
+interface storage {
+    get: func(key: string) -> option<string>;
+    set: func(key: string, value: string);
+    delete: func(key: string);
+}
+
+interface notify {
+    use types.{toast-level};
+
+    toast: func(level: toast-level, text: string);
+}
+
+interface events {
+    subscribe: func(kinds: list<string>);
+}
+
+world rocker-extension {
+    import containers;
+    import storage;
+    import notify;
+    import events;
+
+    export activate: func();
+    export render-panel: func(ctx: string) -> string;
+}

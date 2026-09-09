@@ -1,0 +1,11 @@
+[package]
+name = "rocker-term"
+description = "VT parser and Docker-exec backend for the in-app terminal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

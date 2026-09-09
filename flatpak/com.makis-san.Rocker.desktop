@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Rocker
+GenericName=Docker Desktop Client
+Comment=A native desktop client for the Docker Engine API
+Exec=rocker %F
+Icon=com.makis-san.Rocker
+Terminal=false
+Categories=Development;Utility;System;
+Keywords=docker;container;desktop;engine;
+StartupWMClass=rocker
+MimeType=x-scheme-handler/docker;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=rocker

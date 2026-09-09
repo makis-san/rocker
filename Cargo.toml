@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rocker-core",
+    "crates/rocker-engine",
+    "crates/rocker-store",
+    "crates/rocker-secrets",
+    "crates/rocker-term",
+    "crates/rocker-theme",
+    "crates/rocker-ext-api",
+    "crates/rocker-ext-host",
+    "crates/rocker-ui",
+    "crates/rocker",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/makis-san/rocker"
+authors = ["Rocker contributors"]
+
+[workspace.dependencies]
+# Internal crates
+rocker-core = { path = "crates/rocker-core" }
+rocker-engine = { path = "crates/rocker-engine" }
+rocker-store = { path = "crates/rocker-store" }
+rocker-secrets = { path = "crates/rocker-secrets" }
+rocker-term = { path = "crates/rocker-term" }
+rocker-theme = { path = "crates/rocker-theme" }
+rocker-ext-api = { path = "crates/rocker-ext-api" }
+rocker-ext-host = { path = "crates/rocker-ext-host" }
+rocker-ui = { path = "crates/rocker-ui" }
+
+# Shared third-party (versions resolved by `cargo add`, see each crate)
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
