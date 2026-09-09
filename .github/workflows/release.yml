@@ -291,9 +291,16 @@ jobs:
       GITHUB_EMAIL: "admin+bot@axo.dev"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
+      # persist-credentials must be true here: cargo-dist 0.28.7's generator
+      # emits `false`, which drops the token before the `git push` below runs
+      # ("could not read Username for 'https://github.com'"). Fixed upstream
+      # in cargo-dist's template past 0.28.7 (still true as of 0.32.0); revert
+      # this hand-patch once dist-workspace.toml's cargo-dist-version is
+      # bumped past the fix and `cargo xtask dist generate --mode=ci` emits
+      # `true` on its own.
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          persist-credentials: true
           repository: "makis-san/homebrew-tap"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       # So we have access to the formula
