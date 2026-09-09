@@ -197,6 +197,7 @@ mod budgets {
                 ".msi",
                 ".pkg",
                 ".deb",
+                ".rpm",
                 ".AppImage",
             ]
             .iter()

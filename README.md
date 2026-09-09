@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/rocker-logo.png" alt="Rocker" width="128" />
+  <img src="assets/icon-1024.png" alt="Rocker" width="128" />
 </p>
 
 <h1 align="center">Rocker</h1>
@@ -58,24 +58,50 @@ progress. The config format may change before `1.0`.
 
 ## Installation
 
-### Prebuilt binaries
-
-Download the archive for your platform from the
-[latest release](https://github.com/makis-san/rocker/releases/latest), or use the
-installer script:
+### macOS / Linux
 
 ```sh
-# Linux / macOS
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/makis-san/rocker/releases/latest/download/rocker-installer.sh | sh
 ```
 
+Or via Homebrew (macOS and Linux):
+
+```sh
+brew install makis-san/tap/rocker
+```
+
+### Linux: GNOME / KDE app menu
+
+The shell installer and Homebrew both drop a bare `rocker` binary on `PATH`.
+For a proper desktop-menu entry (icon, launcher, `.desktop` file), grab the
+`.deb` or `.rpm` from the [latest release](https://github.com/makis-san/rocker/releases/latest)
+instead:
+
+```sh
+# Debian / Ubuntu
+sudo dpkg -i rocker-x86_64-unknown-linux-gnu.deb
+
+# Fedora / openSUSE
+sudo rpm -i rocker-x86_64-unknown-linux-gnu.rpm
+```
+
+(swap in the `aarch64` artifact on ARM64.) A Flatpak manifest also exists in
+[`flatpak/`](flatpak/) for a future Flathub submission.
+
+### Windows
+
 ```powershell
-# Windows
 powershell -c "irm https://github.com/makis-san/rocker/releases/latest/download/rocker-installer.ps1 | iex"
 ```
 
-A Windows `.msi` is also attached to each release.
+A `.msi` is also attached to each release for a normal installer experience.
+
+### Prebuilt archives
+
+Plain `.tar.xz` (macOS/Linux) and `.zip` (Windows) archives for every target
+are on the [latest release](https://github.com/makis-san/rocker/releases/latest)
+page, if you'd rather place the binary yourself.
 
 ### From source
 
@@ -117,6 +143,9 @@ cargo clippy --workspace     # lint
 cargo fmt --all --check      # check formatting
 cargo xtask budgets          # check performance budgets
 ```
+
+See [`RELEASING.md`](RELEASING.md) for how tagged releases build and publish
+the installers above.
 
 ### Workspace
 

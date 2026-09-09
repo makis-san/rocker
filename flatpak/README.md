@@ -36,19 +36,32 @@ flatpak run com.makis-san.Rocker
 
 ## Submitting to Flathub
 
-1. Fork the [flathub repository](https://github.com/flathub/flathub)
-2. Create a new directory: `com.makis-san.Rocker`
-3. Copy these files into the directory
-4. Generate and include `cargo-sources.json`
-5. Create a Pull Request
+Flathub builds manifests from a *separate* per-app repository, not from a
+subfolder of this one, so:
+
+1. Fork the [flathub repository](https://github.com/flathub/flathub) and open a
+   PR that adds a new `com.makis-san.Rocker` entry pointing at this repo (see
+   Flathub's [app submission guide](https://docs.flathub.org/docs/for-app-authors/submission))
+2. Once accepted, Flathub gives you a `flathub/com.makis-san.Rocker` repo — copy
+   `com.makis-san.Rocker.yml` there (updated to build from a pinned git tag
+   instead of `type: dir`) plus a generated `cargo-sources.json`
+3. Flathub's own CI builds and publishes it from there; this directory stays the
+   source of truth for local testing and manifest changes
+
+Once published, end users install with:
+
+```sh
+flatpak install flathub com.makis-san.Rocker
+```
 
 ## Files
 
 - `com.makis-san.Rocker.yml` - Flatpak manifest
-- `com.makis-san.Rocker.appdata.xml` - AppStream metadata
-- `com.makis-san.Rocker.desktop` - Desktop entry file
 - `generate-sources.sh` - Script to generate cargo sources
 - `cargo-sources.json` - Generated cargo dependencies (not in repo)
+
+The desktop entry and AppStream metadata are shared with the `.deb`/`.rpm`
+packages and live in [`../packaging/linux/`](../packaging/linux/).
 
 ## Notes
 

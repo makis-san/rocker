@@ -8,12 +8,22 @@ cargo-dist-version = "0.28.7"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "powershell", "msi"]
+installers = ["shell", "powershell", "msi", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+targets = [
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# Homebrew tap dist publishes formula updates to (see RELEASING.md, part 1)
+tap = "makis-san/homebrew-tap"
+# Push the Homebrew formula on every stable release
+publish-jobs = ["homebrew"]

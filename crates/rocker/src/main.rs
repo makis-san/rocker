@@ -7,6 +7,9 @@
 
 use anyhow::Context as _;
 
+/// App icon shown in the window title bar, taskbar/dock, and Alt-Tab switcher.
+const ICON_PNG_BYTES: &[u8] = include_bytes!("../../../assets/icon-1024.png");
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -24,11 +27,15 @@ fn main() -> anyhow::Result<()> {
         .context("build tokio runtime")?;
     let handle = runtime.handle().clone();
 
+    let icon =
+        eframe::icon_data::from_png_bytes(ICON_PNG_BYTES).expect("bundled app icon is a valid PNG");
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rocker")
             .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([560.0, 360.0]),
+            .with_min_inner_size([560.0, 360.0])
+            .with_icon(icon),
         ..Default::default()
     };
 

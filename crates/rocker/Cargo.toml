@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 default-run = "rocker"
 
@@ -14,6 +15,37 @@ upgrade-guid = "09C61034-1A38-42C6-A46E-5D93A3A4F798"
 path-guid = "1035E96C-4E12-405E-89FA-92FF9D32625D"
 license = false
 eula = false
+
+# `cargo deb -p rocker` (built from the workspace root; see
+# .github/workflows/linux-packages.yml). Desktop entry, AppStream metadata and
+# icon are shared with the Flatpak build (../../packaging/linux/).
+[package.metadata.deb]
+maintainer = "Rocker contributors <noreply@github.com>"
+copyright = "2026, Rocker contributors"
+license-file = ["../../LICENSE-MIT", "0"]
+extended-description = """\
+Rocker is a native desktop client for the Docker Engine API: container \
+lifecycle management, streaming logs and stats, an interactive exec shell, \
+and container groups, with no webview and no bundled Chromium."""
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/rocker", "usr/bin/", "755"],
+    ["../../packaging/linux/com.makis-san.Rocker.desktop", "usr/share/applications/com.makis-san.Rocker.desktop", "644"],
+    ["../../packaging/linux/com.makis-san.Rocker.appdata.xml", "usr/share/metainfo/com.makis-san.Rocker.appdata.xml", "644"],
+    ["../../assets/icon-1024.png", "usr/share/icons/hicolor/512x512/apps/com.makis-san.Rocker.png", "644"],
+]
+
+# `cargo generate-rpm -p crates/rocker` (built from the workspace root).
+[package.metadata.generate-rpm]
+license = "MIT OR Apache-2.0"
+assets = [
+    { source = "target/release/rocker", dest = "/usr/bin/rocker", mode = "755" },
+    { source = "packaging/linux/com.makis-san.Rocker.desktop", dest = "/usr/share/applications/com.makis-san.Rocker.desktop", mode = "644" },
+    { source = "packaging/linux/com.makis-san.Rocker.appdata.xml", dest = "/usr/share/metainfo/com.makis-san.Rocker.appdata.xml", mode = "644" },
+    { source = "assets/icon-1024.png", dest = "/usr/share/icons/hicolor/512x512/apps/com.makis-san.Rocker.png", mode = "644" },
+]
 
 [[bin]]
 name = "rocker"

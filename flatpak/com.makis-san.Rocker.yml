@@ -21,11 +21,8 @@ finish-args:
   - --filesystem=/var/run/docker.sock
   # Home directory access for Docker config
   - --filesystem=home/.docker:create
-  # D-Bus access for desktop integration
+  # Session D-Bus, for the secret-service credential store (rocker-secrets)
   - --session-bus
-  - --system-bus
-  # Environment variables for EGL/GPU
-  - --env=DISPLAY=:0
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
@@ -39,11 +36,11 @@ modules:
   - name: rocker
     buildsystem: simple
     build-commands:
-      - cargo --offline build --release --target-dir=target
+      - cargo --offline build --release -p rocker --target-dir=target
       - install -Dm755 target/release/rocker /app/bin/rocker
-      - install -Dm644 flatpak/com.makis-san.Rocker.desktop /app/share/applications/com.makis-san.Rocker.desktop
-      - install -Dm644 flatpak/com.makis-san.Rocker.appdata.xml /app/share/metainfo/com.makis-san.Rocker.appdata.xml
-      - install -Dm644 assets/rocker-logo.png /app/share/icons/hicolor/256x256/apps/com.makis-san.Rocker.png
+      - install -Dm644 packaging/linux/com.makis-san.Rocker.desktop /app/share/applications/com.makis-san.Rocker.desktop
+      - install -Dm644 packaging/linux/com.makis-san.Rocker.appdata.xml /app/share/metainfo/com.makis-san.Rocker.appdata.xml
+      - install -Dm644 assets/icon-1024.png /app/share/icons/hicolor/512x512/apps/com.makis-san.Rocker.png
     sources:
       - type: dir
         path: ..
