@@ -8,6 +8,40 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-09
+
+### Changed
+
+- App-id renamed from `com.makis-san.Rocker` to `io.github.makis_san.Rocker`
+  across the `.desktop` file, AppStream metainfo, and `.deb`/`.rpm`/Flatpak
+  packaging — required for Flathub submission, which only accepts app-ids
+  whose domain the submitter can verify (GitHub-hosted projects without a
+  custom domain use the `io.github.<user>` form)
+- Icon installed by `.deb`/`.rpm`/Flatpak into `hicolor/512x512/apps/` is now
+  an actual 512×512 PNG (`assets/icon-512.png`) instead of the 1024×1024
+  source scaled by the desktop environment at runtime; `flatpak-builder`
+  validates icon dimensions against their directory and rejects the mismatch
+
+### Added
+
+- Flatpak manifest (`flatpak/io.github.makis_san.Rocker.yml`) now builds from
+  a pinned git tag with vendored cargo sources instead of a local directory,
+  installs license files, and bumped the runtime to freedesktop 25.08 (24.08's
+  `rust-stable` SDK extension ships rustc 1.89, below this workspace's
+  `rust-version = "1.90"`); verified with a full offline `flatpak-builder`
+  build, appstream validation, and local install
+- AppStream metainfo now lists real release history (0.0.1, 0.1.0) instead of
+  a placeholder `0.0.0` entry
+
+### Fixed
+
+- Flatpak manifest's `--session-bus` finish-arg was invalid syntax (the
+  correct form doesn't take a bare flag) and, moreover, unused: the
+  secret-service credential store it was added for (`rocker-secrets`) is
+  currently an in-memory stub with no real keyring backend yet. Removed
+  rather than fixed, since Flathub review flags unused permissions; revisit
+  with a scoped `--talk-name=org.freedesktop.secrets` once that backend lands
+
 ## [0.1.0] - 2026-09-09
 
 ### Added

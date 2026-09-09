@@ -24,39 +24,48 @@ cargo2flatpak --manifest-path=../Cargo.lock --output=cargo-sources.json
 ### 2. Build the App
 
 ```bash
-flatpak-builder --force-clean build-dir com.makis-san.Rocker.yml
+flatpak-builder --force-clean build-dir io.github.makis_san.Rocker.yml
 ```
 
 ### 3. Test Locally
 
 ```bash
-flatpak-builder --user --install --force-clean build-dir com.makis-san.Rocker.yml
-flatpak run com.makis-san.Rocker
+flatpak-builder --user --install --force-clean build-dir io.github.makis_san.Rocker.yml
+flatpak run io.github.makis_san.Rocker
 ```
 
 ## Submitting to Flathub
 
 Flathub builds manifests from a *separate* per-app repository, not from a
-subfolder of this one, so:
+subfolder of this one, so the initial submission PR must already carry the
+final manifest (`type: git`, pinned to a real tag — not `type: dir`, which is
+for local testing only):
 
-1. Fork the [flathub repository](https://github.com/flathub/flathub) and open a
-   PR that adds a new `com.makis-san.Rocker` entry pointing at this repo (see
-   Flathub's [app submission guide](https://docs.flathub.org/docs/for-app-authors/submission))
-2. Once accepted, Flathub gives you a `flathub/com.makis-san.Rocker` repo — copy
-   `com.makis-san.Rocker.yml` there (updated to build from a pinned git tag
-   instead of `type: dir`) plus a generated `cargo-sources.json`
-3. Flathub's own CI builds and publishes it from there; this directory stays the
-   source of truth for local testing and manifest changes
+1. Fork [flathub/flathub](https://github.com/flathub/flathub) with "Copy the
+   master branch only" unchecked, then clone your fork on the `new-pr` branch:
+   `git clone --branch=new-pr git@github.com:<you>/flathub.git`
+2. Create a feature branch off `new-pr`, add a new `io.github.makis_san.Rocker/`
+   directory containing `io.github.makis_san.Rocker.yml` (pinned to a tag of
+   this repo) and `cargo-sources.json`, and commit
+3. Open a PR **against the `new-pr` base branch** (not `master`), titled
+   `Add io.github.makis_san.Rocker` (see Flathub's
+   [submission guide](https://docs.flathub.org/docs/for-app-authors/submission))
+4. Reviewers may request changes; comment `bot, build` once addressed to
+   trigger a test build
+5. Once approved, Flathub merges into a new repo under the Flathub org and
+   invites you with write access (accept within a week, 2FA required); that
+   repo becomes the permanent source of truth for the published manifest —
+   this directory stays for local testing and preparing manifest changes
 
 Once published, end users install with:
 
 ```sh
-flatpak install flathub com.makis-san.Rocker
+flatpak install flathub io.github.makis_san.Rocker
 ```
 
 ## Files
 
-- `com.makis-san.Rocker.yml` - Flatpak manifest
+- `io.github.makis_san.Rocker.yml` - Flatpak manifest
 - `generate-sources.sh` - Script to generate cargo sources
 - `cargo-sources.json` - Generated cargo dependencies (not in repo)
 

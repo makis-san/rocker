@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.makis-san.Rocker</id>
+  <id>io.github.makis_san.Rocker</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
 
@@ -25,20 +25,25 @@
     </ul>
   </description>
 
-  <launchable type="desktop-id">com.makis-san.Rocker.desktop</launchable>
+  <launchable type="desktop-id">io.github.makis_san.Rocker.desktop</launchable>
 
   <url type="homepage">https://github.com/makis-san/rocker</url>
   <url type="bugtracker">https://github.com/makis-san/rocker/issues</url>
   <url type="vcs-browser">https://github.com/makis-san/rocker</url>
 
-  <developer id="com.makis-san">
+  <developer id="io.github.makis_san">
     <name>Rocker contributors</name>
   </developer>
 
   <content_rating type="oars-1.1" />
 
   <releases>
-    <release version="0.0.0" date="2026-01-01">
+    <release version="0.1.0" date="2026-09-09">
+      <description>
+        <p>Cross-platform packaging: .deb/.rpm, Homebrew, and a real app icon.</p>
+      </description>
+    </release>
+    <release version="0.0.1" date="2026-09-09">
       <description>
         <p>Initial release of Rocker.</p>
       </description>

@@ -1,0 +1,50 @@
+app-id: io.github.makis_san.Rocker
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: rocker
+
+finish-args:
+  # X11 + XShm access
+  - --share=ipc
+  - --socket=x11
+  - --socket=fallback-x11
+  # Wayland access
+  - --socket=wayland
+  # GPU acceleration
+  - --device=dri
+  # Network access for Docker API
+  - --share=network
+  # Docker socket access
+  - --filesystem=/var/run/docker.sock
+  # Home directory access for Docker config
+  - --filesystem=home/.docker:create
+  # NOTE: rocker-secrets is currently an in-memory stub (real keyring/
+  # secret-service backend is planned for a later phase). When that lands,
+  # add --talk-name=org.freedesktop.secrets here (not a blanket session-bus
+  # socket) so the manifest only requests what's actually used.
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/rocker/cargo
+    CARGO_INCREMENTAL: '0'
+
+modules:
+  - name: rocker
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release -p rocker --target-dir=target
+      - install -Dm755 target/release/rocker /app/bin/rocker
+      - install -Dm644 packaging/linux/io.github.makis_san.Rocker.desktop /app/share/applications/io.github.makis_san.Rocker.desktop
+      - install -Dm644 packaging/linux/io.github.makis_san.Rocker.appdata.xml /app/share/metainfo/io.github.makis_san.Rocker.appdata.xml
+      - install -Dm644 assets/icon-512.png /app/share/icons/hicolor/512x512/apps/io.github.makis_san.Rocker.png
+      - install -Dm644 LICENSE-MIT /app/share/licenses/io.github.makis_san.Rocker/LICENSE-MIT
+      - install -Dm644 LICENSE-APACHE /app/share/licenses/io.github.makis_san.Rocker/LICENSE-APACHE
+    sources:
+      - type: git
+        url: https://github.com/makis-san/rocker.git
+        tag: v0.1.1
+      - cargo-sources.json
