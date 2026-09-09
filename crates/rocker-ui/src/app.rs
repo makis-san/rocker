@@ -116,7 +116,9 @@ impl RockerApp {
         let ctx = cc.egui_ctx.clone();
         let engine = start(&rt, move || ctx.request_repaint());
         engine.send(Command::Connect(Connection::local_default().id));
-        engine.send(Command::SetMaxStatsStreams(config.settings.max_stats_streams));
+        engine.send(Command::SetMaxStatsStreams(
+            config.settings.max_stats_streams,
+        ));
 
         Self {
             engine,
@@ -648,8 +650,9 @@ impl RockerApp {
         if let Some(edit) =
             settings::settings_screen(ui, &self.pal, &mut self.config.settings, about)
         {
-            self.engine
-                .send(Command::SetMaxStatsStreams(self.config.settings.max_stats_streams));
+            self.engine.send(Command::SetMaxStatsStreams(
+                self.config.settings.max_stats_streams,
+            ));
             self.persist();
             if edit.theme_changed {
                 self.apply_theme(ctx);

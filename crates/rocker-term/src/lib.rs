@@ -21,7 +21,6 @@ pub enum TermError {
     StreamClosed(String),
 }
 
-
 /// Grid dimensions, mirrored to the Docker exec resize endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TermSize {

@@ -167,9 +167,8 @@ pub fn container_row(
                     });
                 });
 
-                let cluster = ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
+                let cluster =
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(2.0);
                         ui.allocate_ui_with_layout(
                             egui::vec2(style::ACTION_W, style::ICON_BTN),
@@ -200,8 +199,7 @@ pub fn container_row(
                                 }
                             },
                         );
-                    },
-                );
+                    });
                 actions_rect = cluster.response.rect;
             });
         });
@@ -363,9 +361,8 @@ pub fn group_header(
                     .on_hover_text("Combined memory across the group's running containers");
                 }
 
-                let cluster = ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
+                let cluster =
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         if icons::icon_button(ui, pal, Icon::Trash, None, "Delete all").clicked() {
                             action = Some(GroupOutcome::BulkAct(LifecycleAction::Remove));
@@ -394,8 +391,7 @@ pub fn group_header(
                         {
                             action = Some(GroupOutcome::BulkAct(LifecycleAction::Start));
                         }
-                    },
-                );
+                    });
                 actions_rect = cluster.response.rect;
             });
         });

@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-09-09
+
 ### Added
 
 - Initial workspace scaffold with 11 crates

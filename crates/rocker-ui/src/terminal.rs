@@ -5,8 +5,8 @@
 //! key/text events into the byte stream a PTY expects. The exec transport lives
 //! in `rocker-engine`; nothing here talks to Docker directly.
 
-use rocker_term::{keys, Cell, Color, Screen};
 use egui::{vec2, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, Vec2};
+use rocker_term::{keys, Cell, Color, Screen};
 
 use crate::style::{self, Palette};
 

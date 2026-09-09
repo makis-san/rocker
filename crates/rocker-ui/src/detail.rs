@@ -9,10 +9,10 @@
 
 use std::collections::VecDeque;
 
+use egui::{vec2, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke};
 use rocker_core::{Container, ContainerDetail, ContainerId, ContainerState, StatSample};
 use rocker_engine::{Command, LifecycleAction, LogLine, LogStream};
 use rocker_term::Screen;
-use egui::{vec2, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke};
 
 use crate::icons::{self, Icon};
 use crate::style::{self, Palette};

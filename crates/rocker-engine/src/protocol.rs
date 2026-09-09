@@ -128,9 +128,7 @@ pub enum Event {
         lines: Vec<LogLine>,
     },
     /// The logs stream ended; `reason` is `None` on a clean EOF.
-    LogsClosed {
-        reason: Option<String>,
-    },
+    LogsClosed { reason: Option<String> },
     /// One resource sample for an open stats stream.
     Stat {
         container: ContainerId,
@@ -143,15 +141,11 @@ pub enum Event {
         reason: Option<String>,
     },
     /// The exec shell is attached and ready for input.
-    ExecReady {
-        container: ContainerId,
-    },
+    ExecReady { container: ContainerId },
     /// Raw bytes from the exec stdout/stderr TTY.
     ExecOutput(Vec<u8>),
     /// The exec session ended.
-    ExecClosed {
-        reason: Option<String>,
-    },
+    ExecClosed { reason: Option<String> },
     /// Something went wrong; surface it in a banner.
     Error(String),
 }
