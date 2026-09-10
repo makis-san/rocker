@@ -14,7 +14,9 @@ pub use audit::ExecAudit;
 pub use connection::{Connection, ConnectionId, ConnectionKind};
 pub use container::{Container, ContainerId, ContainerState, PortBinding};
 pub use detail::{ContainerDetail, HealthInfo, MountInfo, NetworkInfo};
-pub use group::{Group, GroupId, GroupKind, GroupRule};
+pub use group::{
+    resolve as resolve_groups, Group, GroupId, GroupKind, GroupRule, ResolvedSection, SectionId,
+};
 pub use stat::StatSample;
 
 /// Semantic version of the token schema that themes and extensions freeze

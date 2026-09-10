@@ -8,6 +8,7 @@ use rocker_store::{AppPaths, Config};
 use rocker_theme::Theme;
 
 use crate::detail::DetailScreen;
+use crate::groups;
 use crate::icons::{self, Icon};
 use crate::settings::{self, About};
 use crate::style::{self, Palette};
@@ -26,6 +27,7 @@ enum ConnStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Containers,
+    Groups,
     Settings,
 }
 
@@ -33,6 +35,7 @@ enum View {
 /// can stay `&self`.
 enum HeaderAction {
     Refresh,
+    ToggleGroups,
     ToggleSettings,
 }
 
@@ -112,6 +115,18 @@ fn resolve_theme(ctx: &egui::Context, id: &str) -> Theme {
             _ => Theme::dark(),
         },
     }
+}
+
+/// Parse a `#rrggbb` string into a colour, tolerating a missing `#`.
+fn hex_color(s: &str) -> Option<egui::Color32> {
+    let h = s.strip_prefix('#').unwrap_or(s);
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
 }
 
 /// Whether a group-level bulk action is meaningful for a container currently
@@ -613,11 +628,24 @@ impl RockerApp {
                             }
                             ui.add_space(2.0);
                         }
-                        let open = self.view == View::Settings;
-                        if icons::toggle_icon_button(ui, pal, Icon::Sliders, open, "Settings")
-                            .clicked()
+                        let settings_open = self.view == View::Settings;
+                        if icons::toggle_icon_button(
+                            ui,
+                            pal,
+                            Icon::Sliders,
+                            settings_open,
+                            "Settings",
+                        )
+                        .clicked()
                         {
                             action = Some(HeaderAction::ToggleSettings);
+                        }
+                        ui.add_space(2.0);
+                        let groups_open = self.view == View::Groups;
+                        if icons::toggle_icon_button(ui, pal, Icon::Stack, groups_open, "Groups")
+                            .clicked()
+                        {
+                            action = Some(HeaderAction::ToggleGroups);
                         }
                         ui.add_space(style::SM);
                         self.conn_status(ui);
@@ -823,29 +851,34 @@ impl RockerApp {
         let pal = &self.pal;
         let mut pending = None;
 
-        // Consecutive runs of one Compose project (the list is pre-sorted).
-        let mut groups: Vec<(Option<&str>, Vec<&Container>)> = Vec::new();
-        for container in &self.containers {
-            let project = container.compose_project.as_deref();
-            match groups.last_mut() {
-                Some((p, items)) if *p == project => items.push(container),
-                _ => groups.push((project, vec![container])),
-            }
-        }
+        // User groups first (PLAN §5.1), then Compose smart-grouping for
+        // whatever's left, then the ungrouped remainder.
+        let sections = rocker_core::resolve_groups(&self.containers, &self.config.groups);
+        let ids: Vec<egui::Id> = sections
+            .iter()
+            .map(|s| match &s.id {
+                rocker_core::SectionId::User(g) => {
+                    ui.make_persistent_id(("sect-user", g.0.as_str()))
+                }
+                rocker_core::SectionId::Compose(p) => {
+                    ui.make_persistent_id(("sect-compose", p.as_str()))
+                }
+                rocker_core::SectionId::Ungrouped => ui.make_persistent_id("sect-ungrouped"),
+            })
+            .collect();
 
-        // Flatten to one slot per visible row: every group's header, then its
-        // container rows while the group is open.
+        // Flatten to one slot per visible row: every section's header, then its
+        // container rows while the section is open.
         enum Slot<'a> {
             Header(usize),
             Row(&'a Container),
         }
         let mut slots: Vec<Slot> = Vec::new();
-        for (gi, (project, items)) in groups.iter().enumerate() {
-            let gid = ui.make_persistent_id(("group", project.unwrap_or("")));
-            let open = CollapsingState::load_with_default_open(ui.ctx(), gid, true).is_open();
-            slots.push(Slot::Header(gi));
+        for (si, sec) in sections.iter().enumerate() {
+            let open = CollapsingState::load_with_default_open(ui.ctx(), ids[si], true).is_open();
+            slots.push(Slot::Header(si));
             if open {
-                slots.extend(items.iter().map(|c| Slot::Row(c)));
+                slots.extend(sec.containers.iter().map(|c| Slot::Row(c)));
             }
         }
 
@@ -856,15 +889,16 @@ impl RockerApp {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for idx in range {
                     match &slots[idx] {
-                        Slot::Header(gi) => {
-                            let (project, items) = &groups[*gi];
-                            let gid = ui.make_persistent_id(("group", project.unwrap_or("")));
+                        Slot::Header(si) => {
+                            let sec = &sections[*si];
+                            let sid = ids[*si];
                             let mut state =
-                                CollapsingState::load_with_default_open(ui.ctx(), gid, true);
-                            let open_t = ui.ctx().animate_bool(gid.with("open"), state.is_open());
-                            let any_stopped = items.iter().any(|c| !c.state.is_active());
-                            let any_active = items.iter().any(|c| c.state.is_active());
-                            let usage = self.group_usage(items);
+                                CollapsingState::load_with_default_open(ui.ctx(), sid, true);
+                            let open_t = ui.ctx().animate_bool(sid.with("open"), state.is_open());
+                            let any_stopped = sec.containers.iter().any(|c| !c.state.is_active());
+                            let any_active = sec.containers.iter().any(|c| c.state.is_active());
+                            let usage = self.group_usage(&sec.containers);
+                            let accent = sec.color.as_deref().and_then(hex_color);
                             ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
                                 // Header sits at the bottom of its slot; the
                                 // slack above is the section's breathing room.
@@ -872,8 +906,9 @@ impl RockerApp {
                                 match group_header(
                                     ui,
                                     pal,
-                                    *project,
-                                    items.len(),
+                                    &sec.label,
+                                    accent,
+                                    sec.containers.len(),
                                     open_t,
                                     any_stopped,
                                     any_active,
@@ -884,7 +919,8 @@ impl RockerApp {
                                         state.store(ui.ctx());
                                     }
                                     Some(GroupOutcome::BulkAct(action)) => {
-                                        let targets: Vec<ContainerId> = items
+                                        let targets: Vec<ContainerId> = sec
+                                            .containers
                                             .iter()
                                             .filter(|c| bulk_action_applies(c.state, action))
                                             .map(|c| c.id.clone())
@@ -999,6 +1035,12 @@ impl RockerApp {
         }
     }
 
+    fn groups_view(&mut self, ui: &mut egui::Ui) {
+        if groups::groups_screen(ui, &self.pal, &mut self.config.groups, &self.containers) {
+            self.persist();
+        }
+    }
+
     /// Render the open container screen and act on whatever it asks for.
     fn detail_view(&mut self, ui: &mut egui::Ui) {
         let response = self
@@ -1057,7 +1099,7 @@ impl eframe::App for RockerApp {
         self.drain_events();
         self.service_tray(ctx);
 
-        if self.view == View::Settings && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.view != View::Containers && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.view = View::Containers;
         }
 
@@ -1068,9 +1110,20 @@ impl eframe::App for RockerApp {
                     if self.view == View::Containers {
                         self.close_detail();
                     }
-                    self.view = match self.view {
-                        View::Settings => View::Containers,
-                        View::Containers => View::Settings,
+                    self.view = if self.view == View::Settings {
+                        View::Containers
+                    } else {
+                        View::Settings
+                    };
+                }
+                HeaderAction::ToggleGroups => {
+                    if self.view == View::Containers {
+                        self.close_detail();
+                    }
+                    self.view = if self.view == View::Groups {
+                        View::Containers
+                    } else {
+                        View::Groups
                     };
                 }
             }
@@ -1088,6 +1141,7 @@ impl eframe::App for RockerApp {
 
                 match self.view {
                     View::Settings => self.settings_view(ui, ctx),
+                    View::Groups => self.groups_view(ui),
                     View::Containers if self.detail.is_some() => self.detail_view(ui),
                     View::Containers => self.containers_view(ui),
                 }

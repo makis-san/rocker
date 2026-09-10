@@ -207,6 +207,11 @@ fn map_container(c: bollard::models::ContainerSummary) -> Container {
         })
         .collect();
 
+    let compose_project = labels.get("com.docker.compose.project").cloned();
+    let compose_service = labels.get("com.docker.compose.service").cloned();
+    let mut labels: Vec<(String, String)> = labels.into_iter().collect();
+    labels.sort_by(|a, b| a.0.cmp(&b.0));
+
     Container {
         id: ContainerId::new(c.id.unwrap_or_default()),
         name,
@@ -214,8 +219,9 @@ fn map_container(c: bollard::models::ContainerSummary) -> Container {
         state,
         status: c.status.unwrap_or_default(),
         ports,
-        compose_project: labels.get("com.docker.compose.project").cloned(),
-        compose_service: labels.get("com.docker.compose.service").cloned(),
+        compose_project,
+        compose_service,
+        labels,
     }
 }
 

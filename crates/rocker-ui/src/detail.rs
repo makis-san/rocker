@@ -1729,6 +1729,7 @@ mod tests {
             }],
             compose_project: Some("example".into()),
             compose_service: Some("web".into()),
+            labels: vec![("com.docker.compose.project".into(), "example".into())],
         }
     }
 

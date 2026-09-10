@@ -79,4 +79,7 @@ pub struct Container {
     pub compose_project: Option<String>,
     #[serde(default)]
     pub compose_service: Option<String>,
+    /// All Engine labels, sorted by key — used by rule-group label selectors.
+    #[serde(default)]
+    pub labels: Vec<(String, String)>,
 }

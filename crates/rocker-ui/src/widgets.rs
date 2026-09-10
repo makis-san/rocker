@@ -293,11 +293,15 @@ pub struct GroupUsage {
 /// combined CPU/mem right after the count — each figure led by a small line
 /// icon (`Cpu` / `Memory`), then quiet monospace data in faint ink, never a
 /// colored chip.
+/// `label` is the section title. `accent`, when set (a user group's colour),
+/// draws a small filled disc in that colour in place of the stacked-planes
+/// mark automatic sections carry.
 #[allow(clippy::too_many_arguments)]
 pub fn group_header(
     ui: &mut egui::Ui,
     pal: &Palette,
-    project: Option<&str>,
+    label: &str,
+    accent: Option<egui::Color32>,
     count: usize,
     open_t: f32,
     any_stopped: bool,
@@ -320,10 +324,15 @@ pub fn group_header(
                 ui.add_space(5.0);
                 let (icon, _) =
                     ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
-                icons::draw(ui.painter(), Icon::Stack, icon, pal.text_faint);
+                match accent {
+                    Some(c) => {
+                        ui.painter().circle_filled(icon.center(), 3.5, c);
+                    }
+                    None => icons::draw(ui.painter(), Icon::Stack, icon, pal.text_faint),
+                }
                 ui.add_space(7.0);
                 ui.label(
-                    egui::RichText::new(project.unwrap_or("Ungrouped"))
+                    egui::RichText::new(label)
                         .small()
                         .strong()
                         .color(pal.text_muted),
@@ -415,7 +424,7 @@ pub fn group_header(
     } else {
         rect
     };
-    let id = ui.make_persistent_id(("group-hit", project.unwrap_or("")));
+    let id = ui.make_persistent_id(("group-hit", label));
     let resp = ui.interact(toggle_rect, id, egui::Sense::click());
     let t = ui.ctx().animate_bool(id, resp.hovered());
     if t > 0.0 {
@@ -700,7 +709,7 @@ mod tests {
             let mut outcome_was_none = false;
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let outcome = group_header(ui, &pal, Some("demo"), 3, 1.0, true, true, None);
+                    let outcome = group_header(ui, &pal, "demo", None, 3, 1.0, true, true, None);
                     outcome_was_none = outcome.is_none();
                 });
             });
@@ -728,7 +737,8 @@ mod tests {
                     group_header(
                         ui,
                         &pal,
-                        Some("demo"),
+                        "demo",
+                        Some(pal.accent),
                         3,
                         1.0,
                         true,
@@ -798,6 +808,7 @@ mod tests {
             ],
             compose_project: Some("demo".into()),
             compose_service: Some("web".into()),
+            labels: vec![],
         };
         for w in [320.0_f32, 480.0, 760.0, 1200.0] {
             let mut measured = 0.0_f32;
