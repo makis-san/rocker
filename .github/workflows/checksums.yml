@@ -1,0 +1,58 @@
+name: Checksums & signatures
+
+# Publishes a single `SHA256SUMS` (and, once a signing key is configured, a
+# `SHA256SUMS.minisig`) covering every asset on the release. The `install.sh` /
+# `install.ps1` bootstrap scripts and `rocker self-update` both verify against
+# these two files. Runs after "Linux packages" so the .deb/.rpm are already
+# attached and get hashed too.
+
+on:
+  workflow_run:
+    workflows: [Linux packages]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      contains(github.event.workflow_run.head_branch, '.')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event.workflow_run.head_branch }}
+      # Lifted to env so a step `if:` can test it (the `secrets` context isn't
+      # available in `if:`). The key is passwordless (generated with `rsign
+      # generate -W`), so there's no companion password secret.
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+    steps:
+      - name: Download every release asset
+        run: |
+          mkdir dist && cd dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*'
+          # Never hash the sums files themselves.
+          rm -f SHA256SUMS SHA256SUMS.minisig
+
+      - name: Compute SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- * | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign SHA256SUMS
+        if: env.MINISIGN_SECRET_KEY != ''
+        run: |
+          cargo install rsign2 --locked --quiet
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          rsign sign -W -s minisign.key \
+            -x dist/SHA256SUMS.minisig -t "rocker $TAG SHA256SUMS" dist/SHA256SUMS
+          rm -f minisign.key
+          test -f dist/SHA256SUMS.minisig
+
+      - name: Attach to the release
+        run: |
+          files=(dist/SHA256SUMS)
+          [ -f dist/SHA256SUMS.minisig ] && files+=(dist/SHA256SUMS.minisig)
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"

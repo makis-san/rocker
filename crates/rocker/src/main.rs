@@ -19,6 +19,13 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // `rocker install` / `uninstall` / `self-update` / `doctor` run here and
+    // exit before any window or runtime is created; anything else opens the GUI.
+    match rocker_setup::cli::run()? {
+        rocker_setup::cli::Outcome::Handled(code) => std::process::exit(code),
+        rocker_setup::cli::Outcome::LaunchGui => {}
+    }
+
     // The async engine runs on a multi-thread runtime on background threads; the
     // UI thread never blocks on it.
     let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -54,6 +54,7 @@ path = "src/main.rs"
 [dependencies]
 rocker-ui = { workspace = true }
 rocker-store = { workspace = true }
+rocker-setup = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 eframe = "0.33.3"
