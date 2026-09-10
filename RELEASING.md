@@ -32,14 +32,14 @@ files. See `.local/DISTRIBUTION.md` for the design.
   the raw binaries and the shell/PowerShell/MSI/Homebrew installers, and
   creates the GitHub Release.
 - **`.github/workflows/linux-packages.yml`** — hand-written, runs after
-  `release.yml` finishes and attaches `.deb`/`.rpm` packages (`dist` has no
-  Debian/RPM support as of 0.28.7).
-- **`.github/workflows/checksums.yml`** — hand-written, runs after
-  `linux-packages.yml` and attaches a single `SHA256SUMS` over every release
-  asset, plus `SHA256SUMS.minisig` when the signing secret is set.
+  `release.yml` finishes. Its `package` jobs attach `.deb`/`.rpm` (`dist` has no
+  Debian/RPM support as of 0.28.7); a final `checksums` job then attaches a
+  single `SHA256SUMS` over every release asset, plus `SHA256SUMS.minisig` when
+  the signing secret is set.
 
 `release.yml` triggers on pushing a tag matching `v<major>.<minor>.<patch>` (or
-a bare `<major>.<minor>.<patch>`); the other two chain off it via `workflow_run`.
+a bare `<major>.<minor>.<patch>`); `linux-packages.yml` chains off it via
+`workflow_run`.
 
 ## Cutting a release
 
@@ -73,7 +73,8 @@ minisign public key.
   (`MINISIGN_PUBKEY`), `install.sh` (`ROCKER_MINISIGN_PUBKEY`), and `install.ps1`
   (`$MinisignPubKey`).
 - **Private key** is the passwordless key in the `MINISIGN_SECRET_KEY` repo
-  secret; `checksums.yml` uses `rsign2` to produce `SHA256SUMS.minisig`.
+  secret; the `checksums` job in `linux-packages.yml` uses `rsign2` to produce
+  `SHA256SUMS.minisig`.
 
 `rocker self-update` always enforces the signature (fails closed). The install
 scripts enforce the HTTPS checksum always and the signature when `minisign` is
