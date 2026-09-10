@@ -8,6 +8,45 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-10
+
+### Added
+
+- **Command-line install with real desktop integration.** `install.sh` /
+  `install.ps1` download a verified release and hand off to a new
+  `rocker install`, which places the binary in `~/.local/bin` (no `sudo`) and
+  wires the desktop entry, full hicolor icon set, AppStream metadata, and the
+  `docker://` URL handler — on any distro and any desktop, no package manager.
+  `--system` opts into the shared prefix; `--modify-path` adds the bin dir to
+  `PATH`.
+- `rocker uninstall` (with `--purge`), `rocker doctor` (install health plus an
+  update check), and `rocker self-update` — the latter verifies a minisign
+  signature over `SHA256SUMS` and the archive checksum before atomically
+  replacing the binary, and fails closed if it can't.
+- `.github/workflows/checksums.yml` publishes a signed `SHA256SUMS` covering
+  every release asset.
+- **Container groups**: manual groups and rule groups (name / image globs,
+  label selectors), a Groups editor, per-group aggregate CPU/memory, and
+  group-level bulk start/stop/delete.
+- **Interactive terminal**: an exec shell (`bash`, falling back to `sh`) and an
+  "attach to main process" mode, both with PTY resize wired through; every
+  session is written to a local exec audit log.
+- **Usage history**: an `egui_plot` history chart alongside the live sparkline
+  cards, backed by a `redb` store (`rocker-store::HistoryStore`) that persists
+  usage samples and the exec audit log and prunes to a configurable retention
+  window.
+- **Logs viewer**: follow, tail depth selector (100 / 1k / 10k / all),
+  `regex-lite` filter with highlighting, a timestamps toggle, jump-to-newest,
+  export to file, a wrap toggle, and a visible "trimmed" marker on the buffer
+  ring.
+
+### Changed
+
+- The container list is virtualized (`ScrollArea::show_rows`); the terminal
+  grid caches per-row layout and only re-lays-out dirty rows.
+- `.desktop` `Categories` trimmed to `Development;` — three main categories
+  made the app show up multiple times in application menus.
+
 ## [0.1.4] - 2026-09-10
 
 ### Changed

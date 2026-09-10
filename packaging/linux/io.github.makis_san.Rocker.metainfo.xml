@@ -45,6 +45,13 @@
   </screenshots>
 
   <releases>
+    <release version="0.1.5" date="2026-09-10">
+      <description>
+        <p>Command-line install with real desktop integration (icon, menu
+        entry, URL handler) and a verified self-updater. Container groups,
+        an interactive terminal, usage history, and a complete logs viewer.</p>
+      </description>
+    </release>
     <release version="0.1.4" date="2026-09-10">
       <description>
         <p>Hand-made, non-AI-generated app and tray icons; Flatpak socket
