@@ -9,6 +9,13 @@ use crate::format;
 use crate::icons::{self, Icon};
 use crate::style::{self, Palette};
 
+/// Uniform slot height for one row of the virtualized container list — a
+/// [`container_row`] fills it; a [`group_header`] sits at the bottom of it, so
+/// the slack above reads as section spacing. Sized to the tallest real row
+/// (`container_row`, two text lines + margins); `container_row_fits_the_list_slot`
+/// guards it.
+pub const LIST_ROW_H: f32 = 64.0;
+
 /// A drawn state indicator: a filled core for a live container, a hollow ring
 /// for a stopped one, and a soft halo that breathes while the container is
 /// mid-transition (restarting / removing). The pulse is the only always-running
@@ -759,6 +766,62 @@ mod tests {
                 },
             );
             assert!(result.is_none(), "no pointer input, so no decision yet");
+        }
+    }
+
+    /// The virtualized list reserves a fixed [`LIST_ROW_H`] per row, so a real
+    /// `container_row` must fit inside it at every width — otherwise rows would
+    /// overlap their neighbour's slot in the running app.
+    #[test]
+    fn container_row_fits_the_list_slot() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let c = Container {
+            id: rocker_core::ContainerId::new("abc123def456"),
+            name: "a-fairly-long-container-name-1".into(),
+            image: "ghcr.io/example/service:2026.09.1".into(),
+            state: ContainerState::Running,
+            status: "Up 3 hours (healthy)".into(),
+            ports: vec![
+                rocker_core::PortBinding {
+                    container_port: 8080,
+                    protocol: "tcp".into(),
+                    host_ip: Some("0.0.0.0".into()),
+                    host_port: Some(8080),
+                },
+                rocker_core::PortBinding {
+                    container_port: 9090,
+                    protocol: "tcp".into(),
+                    host_ip: Some("0.0.0.0".into()),
+                    host_port: Some(9090),
+                },
+            ],
+            compose_project: Some("demo".into()),
+            compose_service: Some("web".into()),
+        };
+        for w in [320.0_f32, 480.0, 760.0, 1200.0] {
+            let mut measured = 0.0_f32;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(w, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let before = ui.cursor().top();
+                        container_row(ui, &pal, &c);
+                        measured = ui.cursor().top() - before;
+                    });
+                },
+            );
+            assert!(
+                measured <= LIST_ROW_H,
+                "container_row is {measured}px at width {w}, over the {LIST_ROW_H}px list slot"
+            );
         }
     }
 }

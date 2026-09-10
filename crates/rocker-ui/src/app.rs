@@ -13,7 +13,7 @@ use crate::settings::{self, About};
 use crate::style::{self, Palette};
 use crate::tray::{Tray, TrayAction, TraySummary};
 use crate::widgets::{
-    confirm_dialog, container_row, group_header, GroupOutcome, GroupUsage, RowOutcome,
+    confirm_dialog, container_row, group_header, GroupOutcome, GroupUsage, RowOutcome, LIST_ROW_H,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -784,7 +784,14 @@ impl RockerApp {
     }
 
     /// What the container list asked for this frame.
+    ///
+    /// Virtualized (PLAN §8): the groups and their rows are flattened into one
+    /// list of fixed-height slots and only the slots inside the viewport are
+    /// laid out, so a 500-container host still renders a handful of rows per
+    /// frame. A collapsed group contributes just its header slot.
     fn container_list(&self, ui: &mut egui::Ui) -> Option<ListHit> {
+        use egui::collapsing_header::CollapsingState;
+
         let pal = &self.pal;
         let mut pending = None;
 
@@ -798,67 +805,85 @@ impl RockerApp {
             }
         }
 
+        // Flatten to one slot per visible row: every group's header, then its
+        // container rows while the group is open.
+        enum Slot<'a> {
+            Header(usize),
+            Row(&'a Container),
+        }
+        let mut slots: Vec<Slot> = Vec::new();
+        for (gi, (project, items)) in groups.iter().enumerate() {
+            let gid = ui.make_persistent_id(("group", project.unwrap_or("")));
+            let open = CollapsingState::load_with_default_open(ui.ctx(), gid, true).is_open();
+            slots.push(Slot::Header(gi));
+            if open {
+                slots.extend(items.iter().map(|c| Slot::Row(c)));
+            }
+        }
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(10.0);
-                for (i, (project, items)) in groups.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(style::MD + 2.0);
-                    }
-                    let id = ui.make_persistent_id(("group", project.unwrap_or("")));
-                    let mut state =
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            true,
-                        );
-                    let open_t = ui.ctx().animate_bool(id.with("open"), state.is_open());
-                    let any_stopped = items.iter().any(|c| !c.state.is_active());
-                    let any_active = items.iter().any(|c| c.state.is_active());
-                    let usage = self.group_usage(items);
-                    match group_header(
-                        ui,
-                        pal,
-                        *project,
-                        items.len(),
-                        open_t,
-                        any_stopped,
-                        any_active,
-                        usage,
-                    ) {
-                        Some(GroupOutcome::Toggle) => state.toggle(ui),
-                        Some(GroupOutcome::BulkAct(action)) => {
-                            // Narrow to the containers the action actually
-                            // applies to (e.g. "start all" skips ones already
-                            // running), so it never fires a no-op call.
-                            let targets: Vec<ContainerId> = items
-                                .iter()
-                                .filter(|c| bulk_action_applies(c.state, action))
-                                .map(|c| c.id.clone())
-                                .collect();
-                            if !targets.is_empty() {
-                                pending = Some(ListHit::BulkAct(targets, action));
-                            }
-                        }
-                        None => {}
-                    }
-                    state.store(ui.ctx());
-                    state.show_body_unindented(ui, |ui| {
-                        for container in items {
-                            match container_row(ui, pal, container) {
-                                Some(RowOutcome::Act(action)) => {
-                                    pending = Some(ListHit::Act((*container).clone(), action));
+            .show_rows(ui, LIST_ROW_H, slots.len(), |ui, range| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for idx in range {
+                    match &slots[idx] {
+                        Slot::Header(gi) => {
+                            let (project, items) = &groups[*gi];
+                            let gid = ui.make_persistent_id(("group", project.unwrap_or("")));
+                            let mut state =
+                                CollapsingState::load_with_default_open(ui.ctx(), gid, true);
+                            let open_t = ui.ctx().animate_bool(gid.with("open"), state.is_open());
+                            let any_stopped = items.iter().any(|c| !c.state.is_active());
+                            let any_active = items.iter().any(|c| c.state.is_active());
+                            let usage = self.group_usage(items);
+                            ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
+                                // Header sits at the bottom of its slot; the
+                                // slack above is the section's breathing room.
+                                ui.add_space((LIST_ROW_H - 40.0).max(0.0));
+                                match group_header(
+                                    ui,
+                                    pal,
+                                    *project,
+                                    items.len(),
+                                    open_t,
+                                    any_stopped,
+                                    any_active,
+                                    usage,
+                                ) {
+                                    Some(GroupOutcome::Toggle) => {
+                                        state.toggle(ui);
+                                        state.store(ui.ctx());
+                                    }
+                                    Some(GroupOutcome::BulkAct(action)) => {
+                                        let targets: Vec<ContainerId> = items
+                                            .iter()
+                                            .filter(|c| bulk_action_applies(c.state, action))
+                                            .map(|c| c.id.clone())
+                                            .collect();
+                                        if !targets.is_empty() {
+                                            pending = Some(ListHit::BulkAct(targets, action));
+                                        }
+                                    }
+                                    None => {}
                                 }
-                                Some(RowOutcome::Open) => {
-                                    pending = Some(ListHit::Open((*container).clone()));
-                                }
-                                None => {}
-                            }
+                            });
                         }
-                    });
+                        Slot::Row(container) => {
+                            ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
+                                match container_row(ui, pal, container) {
+                                    Some(RowOutcome::Act(action)) => {
+                                        pending = Some(ListHit::Act((*container).clone(), action));
+                                    }
+                                    Some(RowOutcome::Open) => {
+                                        pending = Some(ListHit::Open((*container).clone()));
+                                    }
+                                    None => {}
+                                }
+                            });
+                        }
+                    }
                 }
-                ui.add_space(6.0);
             });
         pending
     }
