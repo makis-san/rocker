@@ -197,6 +197,8 @@ enum SessionMode {
 
 struct Term {
     screen: Screen,
+    /// Per-row galley cache for the grid renderer.
+    row_cache: terminal::RowCache,
     mode: SessionMode,
     started: bool,
     ready: bool,
@@ -218,6 +220,7 @@ impl Default for Term {
     fn default() -> Self {
         Self {
             screen: Screen::new(80, 24),
+            row_cache: terminal::RowCache::default(),
             mode: SessionMode::Shell,
             started: false,
             ready: false,
@@ -1150,6 +1153,7 @@ impl DetailScreen {
         if (cols, rows) != self.term.grid {
             self.term.grid = (cols, rows);
             self.term.screen.resize(cols, rows);
+            self.term.row_cache.clear();
             out.commands.push(Command::ExecResize { cols, rows });
         }
 
@@ -1157,7 +1161,14 @@ impl DetailScreen {
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let id = ui.make_persistent_id(("term-surface", &self.id.0));
         let (_resp, focused) = terminal::surface(ui, rect, id);
-        terminal::paint(ui, pal, &self.term.screen, rect, focused);
+        terminal::paint(
+            ui,
+            pal,
+            &self.term.screen,
+            rect,
+            focused,
+            &mut self.term.row_cache,
+        );
 
         if focused {
             let bytes = terminal::take_input(ui);
@@ -1202,6 +1213,7 @@ impl DetailScreen {
                 ui.label(RichText::new(msg).small().color(pal.text_muted));
                 if icons::primary_button(ui, pal, "Start again").clicked() {
                     self.term.screen = Screen::new(self.term.grid.0, self.term.grid.1);
+                    self.term.row_cache.clear();
                     self.term.ended = None;
                     self.term.ready = false;
                     out.commands.push(self.term.open_command(&self.id));

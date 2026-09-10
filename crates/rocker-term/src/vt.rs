@@ -8,7 +8,7 @@
 
 /// A cell colour: terminal-default, one of the 256 indexed colours, or direct
 /// RGB. The UI resolves `Default`/`Indexed` against the active theme palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Color {
     Default,
     Indexed(u8),
@@ -16,7 +16,7 @@ pub enum Color {
 }
 
 /// One character cell.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cell {
     pub ch: char,
     pub fg: Color,
