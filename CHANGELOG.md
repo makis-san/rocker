@@ -8,6 +8,21 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-10
+
+### Changed
+
+- Replaced the app icon (`assets/icon-1024.png`, `assets/icon-512.png`) and the
+  system-tray icon (`assets/tray.png`) with hand-made, non-AI-generated
+  artwork. Flathub review does not accept AI-generated iconography, so the
+  submission was held until this landed.
+
+### Fixed
+
+- Flatpak manifest failed `flatpak-builder-lint`: `--socket=x11` is rejected
+  alongside `--socket=wayland` / `--socket=fallback-x11`. Now ships Wayland with
+  an X11 fallback (`--socket=wayland`, `--socket=fallback-x11`, `--share=ipc`).
+
 ## [0.1.3] - 2026-09-09
 
 ### Changed
