@@ -10,6 +10,6 @@ pub mod runtime;
 pub mod service;
 
 pub use error::{EngineError, Result};
-pub use protocol::{Command, Event, LifecycleAction, LogLine, LogStream};
+pub use protocol::{Command, Event, LifecycleAction, LogLine, LogStream, LogTail};
 pub use runtime::{start, EngineHandle};
 pub use service::{reduce_stats, DockerService, LocalDocker};

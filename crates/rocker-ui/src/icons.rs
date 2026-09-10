@@ -55,6 +55,12 @@ pub enum Icon {
     /// Memory usage — a module board split into three cells, with two contact
     /// tabs on the pin edge.
     Memory,
+    /// Timestamps toggle — the hollow-ring motif as a clock face with two hands.
+    Clock,
+    /// Export to file — a down stroke and arrowhead landing on a short tray.
+    Download,
+    /// Jump to newest — a double chevron settling onto a baseline.
+    JumpDown,
 }
 
 /// Maps 0..16 grid coordinates into a centered square inside `rect`.
@@ -240,6 +246,21 @@ pub fn draw(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
             line(&[(5.2, 10.5), (5.2, 12.6)], false);
             line(&[(10.8, 10.5), (10.8, 12.6)], false);
         }
+        Icon::Clock => {
+            painter.circle_stroke(g.at(8.0, 8.0), 6.0 * g.unit, stroke);
+            line(&[(8.0, 8.0), (8.0, 4.3)], false);
+            line(&[(8.0, 8.0), (10.9, 9.4)], false);
+        }
+        Icon::Download => {
+            line(&[(8.0, 2.6), (8.0, 10.2)], false);
+            line(&[(4.8, 7.0), (8.0, 10.4), (11.2, 7.0)], false);
+            line(&[(3.2, 13.2), (12.8, 13.2)], false);
+        }
+        Icon::JumpDown => {
+            line(&[(4.5, 3.4), (8.0, 6.9), (11.5, 3.4)], false);
+            line(&[(4.5, 7.9), (8.0, 11.4), (11.5, 7.9)], false);
+            line(&[(4.0, 13.7), (12.0, 13.7)], false);
+        }
     }
 }
 
@@ -370,6 +391,40 @@ pub fn toggle_icon_button(
         .lerp_to_gamma(pal.text, active_t);
     let inset = (style::ICON_BTN - style::ICON_SM) * 0.5;
     draw(ui.painter(), icon, rect.shrink(inset), fg);
+
+    resp.on_hover_text(tooltip)
+}
+
+/// A compact text toggle (the Logs tab's `.*` regex switch): the same sticky
+/// tonal state as [`toggle_icon_button`], sized to a short monospace label so a
+/// glyphy caption like `.*` sits true. No lift, no border — state is tone only.
+pub fn toggle_text_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    active: bool,
+    tooltip: &str,
+) -> Response {
+    let font = egui::FontId::monospace(12.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE);
+    let w = (galley.rect.width() + 14.0).max(style::ICON_BTN);
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, style::ICON_BTN), Sense::click());
+    let hover_t = ui.ctx().animate_bool(resp.id, resp.hovered());
+    let active_t = ui.ctx().animate_bool(resp.id.with("active"), active);
+
+    let wash = (0.11 * hover_t).max(0.16 * active_t);
+    if wash > 0.0 {
+        ui.painter()
+            .rect_filled(rect, style::radius(pal.corner - 2.0), pal.tint(wash));
+    }
+    let rest = pal.text_muted.lerp_to_gamma(pal.text, 0.45);
+    let fg = rest
+        .lerp_to_gamma(pal.text, hover_t)
+        .lerp_to_gamma(pal.text, active_t);
+    ui.painter()
+        .text(rect.center(), egui::Align2::CENTER_CENTER, label, font, fg);
 
     resp.on_hover_text(tooltip)
 }

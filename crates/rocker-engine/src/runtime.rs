@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use rocker_core::{ConnectionId, ContainerId};
 
-use crate::protocol::{Command, Event, LogLine, LogStream};
+use crate::protocol::{Command, Event, LogLine, LogStream, LogTail};
 use crate::service::{self, DockerService, LocalDocker};
 
 pub struct EngineHandle {
@@ -150,7 +150,7 @@ impl EngineTask {
                     self.bulk_lifecycle(containers, action)
                 }
                 Command::Inspect(id) => self.inspect(id),
-                Command::OpenLogs(id) => self.open_logs(id),
+                Command::OpenLogs { container, tail } => self.open_logs(container, tail),
                 Command::CloseLogs => self.logs = None,
                 Command::OpenStats(id) => self.open_stats(id),
                 Command::CloseStats(id) => self.close_stats(id),
@@ -301,7 +301,7 @@ impl EngineTask {
         });
     }
 
-    fn open_logs(&mut self, id: ContainerId) {
+    fn open_logs(&mut self, id: ContainerId, tail: LogTail) {
         self.logs = None;
         let Some(docker) = self.docker.clone() else {
             self.emitter.emit(Event::LogsClosed {
@@ -310,7 +310,7 @@ impl EngineTask {
             return;
         };
         let em = self.emitter.clone();
-        let handle = tokio::spawn(async move { run_logs(docker.raw(), id, em).await });
+        let handle = tokio::spawn(async move { run_logs(docker.raw(), id, tail, em).await });
         self.logs = Some(StreamTask(handle));
     }
 
@@ -397,14 +397,17 @@ impl EngineTask {
     }
 }
 
-async fn run_logs(docker: bollard::Docker, id: ContainerId, em: Emitter) {
+async fn run_logs(docker: bollard::Docker, id: ContainerId, tail: LogTail, em: Emitter) {
     use bollard::query_parameters::LogsOptionsBuilder;
 
+    // Timestamps are always requested; the UI decides whether to show them, so
+    // toggling that never restarts the stream.
     let opts = LogsOptionsBuilder::new()
         .follow(true)
         .stdout(true)
         .stderr(true)
-        .tail("400")
+        .timestamps(true)
+        .tail(&tail.as_param())
         .build();
     let mut stream = docker.logs(&id.0, Some(opts));
 
@@ -455,28 +458,46 @@ fn drain_lines(buf: &mut Vec<u8>, stream: LogStream, out: &mut Vec<LogLine>) {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        out.push(LogLine {
-            stream,
-            text: String::from_utf8_lossy(&line).into_owned(),
-        });
+        out.push(make_line(stream, &line));
     }
     // Guard against a single pathological line growing without bound.
     if buf.len() > 64 * 1024 {
         let line = std::mem::take(buf);
-        out.push(LogLine {
-            stream,
-            text: String::from_utf8_lossy(&line).into_owned(),
-        });
+        out.push(make_line(stream, &line));
     }
 }
 
 fn flush_tail(buf: &mut Vec<u8>, stream: LogStream, out: &mut Vec<LogLine>) {
     if !buf.is_empty() {
         let line = std::mem::take(buf);
-        out.push(LogLine {
+        out.push(make_line(stream, &line));
+    }
+}
+
+/// Split Docker's leading RFC 3339 timestamp off a raw log line. With
+/// `timestamps=true` every real line looks like
+/// `2026-09-10T14:03:11.482331Z the message`; a line without that shape (a
+/// client-synthesised note, or an image that writes its own odd prefix) keeps
+/// `ts = None` and its full text.
+fn make_line(stream: LogStream, raw: &[u8]) -> LogLine {
+    let text = String::from_utf8_lossy(raw).into_owned();
+    match text.split_once(' ') {
+        Some((head, rest))
+            if head.len() >= 20
+                && head.as_bytes().get(10) == Some(&b'T')
+                && head.as_bytes().get(4) == Some(&b'-') =>
+        {
+            LogLine {
+                stream,
+                ts: Some(head.to_string()),
+                text: rest.to_string(),
+            }
+        }
+        _ => LogLine {
             stream,
-            text: String::from_utf8_lossy(&line).into_owned(),
-        });
+            ts: None,
+            text,
+        },
     }
 }
 
@@ -619,5 +640,37 @@ async fn run_exec(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn make_line_splits_docker_timestamp() {
+        let l = make_line(
+            LogStream::Stdout,
+            b"2026-09-10T14:03:11.482331Z listening on :80",
+        );
+        assert_eq!(l.ts.as_deref(), Some("2026-09-10T14:03:11.482331Z"));
+        assert_eq!(l.text, "listening on :80");
+    }
+
+    #[test]
+    fn make_line_keeps_untimestamped_text_whole() {
+        let l = make_line(LogStream::Stderr, b"panic: runtime error");
+        assert_eq!(l.ts, None);
+        assert_eq!(l.text, "panic: runtime error");
+        // A leading token that only looks vaguely date-ish is not mistaken for one.
+        let l = make_line(LogStream::Stdout, b"12:34:56 not-a-date message");
+        assert_eq!(l.ts, None);
+    }
+
+    #[test]
+    fn log_tail_param() {
+        assert_eq!(LogTail::Lines(100).as_param(), "100");
+        assert_eq!(LogTail::All.as_param(), "all");
+        assert_eq!(LogTail::default(), LogTail::Lines(400));
     }
 }

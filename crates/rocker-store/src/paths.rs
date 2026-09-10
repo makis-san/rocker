@@ -31,6 +31,11 @@ impl AppPaths {
     pub fn history_db(&self) -> PathBuf {
         self.data_dir.join("history.redb")
     }
+
+    /// Where the Logs tab's "Export" writes dumps.
+    pub fn exports_dir(&self) -> PathBuf {
+        self.data_dir.join("exports")
+    }
 }
 
 enum ConfigOrData {

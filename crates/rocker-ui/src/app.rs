@@ -70,6 +70,9 @@ pub struct RockerApp {
     /// frame.
     stats_subscribed: HashSet<ContainerId>,
     last_error: Option<String>,
+    /// A transient, non-error confirmation (e.g. "logs exported to …"), shown
+    /// in a quiet accent banner and dismissable like the error one.
+    last_notice: Option<String>,
     /// The open container screen, if any. Lives alongside `view` rather than
     /// inside it so the list's scroll position and group state survive a trip
     /// into a container and back.
@@ -84,8 +87,11 @@ pub struct RockerApp {
     /// UI-clock time of the last `/system/df` query, so it runs on a cadence
     /// rather than every frame.
     last_disk_poll: f64,
-    /// The system-tray icon, when the platform let us create one.
+    /// The system-tray icon, when a setting calls for it and the platform let
+    /// us create one.
     tray: Option<Tray>,
+    /// Stop flag for the tray heartbeat thread, set when the tray is torn down.
+    tray_stop: Option<Arc<AtomicBool>>,
     /// Shared with the heartbeat thread: `true` while the window is hidden to
     /// the tray, so it repaints often enough to keep tray clicks responsive.
     hidden: Arc<AtomicBool>,
@@ -138,37 +144,14 @@ impl RockerApp {
             config.settings.max_stats_streams,
         ));
 
-        let tray = Tray::new();
-        let hidden = Arc::new(AtomicBool::new(
-            config.settings.start_minimized && tray.is_some(),
-        ));
+        // The tray only exists when a setting actually calls for it: either
+        // "minimize to tray" (close/minimize hides instead of quitting) or
+        // "start hidden" (which needs somewhere to be). With both off there is
+        // no tray icon at all and the window close button just quits.
+        let want_tray = config.settings.minimize_to_tray || config.settings.start_minimized;
+        let hidden = Arc::new(AtomicBool::new(false));
 
-        if tray.is_some() {
-            // A hidden window gets no redraws from the OS, so nothing would
-            // drain the tray's click channel. This wakes the frame loop on a
-            // slow tick — quick while hidden, lazy while the window is up.
-            let ctx = cc.egui_ctx.clone();
-            let hidden = hidden.clone();
-            std::thread::Builder::new()
-                .name("rocker-tray-heartbeat".into())
-                .spawn(move || loop {
-                    let nap = if hidden.load(Ordering::Relaxed) {
-                        std::time::Duration::from_millis(500)
-                    } else {
-                        std::time::Duration::from_secs(2)
-                    };
-                    std::thread::sleep(nap);
-                    ctx.request_repaint();
-                })
-                .ok();
-        } else if config.settings.start_minimized {
-            // Asked to start hidden, but there's no tray to hide in — show the
-            // window so Rocker isn't left invisible and unreachable.
-            cc.egui_ctx
-                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        }
-
-        Self {
+        let mut app = Self {
             engine,
             paths,
             config,
@@ -179,13 +162,80 @@ impl RockerApp {
             stats: HashMap::new(),
             stats_subscribed: HashSet::new(),
             last_error: None,
+            last_notice: None,
             detail: None,
             pending_delete: None,
             disk_usage: None,
             last_disk_poll: f64::NEG_INFINITY,
-            tray,
+            tray: None,
+            tray_stop: None,
             hidden,
             quitting: false,
+        };
+
+        if want_tray {
+            app.set_tray_enabled(true, &cc.egui_ctx);
+        }
+
+        if app.config.settings.start_minimized {
+            if app.tray.is_some() {
+                // main() already built the window hidden; just record that.
+                app.hidden.store(true, Ordering::Relaxed);
+            } else {
+                // Asked to start hidden, but there's no tray to hide in — show
+                // the window so Rocker isn't left invisible and unreachable.
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+        }
+
+        app
+    }
+
+    /// Create or tear down the system tray (and its heartbeat thread) so it
+    /// matches `wanted`. Called at startup and whenever the "minimize to tray"
+    /// setting is toggled. Tearing it down removes the icon from the panel.
+    fn set_tray_enabled(&mut self, wanted: bool, ctx: &egui::Context) {
+        if wanted == self.tray.is_some() {
+            return;
+        }
+
+        if wanted {
+            self.tray = Tray::new();
+            if self.tray.is_none() {
+                return;
+            }
+            // A hidden window gets no redraws from the OS, so nothing would
+            // drain the tray's click channel. This wakes the frame loop on a
+            // slow tick — quick while hidden, lazy while the window is up — and
+            // stops itself when the tray goes away.
+            let stop = Arc::new(AtomicBool::new(false));
+            self.tray_stop = Some(stop.clone());
+            let ctx = ctx.clone();
+            let hidden = self.hidden.clone();
+            std::thread::Builder::new()
+                .name("rocker-tray-heartbeat".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let nap = if hidden.load(Ordering::Relaxed) {
+                            std::time::Duration::from_millis(500)
+                        } else {
+                            std::time::Duration::from_secs(2)
+                        };
+                        std::thread::sleep(nap);
+                        ctx.request_repaint();
+                    }
+                })
+                .ok();
+        } else {
+            self.tray = None;
+            if let Some(stop) = self.tray_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            // Nothing to hide into anymore; make sure the window is on screen.
+            if self.hidden.swap(false, Ordering::Relaxed) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
         }
     }
 
@@ -390,7 +440,10 @@ impl RockerApp {
         let mut screen = DetailScreen::new(container);
         screen.sync_state(&self.containers);
         self.engine.send(Command::Inspect(container.id.clone()));
-        self.engine.send(Command::OpenLogs(container.id.clone()));
+        self.engine.send(Command::OpenLogs {
+            container: container.id.clone(),
+            tail: rocker_engine::LogTail::default(),
+        });
         self.engine.send(Command::OpenStats(container.id.clone()));
         self.detail = Some(screen);
         self.view = View::Containers;
@@ -603,7 +656,10 @@ impl RockerApp {
         let mut dismiss = false;
         egui::Frame::new()
             .fill(pal.unhealthy.gamma_multiply(0.12))
-            .stroke(egui::Stroke::new(1.0_f32, pal.unhealthy.gamma_multiply(0.42)))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                pal.unhealthy.gamma_multiply(0.42),
+            ))
             .corner_radius(style::radius(pal.corner))
             .inner_margin(egui::Margin::symmetric(12, 10))
             .outer_margin(egui::Margin {
@@ -626,6 +682,42 @@ impl RockerApp {
             });
         if dismiss {
             self.last_error = None;
+        }
+    }
+
+    /// A quiet accent-tinted confirmation banner, same shape as
+    /// [`Self::error_banner`] but for a non-error result the user asked for.
+    fn notice_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(message) = self.last_notice.clone() else {
+            return;
+        };
+        let pal = self.pal;
+        let mut dismiss = false;
+        egui::Frame::new()
+            .fill(pal.accent.gamma_multiply(0.10))
+            .stroke(egui::Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.38)))
+            .corner_radius(style::radius(pal.corner))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .outer_margin(egui::Margin {
+                bottom: 10,
+                ..egui::Margin::ZERO
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    icons::draw(ui.painter(), Icon::Info, rect, pal.accent);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(message).color(pal.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::icon_button(ui, &pal, Icon::Close, None, "Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            });
+        if dismiss {
+            self.last_notice = None;
         }
     }
 
@@ -783,6 +875,9 @@ impl RockerApp {
             config_path: &cfg_path,
         };
 
+        let tray_wanted_before =
+            self.config.settings.minimize_to_tray || self.config.settings.start_minimized;
+
         if let Some(edit) =
             settings::settings_screen(ui, &self.pal, &mut self.config.settings, about)
         {
@@ -790,6 +885,11 @@ impl RockerApp {
                 self.config.settings.max_stats_streams,
             ));
             self.persist();
+            let tray_wanted_now =
+                self.config.settings.minimize_to_tray || self.config.settings.start_minimized;
+            if tray_wanted_now != tray_wanted_before {
+                self.set_tray_enabled(tray_wanted_now, ctx);
+            }
             if edit.theme_changed {
                 self.apply_theme(ctx);
             }
@@ -853,8 +953,45 @@ impl RockerApp {
         for cmd in response.commands {
             self.engine.send(cmd);
         }
+        if let Some(export) = response.export {
+            self.write_log_export(export);
+        }
         if response.back {
             self.close_detail();
+        }
+    }
+
+    /// Write a Logs-tab export under `data/rocker/exports/` and report the path
+    /// in the notice banner. Kept off the UI thread's hot path — it only runs
+    /// on an explicit button press.
+    fn write_log_export(&mut self, export: crate::detail::LogExport) {
+        let dir = self.paths.exports_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let safe: String = export
+            .container
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let name = if safe.is_empty() {
+            "container".into()
+        } else {
+            safe
+        };
+        let path = dir.join(format!("{name}-{stamp}.log"));
+        match std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, export.body.as_bytes()))
+        {
+            Ok(()) => self.last_notice = Some(format!("Logs exported to {}", path.display())),
+            Err(e) => self.last_error = Some(format!("Couldn't export logs: {e}")),
         }
     }
 }
@@ -891,6 +1028,7 @@ impl eframe::App for RockerApp {
             )
             .show(ctx, |ui| {
                 self.error_banner(ui);
+                self.notice_banner(ui);
 
                 match self.view {
                     View::Settings => self.settings_view(ui, ctx),

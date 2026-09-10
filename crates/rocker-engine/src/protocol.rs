@@ -41,10 +41,41 @@ pub enum LogStream {
     Stderr,
 }
 
+/// How much history to pull before switching to follow mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTail {
+    /// The last `n` lines.
+    Lines(u32),
+    /// Every line the engine still has.
+    All,
+}
+
+impl LogTail {
+    /// The value Docker's `tail=` query parameter expects.
+    pub fn as_param(self) -> String {
+        match self {
+            LogTail::Lines(n) => n.to_string(),
+            LogTail::All => "all".to_string(),
+        }
+    }
+}
+
+impl Default for LogTail {
+    fn default() -> Self {
+        LogTail::Lines(400)
+    }
+}
+
 /// One line of container output, newline stripped.
+///
+/// The engine always asks Docker for timestamps, so `ts` is populated whenever
+/// Docker prefixed the line with one (`Some` for real container output, `None`
+/// for a synthetic line the client itself produced). The UI decides whether to
+/// show it — toggling that is a pure view change, no stream restart.
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub stream: LogStream,
+    pub ts: Option<String>,
     pub text: String,
 }
 
@@ -77,8 +108,13 @@ pub enum Command {
     },
     /// One-shot full inspect of a container for the Overview tab.
     Inspect(ContainerId),
-    /// Start following a container's logs (tail + follow).
-    OpenLogs(ContainerId),
+    /// Start following a container's logs: pull `tail` of history, then follow.
+    /// Sending this again (e.g. after the tail size changes) replaces the
+    /// running stream.
+    OpenLogs {
+        container: ContainerId,
+        tail: LogTail,
+    },
     CloseLogs,
     /// Start streaming a container's resource stats. Independent callers (a
     /// group's combined header total, a detail screen) can each open the same

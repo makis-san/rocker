@@ -35,8 +35,8 @@ pub struct Settings {
     /// Max concurrent stats streams before LRU eviction (PLAN §5.3).
     pub max_stats_streams: usize,
     /// Hide to the system tray instead of quitting when the window is closed
-    /// or minimized. The tray icon itself is shown whenever the platform
-    /// supports it; this only governs the close/minimize behaviour.
+    /// or minimized. When this and `start_minimized` are both off there is no
+    /// tray icon at all and closing the window quits Rocker.
     pub minimize_to_tray: bool,
     /// Launch with the window already hidden to the tray — used when Rocker
     /// starts itself at login.

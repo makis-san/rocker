@@ -7,11 +7,13 @@
 //! returns a [`DetailResponse`] of commands the app forwards, so the screen
 //! stays a pure view.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
+use egui::text::{LayoutJob, TextFormat};
 use egui::{vec2, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke};
+use regex_lite::Regex;
 use rocker_core::{Container, ContainerDetail, ContainerId, ContainerState, StatSample};
-use rocker_engine::{Command, LifecycleAction, LogLine, LogStream};
+use rocker_engine::{Command, LifecycleAction, LogLine, LogStream, LogTail};
 use rocker_term::Screen;
 
 use crate::icons::{self, Icon};
@@ -21,6 +23,39 @@ use crate::{format, widgets};
 
 const LOG_CAP: usize = 4000;
 const STAT_CAP: usize = 240;
+
+/// The tail sizes offered in the Logs tab, paired with the label on the
+/// segmented control. `None` == "all".
+const TAIL_CHOICES: [(&str, Option<u32>); 4] = [
+    ("100", Some(100)),
+    ("1k", Some(1_000)),
+    ("10k", Some(10_000)),
+    ("All", None),
+];
+
+fn tail_to_index(tail: LogTail) -> usize {
+    match tail {
+        LogTail::Lines(100) => 0,
+        LogTail::Lines(1_000) => 1,
+        LogTail::Lines(10_000) => 2,
+        LogTail::All => 3,
+        // Any other line count (the default 400) sits closest to "1k".
+        LogTail::Lines(_) => 1,
+    }
+}
+
+fn index_to_tail(i: usize) -> LogTail {
+    match TAIL_CHOICES.get(i).and_then(|&(_, n)| n) {
+        Some(n) => LogTail::Lines(n),
+        None => LogTail::All,
+    }
+}
+
+/// A log dump the app should write to disk (the Logs tab's "Export").
+pub struct LogExport {
+    pub container: String,
+    pub body: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -53,18 +88,34 @@ impl Tab {
 }
 
 /// Commands the app should forward to the engine, plus a `back` flag asking it
-/// to return to the list.
+/// to return to the list and an optional log dump to write out.
 #[derive(Default)]
 pub struct DetailResponse {
     pub back: bool,
     pub commands: Vec<Command>,
+    pub export: Option<LogExport>,
 }
 
 struct Logs {
     lines: VecDeque<LogLine>,
     filter: String,
+    /// Treat `filter` as a regular expression rather than a case-insensitive
+    /// substring.
+    use_regex: bool,
+    /// Compiled matcher for the current `(filter, use_regex)`. `Ok(None)` when
+    /// the filter is empty (everything matches); `Err` carries the regex
+    /// compile error to show under the field.
+    matcher: Result<Option<Regex>, String>,
+    matcher_key: (String, bool),
     follow: bool,
     wrap: bool,
+    /// Show Docker's per-line timestamp. Pure view state — the engine always
+    /// streams timestamps, so toggling this never restarts anything.
+    timestamps: bool,
+    tail: LogTail,
+    /// Lines dropped off the front of the ring since the stream last
+    /// (re)started, so the view can mark that the history is clipped.
+    trimmed: u64,
     /// `Some(reason)` once the stream ends (`reason` empty on a clean EOF).
     ended: Option<String>,
 }
@@ -74,9 +125,53 @@ impl Default for Logs {
         Self {
             lines: VecDeque::new(),
             filter: String::new(),
+            use_regex: false,
+            matcher: Ok(None),
+            matcher_key: (String::new(), false),
             follow: true,
             wrap: true,
+            timestamps: false,
+            tail: LogTail::default(),
+            trimmed: 0,
             ended: None,
+        }
+    }
+}
+
+impl Logs {
+    /// Recompile `matcher` if the filter text or the regex toggle changed since
+    /// last frame. Substring mode is a case-insensitive literal; regex mode is
+    /// verbatim (the user adds `(?i)` themselves).
+    fn sync_matcher(&mut self) {
+        let key = (self.filter.clone(), self.use_regex);
+        if key == self.matcher_key {
+            return;
+        }
+        self.matcher_key = key;
+        self.matcher = if self.filter.is_empty() {
+            Ok(None)
+        } else {
+            let pattern = if self.use_regex {
+                self.filter.clone()
+            } else {
+                format!("(?i){}", regex_lite::escape(&self.filter))
+            };
+            Regex::new(&pattern).map(Some).map_err(|e| e.to_string())
+        };
+    }
+
+    /// The compiled regex, if the filter is active and valid.
+    fn active_matcher(&self) -> Option<&Regex> {
+        match &self.matcher {
+            Ok(Some(re)) => Some(re),
+            _ => None,
+        }
+    }
+
+    fn line_matches(&self, line: &LogLine) -> bool {
+        match self.active_matcher() {
+            Some(re) => re.is_match(&line.text),
+            None => true,
         }
     }
 }
@@ -119,6 +214,9 @@ pub struct DetailScreen {
     term: Term,
     /// `(field key, hide-after time)` for the transient "copied" confirmation.
     copied: Option<(&'static str, f64)>,
+    /// Overview sections the user has folded away, by stable key. A key that is
+    /// absent means the section is expanded, so the default state is all-open.
+    ov_collapsed: HashSet<&'static str>,
 }
 
 impl DetailScreen {
@@ -134,6 +232,7 @@ impl DetailScreen {
             stats: Stats::default(),
             term: Term::default(),
             copied: None,
+            ov_collapsed: HashSet::new(),
         }
     }
 
@@ -182,6 +281,7 @@ impl DetailScreen {
         for line in lines {
             if self.logs.lines.len() >= LOG_CAP {
                 self.logs.lines.pop_front();
+                self.logs.trimmed += 1;
             }
             self.logs.lines.push_back(line);
         }
@@ -189,6 +289,19 @@ impl DetailScreen {
 
     pub fn on_logs_closed(&mut self, reason: Option<String>) {
         self.logs.ended = Some(reason.unwrap_or_default());
+    }
+
+    /// Clear the buffer and re-open the stream — used when the tail size
+    /// changes and on an explicit reconnect. The fresh stream re-delivers its
+    /// own tail, so keeping the old lines would just double them up.
+    fn restart_logs(&mut self, out: &mut DetailResponse) {
+        self.logs.lines.clear();
+        self.logs.trimmed = 0;
+        self.logs.ended = None;
+        out.commands.push(Command::OpenLogs {
+            container: self.id.clone(),
+            tail: self.logs.tail,
+        });
     }
 
     pub fn on_stat(&mut self, sample: StatSample) {
@@ -374,146 +487,162 @@ impl DetailScreen {
             return;
         };
 
+        // Lifted out of `self` for the duration of the layout so the section
+        // bodies can still take `&mut self` (for `copy_row`); put back below.
+        let mut collapsed = std::mem::take(&mut self.ov_collapsed);
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
 
-                section(ui, pal, "Status");
-                kv(ui, pal, "State", state_word(detail.state));
-                if !detail.status_line.is_empty() {
-                    kv(ui, pal, "Summary", &detail.status_line);
-                }
-                if !detail.created.is_empty() {
-                    kv(ui, pal, "Created", &format::timestamp(&detail.created));
-                }
-                if !detail.started_at.is_empty() && detail.state.is_active() {
-                    kv(ui, pal, "Started", &format::timestamp(&detail.started_at));
-                }
-                if matches!(detail.state, ContainerState::Exited | ContainerState::Dead) {
-                    if !detail.finished_at.is_empty() {
-                        kv(ui, pal, "Finished", &format::timestamp(&detail.finished_at));
+                collapsing_section(ui, pal, &mut collapsed, "status", "Status", |ui| {
+                    kv(ui, pal, "State", state_word(detail.state));
+                    if !detail.status_line.is_empty() {
+                        kv(ui, pal, "Summary", &detail.status_line);
                     }
-                    if let Some(code) = detail.exit_code {
-                        kv(ui, pal, "Exit code", &code.to_string());
+                    if !detail.created.is_empty() {
+                        kv(ui, pal, "Created", &format::timestamp(&detail.created));
                     }
-                }
-                if detail.restart_count > 0 {
-                    kv(ui, pal, "Restarts", &detail.restart_count.to_string());
-                }
-                kv(ui, pal, "Restart policy", &detail.restart_policy);
-                if let Some(h) = &detail.health {
-                    kv(
-                        ui,
-                        pal,
-                        "Health",
-                        &format!("{} ({} failing)", h.status, h.failing_streak),
-                    );
-                    if let Some(o) = &h.last_output {
-                        let summary = probe_summary(o);
-                        self.copy_row(ui, pal, "Last probe", &summary, "probe");
+                    if !detail.started_at.is_empty() && detail.state.is_active() {
+                        kv(ui, pal, "Started", &format::timestamp(&detail.started_at));
                     }
-                }
-                if let Some(err) = &detail.error {
-                    kv(ui, pal, "Error", err);
-                }
-
-                section(ui, pal, "Image");
-                self.copy_row(ui, pal, "Image", &detail.image, "img");
-                self.copy_row(ui, pal, "Image ID", short_id(&detail.image_id), "imgid");
-                if !detail.platform.is_empty() {
-                    kv(ui, pal, "Platform", &detail.platform);
-                }
-                let cid = self.id.0.clone();
-                self.copy_row(ui, pal, "Container ID", &cid, "cid");
-
-                section(ui, pal, "Command");
-                if !detail.command.is_empty() {
-                    kv_mono(ui, pal, "Command", &detail.command);
-                }
-                if !detail.working_dir.is_empty() {
-                    kv_mono(ui, pal, "Working dir", &detail.working_dir);
-                }
-                if !detail.user.is_empty() {
-                    kv(ui, pal, "User", &detail.user);
-                }
-
-                section(ui, pal, "Ports");
-                if detail.ports.is_empty() {
-                    muted(ui, pal, "No published ports.");
-                } else {
-                    for p in &detail.ports {
-                        let host = match (&p.host_ip, p.host_port) {
-                            (Some(ip), Some(port)) => format!("{ip}:{port}"),
-                            (None, Some(port)) => format!("0.0.0.0:{port}"),
-                            _ => "—".to_string(),
-                        };
-                        mono_line(
+                    if matches!(detail.state, ContainerState::Exited | ContainerState::Dead) {
+                        if !detail.finished_at.is_empty() {
+                            kv(ui, pal, "Finished", &format::timestamp(&detail.finished_at));
+                        }
+                        if let Some(code) = detail.exit_code {
+                            kv(ui, pal, "Exit code", &code.to_string());
+                        }
+                    }
+                    if detail.restart_count > 0 {
+                        kv(ui, pal, "Restarts", &detail.restart_count.to_string());
+                    }
+                    kv(ui, pal, "Restart policy", &detail.restart_policy);
+                    if let Some(h) = &detail.health {
+                        kv(
                             ui,
                             pal,
-                            &format!("{host}  \u{2192}  {}/{}", p.container_port, p.protocol),
+                            "Health",
+                            &format!("{} ({} failing)", h.status, h.failing_streak),
                         );
+                        if let Some(o) = &h.last_output {
+                            let summary = probe_summary(o);
+                            self.copy_row(ui, pal, "Last probe", &summary, "probe");
+                        }
                     }
-                }
+                    if let Some(err) = &detail.error {
+                        kv(ui, pal, "Error", err);
+                    }
+                });
 
-                section(ui, pal, "Networks");
-                if detail.networks.is_empty() {
-                    muted(ui, pal, "Not attached to any network.");
-                } else {
-                    for n in &detail.networks {
-                        kv_mono(
-                            ui,
-                            pal,
-                            &n.name,
-                            &format!(
-                                "{}{}",
-                                if n.ip.is_empty() { "no address" } else { &n.ip },
-                                if n.gateway.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("  via {}", n.gateway)
-                                }
-                            ),
-                        );
+                collapsing_section(ui, pal, &mut collapsed, "image", "Image", |ui| {
+                    self.copy_row(ui, pal, "Image", &detail.image, "img");
+                    self.copy_row(ui, pal, "Image ID", short_id(&detail.image_id), "imgid");
+                    if !detail.platform.is_empty() {
+                        kv(ui, pal, "Platform", &detail.platform);
                     }
-                }
+                    let cid = self.id.0.clone();
+                    self.copy_row(ui, pal, "Container ID", &cid, "cid");
+                });
 
-                section(ui, pal, "Mounts");
-                if detail.mounts.is_empty() {
-                    muted(ui, pal, "No mounts.");
-                } else {
-                    for m in &detail.mounts {
-                        let src = m.name.clone().unwrap_or_else(|| m.source.clone());
-                        mono_line(
-                            ui,
-                            pal,
-                            &format!(
-                                "{}  \u{2190}  {}  ({}, {})",
-                                m.destination,
-                                src,
-                                m.kind,
-                                if m.read_write { "rw" } else { "ro" }
-                            ),
-                        );
+                collapsing_section(ui, pal, &mut collapsed, "command", "Command", |ui| {
+                    if !detail.command.is_empty() {
+                        kv_mono(ui, pal, "Command", &detail.command);
                     }
-                }
+                    if !detail.working_dir.is_empty() {
+                        kv_mono(ui, pal, "Working dir", &detail.working_dir);
+                    }
+                    if !detail.user.is_empty() {
+                        kv(ui, pal, "User", &detail.user);
+                    }
+                });
+
+                collapsing_section(ui, pal, &mut collapsed, "ports", "Ports", |ui| {
+                    if detail.ports.is_empty() {
+                        muted(ui, pal, "No published ports.");
+                    } else {
+                        for p in &detail.ports {
+                            let host = match (&p.host_ip, p.host_port) {
+                                (Some(ip), Some(port)) => format!("{ip}:{port}"),
+                                (None, Some(port)) => format!("0.0.0.0:{port}"),
+                                _ => "—".to_string(),
+                            };
+                            mono_line(
+                                ui,
+                                pal,
+                                &format!("{host}  \u{2192}  {}/{}", p.container_port, p.protocol),
+                            );
+                        }
+                    }
+                });
+
+                collapsing_section(ui, pal, &mut collapsed, "networks", "Networks", |ui| {
+                    if detail.networks.is_empty() {
+                        muted(ui, pal, "Not attached to any network.");
+                    } else {
+                        for n in &detail.networks {
+                            kv_mono(
+                                ui,
+                                pal,
+                                &n.name,
+                                &format!(
+                                    "{}{}",
+                                    if n.ip.is_empty() { "no address" } else { &n.ip },
+                                    if n.gateway.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("  via {}", n.gateway)
+                                    }
+                                ),
+                            );
+                        }
+                    }
+                });
+
+                collapsing_section(ui, pal, &mut collapsed, "mounts", "Mounts", |ui| {
+                    if detail.mounts.is_empty() {
+                        muted(ui, pal, "No mounts.");
+                    } else {
+                        for m in &detail.mounts {
+                            let src = m.name.clone().unwrap_or_else(|| m.source.clone());
+                            mono_line(
+                                ui,
+                                pal,
+                                &format!(
+                                    "{}  \u{2190}  {}  ({}, {})",
+                                    m.destination,
+                                    src,
+                                    m.kind,
+                                    if m.read_write { "rw" } else { "ro" }
+                                ),
+                            );
+                        }
+                    }
+                });
 
                 if !detail.env.is_empty() {
-                    section(ui, pal, &format!("Environment ({})", detail.env.len()));
-                    for (k, v) in &detail.env {
-                        mono_line(ui, pal, &format!("{k}={v}"));
-                    }
+                    let title = format!("Environment ({})", detail.env.len());
+                    collapsing_section(ui, pal, &mut collapsed, "env", &title, |ui| {
+                        for (k, v) in &detail.env {
+                            mono_line(ui, pal, &format!("{k}={v}"));
+                        }
+                    });
                 }
 
                 if !detail.labels.is_empty() {
-                    section(ui, pal, &format!("Labels ({})", detail.labels.len()));
-                    for (k, v) in &detail.labels {
-                        mono_line(ui, pal, &format!("{k} = {v}"));
-                    }
+                    let title = format!("Labels ({})", detail.labels.len());
+                    collapsing_section(ui, pal, &mut collapsed, "labels", &title, |ui| {
+                        for (k, v) in &detail.labels {
+                            mono_line(ui, pal, &format!("{k} = {v}"));
+                        }
+                    });
                 }
 
                 ui.add_space(24.0);
             });
+
+        self.ov_collapsed = collapsed;
     }
 
     fn copy_row(
@@ -544,48 +673,107 @@ impl DetailScreen {
     // ---- Logs ----------------------------------------------------------
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, pal: &Palette, out: &mut DetailResponse) {
+        self.logs.sync_matcher();
+
+        // Row 1 — filter and its regex switch on the left, buffer actions right.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            let field = egui::TextEdit::singleline(&mut self.logs.filter)
-                .hint_text("Filter")
-                .desired_width(200.0);
-            ui.add(field);
+            let hint = if self.logs.use_regex {
+                "Filter (regex)"
+            } else {
+                "Filter"
+            };
+            ui.add(
+                egui::TextEdit::singleline(&mut self.logs.filter)
+                    .hint_text(hint)
+                    .desired_width(196.0),
+            );
+            if icons::toggle_text_button(ui, pal, ".*", self.logs.use_regex, "Match as a regex")
+                .clicked()
+            {
+                self.logs.use_regex = !self.logs.use_regex;
+            }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                if icons::icon_button(ui, pal, Icon::Close, None, "Clear").clicked() {
-                    self.logs.lines.clear();
-                }
-                if icons::icon_button(ui, pal, Icon::Copy, None, "Copy all").clicked() {
-                    let joined: String = self
-                        .logs
-                        .lines
-                        .iter()
-                        .map(|l| l.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    ui.ctx().copy_text(joined);
-                }
-                if icons::toggle_icon_button(ui, pal, Icon::Lines, self.logs.wrap, "Wrap lines")
+                if icons::icon_button(ui, pal, Icon::Download, None, "Export visible lines")
                     .clicked()
                 {
-                    self.logs.wrap = !self.logs.wrap;
+                    out.export = Some(self.log_export());
+                }
+                if icons::icon_button(ui, pal, Icon::Copy, None, "Copy visible lines").clicked() {
+                    ui.ctx().copy_text(self.log_export().body);
+                }
+                if icons::icon_button(ui, pal, Icon::Close, None, "Clear the buffer").clicked() {
+                    self.logs.lines.clear();
+                    self.logs.trimmed = 0;
+                }
+            });
+        });
+
+        if let Err(err) = &self.logs.matcher {
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new(format!("Invalid regex: {err}"))
+                    .small()
+                    .color(pal.unhealthy),
+            );
+        }
+        ui.add_space(6.0);
+
+        // Row 2 — tail size on the left, view toggles right.
+        ui.horizontal(|ui| {
+            let idx = tail_to_index(self.logs.tail);
+            if let Some(new_idx) =
+                widgets::segmented(ui, pal, "log-tail", &["100", "1k", "10k", "All"], idx)
+            {
+                self.logs.tail = index_to_tail(new_idx);
+                self.restart_logs(out);
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if icons::icon_button(ui, pal, Icon::JumpDown, None, "Jump to newest").clicked() {
+                    self.logs.follow = true;
                 }
                 if icons::toggle_icon_button(ui, pal, Icon::Pulse, self.logs.follow, "Follow tail")
                     .clicked()
                 {
                     self.logs.follow = !self.logs.follow;
                 }
+                if icons::toggle_icon_button(ui, pal, Icon::Lines, self.logs.wrap, "Wrap lines")
+                    .clicked()
+                {
+                    self.logs.wrap = !self.logs.wrap;
+                }
+                if icons::toggle_icon_button(
+                    ui,
+                    pal,
+                    Icon::Clock,
+                    self.logs.timestamps,
+                    "Show timestamps",
+                )
+                .clicked()
+                {
+                    self.logs.timestamps = !self.logs.timestamps;
+                }
             });
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
-        let filter = self.logs.filter.to_lowercase();
+        // Borrow only the individual fields the render closure needs, so it can
+        // still flip `self.logs.follow` when the user scrolls off the bottom.
+        let matcher: Option<&Regex> = match &self.logs.matcher {
+            Ok(Some(re)) => Some(re),
+            _ => None,
+        };
+        let show_ts = self.logs.timestamps;
+        let wrap = self.logs.wrap;
+        let trimmed = self.logs.trimmed;
         let matching: Vec<&LogLine> = self
             .logs
             .lines
             .iter()
-            .filter(|l| filter.is_empty() || l.text.to_lowercase().contains(&filter))
+            .filter(|l| matcher.is_none_or(|re| re.is_match(&l.text)))
             .collect();
 
         if self.logs.lines.is_empty() {
@@ -601,21 +789,35 @@ impl DetailScreen {
                     .stick_to_bottom(self.logs.follow);
                 let out_scroll = scroll.show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    for line in &matching {
-                        let color = match line.stream {
-                            LogStream::Stderr => pal.unhealthy.lerp_to_gamma(pal.term_fg, 0.25),
-                            LogStream::Stdout => pal.term_fg.gamma_multiply(0.92),
-                        };
-                        let rt = RichText::new(&line.text)
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    if trimmed > 0 {
+                        ui.label(
+                            RichText::new(format!(
+                                "\u{2014} {trimmed} earlier line{} trimmed \u{2014}",
+                                if trimmed == 1 { "" } else { "s" }
+                            ))
                             .monospace()
-                            .size(11.5)
-                            .color(color);
-                        let widget = egui::Label::new(rt).wrap_mode(if self.logs.wrap {
-                            egui::TextWrapMode::Wrap
-                        } else {
-                            egui::TextWrapMode::Extend
-                        });
-                        ui.add(widget);
+                            .size(11.0)
+                            .color(pal.text_faint),
+                        );
+                    }
+                    let max_w = if wrap {
+                        ui.available_width()
+                    } else {
+                        f32::INFINITY
+                    };
+                    for line in &matching {
+                        let mut job = log_line_job(pal, line, matcher, show_ts);
+                        job.wrap.max_width = max_w;
+                        ui.add(egui::Label::new(job));
+                    }
+                    if matching.is_empty() {
+                        ui.label(
+                            RichText::new("No lines match the filter.")
+                                .monospace()
+                                .size(11.0)
+                                .color(pal.text_faint),
+                        );
                     }
                 });
                 // Drop follow if the user scrolls off the bottom.
@@ -643,10 +845,29 @@ impl DetailScreen {
                     )
                     .clicked()
                 {
-                    self.logs.ended = None;
-                    out.commands.push(Command::OpenLogs(self.id.clone()));
+                    self.restart_logs(out);
                 }
             });
+        }
+    }
+
+    /// The currently-visible (filtered) lines as plain text — timestamps
+    /// prefixed when the toggle is on. Backs both "Copy" and "Export".
+    fn log_export(&self) -> LogExport {
+        let mut body = String::new();
+        for line in self.logs.lines.iter().filter(|l| self.logs.line_matches(l)) {
+            if self.logs.timestamps {
+                if let Some(ts) = &line.ts {
+                    body.push_str(ts);
+                    body.push(' ');
+                }
+            }
+            body.push_str(&line.text);
+            body.push('\n');
+        }
+        LogExport {
+            container: self.name.clone(),
+            body,
         }
     }
 
@@ -948,10 +1169,71 @@ fn probe_summary(raw: &str) -> String {
 
 const KEY_W: f32 = 132.0;
 
-fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
+/// A collapsible Overview section: the same quiet small-caps head as the old
+/// static `section`, now fronted by a disclosure chevron that rotates with an
+/// animated open/closed `t`, and a full-width hit target that takes a tonal
+/// hover wash (no divider line) — matching `widgets::group_header`. `collapsed`
+/// carries the folded-away keys, so the state lives on [`DetailScreen`] and
+/// survives redraws and tab switches. The body is only laid out while open.
+fn collapsing_section(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    collapsed: &mut HashSet<&'static str>,
+    key: &'static str,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+) {
     ui.add_space(18.0);
-    ui.label(RichText::new(title).small().strong().color(pal.text_muted));
+    let open = !collapsed.contains(key);
+
+    let full_w = ui.available_width();
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let head = egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(4, 3))
+        .show(ui, |ui| {
+            ui.set_width(full_w - 8.0);
+            ui.horizontal(|ui| {
+                let (chev, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                let open_t = ui
+                    .ctx()
+                    .animate_bool(ui.make_persistent_id(("ov-sec", key)), open);
+                icons::chevron(ui.painter(), chev, pal.text_muted, open_t);
+                ui.add_space(6.0);
+                ui.label(RichText::new(title).small().strong().color(pal.text_muted));
+            });
+        });
+
+    let rect = head.response.rect;
+    let id = ui.make_persistent_id(("ov-sec-hit", key));
+    let resp = ui.interact(rect, id, Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let t = ui.ctx().animate_bool(id, resp.hovered());
+    if t > 0.0 {
+        ui.painter().set(
+            bg_idx,
+            egui::epaint::RectShape::new(
+                rect,
+                style::radius(pal.corner - 2.0),
+                pal.tint(0.04 * t),
+                Stroke::NONE,
+                egui::StrokeKind::Inside,
+            ),
+        );
+    }
+    if resp.clicked() {
+        if open {
+            collapsed.insert(key);
+        } else {
+            collapsed.remove(key);
+        }
+    }
+
     ui.add_space(4.0);
+    if open {
+        body(ui);
+    }
 }
 
 fn kv(ui: &mut egui::Ui, pal: &Palette, key: &str, val: &str) {
@@ -1007,6 +1289,75 @@ fn waiting(ui: &mut egui::Ui, pal: &Palette, text: &str) {
         ui.label(RichText::new(text).color(pal.text_muted));
     });
     ui.ctx().request_repaint();
+}
+
+// ---- logs helpers -----------------------------------------------
+
+/// Build the styled galley for one log line: an optional faint timestamp, then
+/// the message with any filter matches lifted onto a faint accent ground.
+/// stderr lines carry a warm tint, stdout a slightly dimmed foreground —
+/// matching the old `RichText` styling, now as a `LayoutJob` so matched spans
+/// can be recoloured inline.
+fn log_line_job(
+    pal: &Palette,
+    line: &LogLine,
+    matcher: Option<&Regex>,
+    show_ts: bool,
+) -> LayoutJob {
+    let font = FontId::monospace(11.5);
+    let base = match line.stream {
+        LogStream::Stderr => pal.unhealthy.lerp_to_gamma(pal.term_fg, 0.25),
+        LogStream::Stdout => pal.term_fg.gamma_multiply(0.92),
+    };
+    let plain = TextFormat {
+        font_id: font.clone(),
+        color: base,
+        ..Default::default()
+    };
+    let hit = TextFormat {
+        font_id: font.clone(),
+        color: pal.text,
+        background: pal.accent.gamma_multiply(0.22),
+        ..Default::default()
+    };
+
+    let mut job = LayoutJob::default();
+    if show_ts {
+        if let Some(ts) = &line.ts {
+            job.append(
+                &format!("{}  ", format::log_time(ts)),
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color: pal.text_faint,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    match matcher {
+        Some(re) => {
+            let mut last = 0usize;
+            for m in re.find_iter(&line.text) {
+                if m.start() > last {
+                    job.append(&line.text[last..m.start()], 0.0, plain.clone());
+                }
+                if m.end() > m.start() {
+                    job.append(&line.text[m.start()..m.end()], 0.0, hit.clone());
+                }
+                last = m.end().max(m.start());
+            }
+            if last < line.text.len() {
+                job.append(&line.text[last..], 0.0, plain);
+            } else if line.text.is_empty() {
+                job.append(" ", 0.0, plain);
+            }
+        }
+        None if line.text.is_empty() => job.append(" ", 0.0, plain),
+        None => job.append(&line.text, 0.0, plain),
+    }
+    job
 }
 
 // ---- stats helpers ------------------------------------------------
@@ -1211,10 +1562,12 @@ mod tests {
             screen.on_log_lines(vec![
                 LogLine {
                     stream: LogStream::Stdout,
+                    ts: Some(format!("2026-09-10T14:{:02}:00.000000Z", i % 60)),
                     text: format!("line {i}: listening on :80"),
                 },
                 LogLine {
                     stream: LogStream::Stderr,
+                    ts: None,
                     text: format!("line {i}: warning: slow query"),
                 },
             ]);
@@ -1251,6 +1604,42 @@ mod tests {
         }
     }
 
+    /// Overview lays out cleanly with every section folded away — exercising
+    /// the collapsed branch of `collapsing_section`, where the bodies (and
+    /// their `copy_row` borrows of `&mut self`) are skipped entirely.
+    #[test]
+    fn overview_with_all_sections_collapsed_lays_out() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let container = fake_container("beadfeed0002");
+        let mut screen = DetailScreen::new(&container);
+        screen.on_inspected(fake_detail(&container.id));
+        screen.tab = Tab::Overview;
+        for key in [
+            "status", "image", "command", "ports", "networks", "mounts", "env", "labels",
+        ] {
+            screen.ov_collapsed.insert(key);
+        }
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(700.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = screen.ui(ui, &pal);
+            });
+        });
+        assert_eq!(
+            screen.ov_collapsed.len(),
+            8,
+            "no click, so the set is unchanged"
+        );
+    }
+
     /// The unstarted terminal tab must not push an `OpenExec` on its own —
     /// only an explicit "Start session" click should.
     #[test]
@@ -1281,5 +1670,71 @@ mod tests {
                 .any(|c| matches!(c, Command::OpenExec(_))),
             "the terminal must wait for an explicit Start click"
         );
+    }
+
+    #[test]
+    fn tail_index_round_trips() {
+        for t in [
+            LogTail::Lines(100),
+            LogTail::Lines(1_000),
+            LogTail::Lines(10_000),
+            LogTail::All,
+        ] {
+            assert_eq!(index_to_tail(tail_to_index(t)), t);
+        }
+        // The default (400) has no cell of its own; it snaps to "1k".
+        assert_eq!(tail_to_index(LogTail::default()), 1);
+    }
+
+    #[test]
+    fn logs_regex_filter_drives_export_and_lays_out() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let container = fake_container("f00dcafe0003");
+        let mut screen = DetailScreen::new(&container);
+        screen.tab = Tab::Logs;
+        screen.on_log_lines(vec![
+            LogLine {
+                stream: LogStream::Stdout,
+                ts: Some("2026-09-10T14:03:11.000000Z".into()),
+                text: "GET /health 200".into(),
+            },
+            LogLine {
+                stream: LogStream::Stderr,
+                ts: Some("2026-09-10T14:03:12.000000Z".into()),
+                text: "GET /login 500".into(),
+            },
+        ]);
+        screen.logs.use_regex = true;
+        screen.logs.filter = r"\s5\d\d$".into();
+        screen.logs.timestamps = true;
+        screen.logs.sync_matcher();
+
+        // Only the 5xx line survives the regex, and the export carries its
+        // timestamp because the toggle is on.
+        let export = screen.log_export();
+        assert!(export.body.contains("GET /login 500"));
+        assert!(!export.body.contains("/health"));
+        assert!(export.body.contains("2026-09-10T14:03:12"));
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(480.0, 520.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = screen.ui(ui, &pal);
+            });
+        });
+
+        // A broken pattern is surfaced as an error and fails open (every line
+        // shows) rather than hiding output or panicking.
+        screen.logs.filter = "(unclosed".into();
+        screen.logs.sync_matcher();
+        assert!(screen.logs.matcher.is_err());
+        assert_eq!(screen.log_export().body.lines().count(), 2);
     }
 }

@@ -39,3 +39,12 @@ pub fn timestamp(rfc3339: &str) -> String {
         _ => s.to_string(),
     }
 }
+
+/// `2026-09-10T14:03:11.482331Z` → `14:03:11`, the clock time a log line
+/// carries. Anything unrecognised falls back to its first 19 characters.
+pub fn log_time(rfc3339: &str) -> String {
+    match rfc3339.split_once('T') {
+        Some((_, rest)) if rest.len() >= 8 => rest[..8].to_string(),
+        _ => rfc3339.chars().take(19).collect(),
+    }
+}
