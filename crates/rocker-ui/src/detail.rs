@@ -186,18 +186,39 @@ struct Stats {
     ended: Option<String>,
 }
 
+/// Which kind of interactive session the Terminal tab opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMode {
+    /// A fresh `exec` shell (bash → sh).
+    Shell,
+    /// Attach to the container's main process stdio.
+    Attach,
+}
+
 struct Term {
     screen: Screen,
+    mode: SessionMode,
     started: bool,
     ready: bool,
     ended: Option<String>,
     grid: (u16, u16),
 }
 
+impl Term {
+    /// The command that opens a session in the current mode.
+    fn open_command(&self, id: &ContainerId) -> Command {
+        match self.mode {
+            SessionMode::Shell => Command::OpenExec(id.clone()),
+            SessionMode::Attach => Command::OpenAttach(id.clone()),
+        }
+    }
+}
+
 impl Default for Term {
     fn default() -> Self {
         Self {
             screen: Screen::new(80, 24),
+            mode: SessionMode::Shell,
             started: false,
             ready: false,
             ended: None,
@@ -1057,22 +1078,40 @@ impl DetailScreen {
                 icons::draw(ui.painter(), Icon::Terminal, r, pal.text_faint);
                 ui.add_space(12.0);
                 ui.label(
-                    RichText::new("Open a shell in this container")
+                    RichText::new("Open an interactive session")
                         .size(14.0)
                         .strong()
                         .color(pal.text),
                 );
                 ui.add_space(4.0);
                 if self.state().is_active() {
-                    ui.label(
-                        RichText::new("Runs /bin/sh (or bash) with a pseudo-TTY.")
-                            .color(pal.text_muted),
-                    );
+                    let mode_idx = match self.term.mode {
+                        SessionMode::Shell => 0,
+                        SessionMode::Attach => 1,
+                    };
+                    if let Some(i) =
+                        widgets::segmented(ui, pal, "term-mode", &["Shell", "Attach"], mode_idx)
+                    {
+                        self.term.mode = if i == 0 {
+                            SessionMode::Shell
+                        } else {
+                            SessionMode::Attach
+                        };
+                    }
+                    ui.add_space(6.0);
+                    let blurb = match self.term.mode {
+                        SessionMode::Shell => "A fresh /bin/sh (or bash) on a pseudo-TTY.",
+                        SessionMode::Attach => {
+                            "The main process's own stdio — Ctrl-C, Ctrl-D and \
+                             resize reach it directly."
+                        }
+                    };
+                    ui.label(RichText::new(blurb).color(pal.text_muted));
                     ui.add_space(14.0);
                     if icons::primary_button(ui, pal, "Start session").clicked() {
                         self.term.started = true;
                         self.term.ended = None;
-                        out.commands.push(Command::OpenExec(self.id.clone()));
+                        out.commands.push(self.term.open_command(&self.id));
                     }
                 } else {
                     ui.label(
@@ -1165,7 +1204,7 @@ impl DetailScreen {
                     self.term.screen = Screen::new(self.term.grid.0, self.term.grid.1);
                     self.term.ended = None;
                     self.term.ready = false;
-                    out.commands.push(Command::OpenExec(self.id.clone()));
+                    out.commands.push(self.term.open_command(&self.id));
                 }
             });
         }
@@ -1869,9 +1908,24 @@ mod tests {
             !response
                 .commands
                 .iter()
-                .any(|c| matches!(c, Command::OpenExec(_))),
+                .any(|c| matches!(c, Command::OpenExec(_) | Command::OpenAttach(_))),
             "the terminal must wait for an explicit Start click"
         );
+    }
+
+    #[test]
+    fn session_mode_picks_the_open_command() {
+        let container = fake_container("cafefeed0002");
+        let mut screen = DetailScreen::new(&container);
+        assert!(matches!(
+            screen.term.open_command(&container.id),
+            Command::OpenExec(_)
+        ));
+        screen.term.mode = SessionMode::Attach;
+        assert!(matches!(
+            screen.term.open_command(&container.id),
+            Command::OpenAttach(_)
+        ));
     }
 
     #[test]

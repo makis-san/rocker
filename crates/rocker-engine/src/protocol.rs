@@ -138,9 +138,14 @@ pub enum Command {
     LoadExecAudit,
     /// Open an interactive `exec` shell session in a container.
     OpenExec(ContainerId),
-    /// Bytes typed into the terminal, forwarded to the exec stdin.
+    /// Attach to the container's main process stdio (PLAN §5.3). Shares the
+    /// entrypoint's TTY — input, Ctrl-C and resize reach it directly. Uses the
+    /// same `Exec*` input/output/close vocabulary as a shell session; only one
+    /// interactive session is open at a time.
+    OpenAttach(ContainerId),
+    /// Bytes typed into the terminal, forwarded to the session's stdin.
     ExecInput(Vec<u8>),
-    /// The terminal grid was resized; mirror it to the exec TTY.
+    /// The terminal grid was resized; mirror it to the session's TTY.
     ExecResize {
         cols: u16,
         rows: u16,

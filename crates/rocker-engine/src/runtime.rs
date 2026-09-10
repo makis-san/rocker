@@ -204,6 +204,7 @@ impl EngineTask {
                 Command::LoadStatHistory(id) => self.load_stat_history(id),
                 Command::LoadExecAudit => self.load_exec_audit(),
                 Command::OpenExec(id) => self.open_exec(id),
+                Command::OpenAttach(id) => self.open_attach(id),
                 Command::ExecInput(bytes) => {
                     if let Some(exec) = &self.exec {
                         let _ = exec.input.send(ExecMsg::Data(bytes));
@@ -473,6 +474,17 @@ impl EngineTask {
         false
     }
 
+    fn audit_ctx(&self) -> AuditCtx {
+        AuditCtx {
+            history: self.history.clone(),
+            connection_id: self
+                .connection
+                .as_ref()
+                .map(|c| c.0.clone())
+                .unwrap_or_else(|| "local".into()),
+        }
+    }
+
     fn open_exec(&mut self, id: ContainerId) {
         self.exec = None;
         let Some(docker) = self.docker.clone() else {
@@ -483,15 +495,26 @@ impl EngineTask {
         };
         let em = self.emitter.clone();
         let (tx, rx) = unbounded_channel::<ExecMsg>();
-        let audit = AuditCtx {
-            history: self.history.clone(),
-            connection_id: self
-                .connection
-                .as_ref()
-                .map(|c| c.0.clone())
-                .unwrap_or_else(|| "local".into()),
-        };
+        let audit = self.audit_ctx();
         let handle = tokio::spawn(async move { run_exec(docker.raw(), id, em, rx, audit).await });
+        self.exec = Some(ExecTask {
+            task: handle,
+            input: tx,
+        });
+    }
+
+    fn open_attach(&mut self, id: ContainerId) {
+        self.exec = None;
+        let Some(docker) = self.docker.clone() else {
+            self.emitter.emit(Event::ExecClosed {
+                reason: Some("not connected".into()),
+            });
+            return;
+        };
+        let em = self.emitter.clone();
+        let (tx, rx) = unbounded_channel::<ExecMsg>();
+        let audit = self.audit_ctx();
+        let handle = tokio::spawn(async move { run_attach(docker.raw(), id, em, rx, audit).await });
         self.exec = Some(ExecTask {
             task: handle,
             input: tx,
@@ -499,10 +522,43 @@ impl EngineTask {
     }
 }
 
-/// What `run_exec` needs to write an audit row when the session ends.
+/// What an interactive session needs to write an audit row when it ends.
 struct AuditCtx {
     history: Option<Arc<HistoryStore>>,
     connection_id: String,
+}
+
+/// Record one finished-session audit row (best effort). `exit_code` comes from
+/// the caller (an `inspect_exec` for a shell; `None` for an attach).
+async fn write_audit(
+    docker: &bollard::Docker,
+    audit: AuditCtx,
+    id: &ContainerId,
+    started_ms: u64,
+    argv: Vec<String>,
+    exit_code: Option<i64>,
+) {
+    let Some(history) = audit.history else { return };
+    let container_name = docker
+        .inspect_container(
+            &id.0,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .ok()
+        .and_then(|r| r.name)
+        .map(|n| n.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| id.short().to_string());
+    let row = ExecAudit {
+        ts_ms: started_ms,
+        connection_id: audit.connection_id,
+        container: id.0.clone(),
+        container_name,
+        argv,
+        exit_code,
+        duration_secs: now_ms().checked_sub(started_ms).map(|ms| ms / 1000),
+    };
+    let _ = tokio::task::spawn_blocking(move || history.record_exec(&row)).await;
 }
 
 async fn run_logs(docker: bollard::Docker, id: ContainerId, tail: LogTail, em: Emitter) {
@@ -765,37 +821,92 @@ async fn run_exec(
         }
     };
 
-    // Audit the finished session. The exit code comes from a follow-up
-    // `inspect_exec`; the container name from a one-shot inspect at close
-    // (cheap, once per session). A failure to write the row is not surfaced.
-    if let Some(history) = audit.history {
-        let exit_code = docker
-            .inspect_exec(&exec_id)
-            .await
-            .ok()
-            .and_then(|r| r.exit_code);
-        let container_name = docker
-            .inspect_container(
-                &id.0,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-            .ok()
-            .and_then(|r| r.name)
-            .map(|n| n.trim_start_matches('/').to_string())
-            .unwrap_or_else(|| id.short().to_string());
-        let row = ExecAudit {
-            ts_ms: started_ms,
-            connection_id: audit.connection_id,
-            container: id.0.clone(),
-            container_name,
-            argv,
-            exit_code,
-            duration_secs: now_ms().checked_sub(started_ms).map(|ms| ms / 1000),
-        };
-        let _ = tokio::task::spawn_blocking(move || history.record_exec(&row)).await;
-    }
+    // Audit the finished session: exit code from a follow-up `inspect_exec`.
+    let exit_code = docker
+        .inspect_exec(&exec_id)
+        .await
+        .ok()
+        .and_then(|r| r.exit_code);
+    write_audit(&docker, audit, &id, started_ms, argv, exit_code).await;
 
+    em.emit(Event::ExecClosed { reason: end_reason });
+}
+
+/// Attach to a container's main-process stdio (PLAN §5.3). No exec wrapper —
+/// input, Ctrl-C and TTY resize go straight to the entrypoint. Otherwise the
+/// same byte-stream loop and audit as [`run_exec`].
+async fn run_attach(
+    docker: bollard::Docker,
+    id: ContainerId,
+    em: Emitter,
+    mut input: UnboundedReceiver<ExecMsg>,
+    audit: AuditCtx,
+) {
+    use bollard::query_parameters::{
+        AttachContainerOptionsBuilder, ResizeContainerTTYOptionsBuilder,
+    };
+
+    let opts = AttachContainerOptionsBuilder::new()
+        .stream(true)
+        .stdin(true)
+        .stdout(true)
+        .stderr(true)
+        .logs(true)
+        .build();
+
+    let (mut output, mut writer) = match docker.attach_container(&id.0, Some(opts)).await {
+        Ok(r) => (r.output, r.input),
+        Err(e) => {
+            em.emit(Event::ExecClosed {
+                reason: Some(e.to_string()),
+            });
+            return;
+        }
+    };
+
+    em.emit(Event::ExecReady {
+        container: id.clone(),
+    });
+    let started_ms = now_ms();
+
+    let end_reason: Option<String> = loop {
+        tokio::select! {
+            msg = input.recv() => match msg {
+                Some(ExecMsg::Data(bytes)) => {
+                    if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                        break Some("stdin closed".into());
+                    }
+                }
+                Some(ExecMsg::Resize { cols, rows }) => {
+                    let _ = docker
+                        .resize_container_tty(
+                            &id.0,
+                            ResizeContainerTTYOptionsBuilder::new()
+                                .w(cols as i32)
+                                .h(rows as i32)
+                                .build(),
+                        )
+                        .await;
+                }
+                None => break None,
+            },
+            out = output.next() => match out {
+                Some(Ok(chunk)) => em.emit(Event::ExecOutput(chunk.into_bytes().to_vec())),
+                Some(Err(e)) => break Some(e.to_string()),
+                None => break None,
+            },
+        }
+    };
+
+    write_audit(
+        &docker,
+        audit,
+        &id,
+        started_ms,
+        vec!["<attach>".into()],
+        None,
+    )
+    .await;
     em.emit(Event::ExecClosed { reason: end_reason });
 }
 
