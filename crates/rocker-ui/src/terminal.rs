@@ -129,7 +129,7 @@ pub fn paint(ui: &mut egui::Ui, pal: &Palette, screen: &Screen, rect: Rect, focu
                 painter.hline(
                     pos.x..=pos.x + (x - start) as f32 * cs.x,
                     uy,
-                    Stroke::new(1.0, fg),
+                    Stroke::new(1.0_f32, fg),
                 );
             }
         }
@@ -150,7 +150,7 @@ pub fn paint(ui: &mut egui::Ui, pal: &Palette, screen: &Screen, rect: Rect, focu
                 cr,
                 1.0,
                 Color32::TRANSPARENT,
-                Stroke::new(1.0, pal.accent.gamma_multiply(0.7)),
+                Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.7)),
                 StrokeKind::Inside,
             );
         }

@@ -313,7 +313,7 @@ impl DetailScreen {
         ui.painter().hline(
             full.x_range(),
             baseline_y,
-            Stroke::new(1.0, pal.border.gamma_multiply(0.7)),
+            Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7)),
         );
 
         if let Some((_, active)) = strip.iter().find(|(t, _)| *t == self.tab) {
@@ -1060,7 +1060,7 @@ fn metric_card(ui: &mut egui::Ui, pal: &Palette, card: MetricCard<'_>) {
     } = card;
     egui::Frame::new()
         .fill(pal.surface)
-        .stroke(Stroke::new(1.0, pal.border))
+        .stroke(Stroke::new(1.0_f32, pal.border))
         .corner_radius(style::radius(pal.corner))
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -1089,7 +1089,7 @@ fn sparkline(painter: &egui::Painter, rect: Rect, series: &[f32], scale: f32, co
         painter.hline(
             rect.x_range(),
             base,
-            Stroke::new(1.0, color.gamma_multiply(0.35)),
+            Stroke::new(1.0_f32, color.gamma_multiply(0.35)),
         );
         return;
     }
@@ -1112,7 +1112,7 @@ fn sparkline(painter: &egui::Painter, rect: Rect, series: &[f32], scale: f32, co
         color.gamma_multiply(0.14),
         Stroke::NONE,
     ));
-    painter.add(egui::Shape::line(line, Stroke::new(1.5, color)));
+    painter.add(egui::Shape::line(line, Stroke::new(1.5_f32, color)));
 }
 
 #[cfg(test)]

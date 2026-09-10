@@ -183,11 +183,11 @@ pub fn install(ctx: &egui::Context, theme: &Theme) -> Palette {
     );
     v.override_text_color = None;
     v.hyperlink_color = p.accent;
-    v.window_stroke = Stroke::new(1.0, p.border);
+    v.window_stroke = Stroke::new(1.0_f32, p.border);
     v.window_corner_radius = radius(p.corner);
     v.menu_corner_radius = radius(p.corner);
     v.selection.bg_fill = p.accent.gamma_multiply(0.30);
-    v.selection.stroke = Stroke::new(1.0, p.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, p.accent);
 
     // Depth is tone here, not a bloom. Kill the window shadow; keep the popup
     // shadow tight, low-offset and near-black rather than a fat halo.
@@ -206,28 +206,28 @@ pub fn install(ctx: &egui::Context, theme: &Theme) -> Palette {
 
     w.noninteractive.bg_fill = p.surface;
     w.noninteractive.weak_bg_fill = p.surface;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.noninteractive.corner_radius = cr;
 
     w.inactive.bg_fill = p.surface;
     w.inactive.weak_bg_fill = p.surface;
-    w.inactive.bg_stroke = Stroke::new(1.0, p.border);
-    w.inactive.fg_stroke = Stroke::new(1.0, p.text_muted);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, p.text_muted);
     w.inactive.corner_radius = cr;
     w.inactive.expansion = 0.0;
 
     w.hovered.bg_fill = p.surface_hover;
     w.hovered.weak_bg_fill = p.surface_hover;
-    w.hovered.bg_stroke = Stroke::new(1.0, p.border_strong);
-    w.hovered.fg_stroke = Stroke::new(1.0, p.text);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, p.border_strong);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.hovered.corner_radius = cr;
     w.hovered.expansion = 0.0;
 
     w.active.bg_fill = p.surface_active;
     w.active.weak_bg_fill = p.surface_active;
-    w.active.bg_stroke = Stroke::new(1.0, p.accent);
-    w.active.fg_stroke = Stroke::new(1.0, p.text);
+    w.active.bg_stroke = Stroke::new(1.0_f32, p.accent);
+    w.active.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.active.corner_radius = cr;
     w.active.expansion = 0.0;
 

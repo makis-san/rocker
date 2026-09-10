@@ -36,13 +36,13 @@ pub fn state_indicator(ui: &mut egui::Ui, pal: &Palette, state: ContainerState) 
         // Hollow ring = not running.
         ContainerState::Created | ContainerState::Exited | ContainerState::Dead => {
             ui.painter()
-                .circle_stroke(center, core, egui::Stroke::new(1.6, color));
+                .circle_stroke(center, core, egui::Stroke::new(1.6_f32, color));
         }
         ContainerState::Unknown => {
             ui.painter().circle_stroke(
                 center,
                 core,
-                egui::Stroke::new(1.6, color.gamma_multiply(0.7)),
+                egui::Stroke::new(1.6_f32, color.gamma_multiply(0.7)),
             );
         }
         // Filled = live.
@@ -229,7 +229,7 @@ pub fn container_row(
             row_rect,
             style::radius(pal.corner),
             pal.tint(0.045 * t),
-            egui::Stroke::new(1.0, pal.border.lerp_to_gamma(pal.border_strong, t)),
+            egui::Stroke::new(1.0_f32, pal.border.lerp_to_gamma(pal.border_strong, t)),
             egui::StrokeKind::Inside,
         ),
     );
@@ -469,7 +469,7 @@ pub fn confirm_dialog(
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(pal.surface)
-                .stroke(egui::Stroke::new(1.0, pal.border_strong))
+                .stroke(egui::Stroke::new(1.0_f32, pal.border_strong))
                 .corner_radius(style::radius(pal.corner))
                 .inner_margin(egui::Margin::same(18))
                 .show(ui, |ui| {
@@ -518,7 +518,7 @@ pub fn segmented(
         rect,
         style::radius(pal.corner),
         pal.surface,
-        egui::Stroke::new(1.0, pal.border),
+        egui::Stroke::new(1.0_f32, pal.border),
         egui::StrokeKind::Inside,
     );
 
@@ -539,7 +539,7 @@ pub fn segmented(
         thumb,
         style::radius((pal.corner - 2.0).max(1.0)),
         pal.tint(0.10),
-        egui::Stroke::new(1.0, pal.border_strong),
+        egui::Stroke::new(1.0_f32, pal.border_strong),
         egui::StrokeKind::Inside,
     );
 
@@ -596,7 +596,7 @@ pub fn stepper(
         rect,
         style::radius(pal.corner),
         pal.surface,
-        egui::Stroke::new(1.0, pal.border),
+        egui::Stroke::new(1.0_f32, pal.border),
         egui::StrokeKind::Inside,
     );
 

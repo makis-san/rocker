@@ -550,7 +550,7 @@ impl RockerApp {
         ctx.layer_painter(egui::LayerId::background()).hline(
             r.x_range(),
             r.max.y,
-            egui::Stroke::new(1.0, pal.border),
+            egui::Stroke::new(1.0_f32, pal.border),
         );
 
         action
@@ -603,7 +603,7 @@ impl RockerApp {
         let mut dismiss = false;
         egui::Frame::new()
             .fill(pal.unhealthy.gamma_multiply(0.12))
-            .stroke(egui::Stroke::new(1.0, pal.unhealthy.gamma_multiply(0.42)))
+            .stroke(egui::Stroke::new(1.0_f32, pal.unhealthy.gamma_multiply(0.42)))
             .corner_radius(style::radius(pal.corner))
             .inner_margin(egui::Margin::symmetric(12, 10))
             .outer_margin(egui::Margin {

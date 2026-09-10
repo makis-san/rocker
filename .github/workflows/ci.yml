@@ -91,7 +91,7 @@ jobs:
       - name: Install dist
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/astral-sh/cargo-dist/releases/download/v0.28.7/cargo-dist-installer.sh | sh
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
 
       - name: Check generated CI is current
         run: dist generate --check
