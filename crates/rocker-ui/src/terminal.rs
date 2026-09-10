@@ -201,7 +201,7 @@ fn row_job(pal: &Palette, row: &[Cell]) -> LayoutJob {
                 background: bg.unwrap_or(Color32::TRANSPARENT),
                 italics,
                 underline: if underline {
-                    Stroke::new(1.0, fg)
+                    Stroke::new(1.0_f32, fg)
                 } else {
                     Stroke::NONE
                 },

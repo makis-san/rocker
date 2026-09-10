@@ -1710,17 +1710,17 @@ fn history_plot(ui: &mut egui::Ui, pal: &Palette, container_id: &str, samples: &
             plot_ui.line(
                 Line::new("CPU %", PlotPoints::from(cpu))
                     .color(pal.accent)
-                    .width(1.5)
-                    .fill(0.0)
-                    .fill_alpha(0.05),
+                    .width(1.5_f32)
+                    .fill(0.0_f32)
+                    .fill_alpha(0.05_f32),
             );
             if has_mem_limit {
                 plot_ui.line(
                     Line::new("Mem %", PlotPoints::from(mem))
                         .color(pal.running)
-                        .width(1.5)
-                        .fill(0.0)
-                        .fill_alpha(0.05),
+                        .width(1.5_f32)
+                        .fill(0.0_f32)
+                        .fill_alpha(0.05_f32),
                 );
             }
         });
