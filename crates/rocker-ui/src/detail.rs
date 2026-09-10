@@ -851,7 +851,7 @@ impl DetailScreen {
                     if trimmed > 0 {
                         ui.label(
                             RichText::new(format!(
-                                "\u{2014} {trimmed} earlier line{} trimmed \u{2014}",
+                                "{trimmed} earlier line{} trimmed",
                                 if trimmed == 1 { "" } else { "s" }
                             ))
                             .monospace()
@@ -941,6 +941,14 @@ impl DetailScreen {
             return;
         }
 
+        // Scrollable so the metric cards + history chart never clip on a short
+        // window (the tab has no fixed height of its own).
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.stats_body(ui, pal));
+    }
+
+    fn stats_body(&self, ui: &mut egui::Ui, pal: &Palette) {
         let samples: Vec<StatSample> = self.stats.samples.iter().copied().collect();
         let latest = *samples.last().unwrap();
 
@@ -1105,7 +1113,7 @@ impl DetailScreen {
                     let blurb = match self.term.mode {
                         SessionMode::Shell => "A fresh /bin/sh (or bash) on a pseudo-TTY.",
                         SessionMode::Attach => {
-                            "The main process's own stdio — Ctrl-C, Ctrl-D and \
+                            "The main process's own stdio. Ctrl-C, Ctrl-D and \
                              resize reach it directly."
                         }
                     };
