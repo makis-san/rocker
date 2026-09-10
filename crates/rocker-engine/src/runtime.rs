@@ -10,6 +10,7 @@
 //! reassignment. The command loop itself never blocks on a stream.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +19,18 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use rocker_core::{ConnectionId, ContainerId};
+use rocker_core::{ConnectionId, ContainerId, ExecAudit};
+use rocker_store::HistoryStore;
 
 use crate::protocol::{Command, Event, LogLine, LogStream, LogTail};
 use crate::service::{self, DockerService, LocalDocker};
+
+/// Default retention window until the UI sends the persisted value.
+const DEFAULT_RETENTION_HOURS: u64 = 24;
+/// The exec audit log is kept far longer than usage samples — it's tiny.
+const AUDIT_RETENTION_MS: u64 = 90 * 24 * 3600 * 1000;
+/// How often the prune timer sweeps the history store.
+const PRUNE_EVERY: Duration = Duration::from_secs(300);
 
 pub struct EngineHandle {
     commands: UnboundedSender<Command>,
@@ -48,10 +57,13 @@ const DEFAULT_MAX_STATS_STREAMS: usize = 12;
 /// Spawn the engine task on `rt` and return its handle.
 ///
 /// `repaint` is invoked after every emitted event; wire it to
-/// `egui::Context::request_repaint`.
+/// `egui::Context::request_repaint`. `history`, when present, receives usage
+/// samples and exec-audit rows, and a background timer prunes it to the
+/// retention window (updated via [`Command::SetStatsRetentionHours`]).
 pub fn start(
     rt: &tokio::runtime::Handle,
     repaint: impl Fn() + Send + Sync + 'static,
+    history: Option<Arc<HistoryStore>>,
 ) -> EngineHandle {
     let (cmd_tx, cmd_rx) = unbounded_channel::<Command>();
     let (evt_tx, evt_rx) = unbounded_channel::<Event>();
@@ -61,10 +73,34 @@ pub fn start(
         repaint: Arc::new(repaint),
     };
 
+    let retention_ms = Arc::new(AtomicU64::new(DEFAULT_RETENTION_HOURS * 3600 * 1000));
+
+    if let Some(h) = history.clone() {
+        let ret = retention_ms.clone();
+        rt.spawn(async move {
+            let mut tick = tokio::time::interval(PRUNE_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let now = now_ms();
+                let usage_before = now.saturating_sub(ret.load(Ordering::Relaxed));
+                let h = h.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = h.prune_samples(usage_before);
+                    let _ = h.prune_exec(now.saturating_sub(AUDIT_RETENTION_MS));
+                })
+                .await;
+            }
+        });
+    }
+
     rt.spawn(async move {
         let mut task = EngineTask {
             docker: None,
+            connection: None,
             emitter,
+            history,
+            retention_ms,
             logs: None,
             stats: HashMap::new(),
             stats_order: VecDeque::new(),
@@ -124,7 +160,13 @@ enum ExecMsg {
 
 struct EngineTask {
     docker: Option<LocalDocker>,
+    /// The connection id currently in use, for the exec audit trail.
+    connection: Option<ConnectionId>,
     emitter: Emitter,
+    /// Persisted usage + audit history, when a store opened.
+    history: Option<Arc<HistoryStore>>,
+    /// Retention window in milliseconds, shared with the prune timer.
+    retention_ms: Arc<AtomicU64>,
     logs: Option<StreamTask>,
     /// One entry per container currently streaming stats, plus how many
     /// callers have it open (the list view's group aggregates and a detail
@@ -155,6 +197,12 @@ impl EngineTask {
                 Command::OpenStats(id) => self.open_stats(id),
                 Command::CloseStats(id) => self.close_stats(id),
                 Command::SetMaxStatsStreams(n) => self.set_max_stats_streams(n),
+                Command::SetStatsRetentionHours(h) => {
+                    self.retention_ms
+                        .store((h as u64).max(1) * 3600 * 1000, Ordering::Relaxed);
+                }
+                Command::LoadStatHistory(id) => self.load_stat_history(id),
+                Command::LoadExecAudit => self.load_exec_audit(),
                 Command::OpenExec(id) => self.open_exec(id),
                 Command::ExecInput(bytes) => {
                     if let Some(exec) = &self.exec {
@@ -178,6 +226,7 @@ impl EngineTask {
         self.stats.clear();
         self.stats_order.clear();
         self.exec = None;
+        self.connection = Some(id.clone());
 
         match LocalDocker::connect() {
             Ok(docker) => match docker.version().await {
@@ -336,9 +385,54 @@ impl EngineTask {
         }
         let em = self.emitter.clone();
         let cid = id.clone();
-        let handle = tokio::spawn(async move { run_stats(docker.raw(), cid, em).await });
+        let history = self.history.clone();
+        let handle = tokio::spawn(async move { run_stats(docker.raw(), cid, em, history).await });
         self.stats.insert(id.clone(), (StreamTask(handle), 1));
         self.stats_order.push_back(id);
+    }
+
+    /// Read `id`'s persisted usage history over the current retention window
+    /// (down-sampled) and answer with [`Event::StatHistory`]. Empty answer if
+    /// no store opened.
+    fn load_stat_history(&self, id: ContainerId) {
+        let Some(history) = self.history.clone() else {
+            self.emitter.emit(Event::StatHistory {
+                container: id,
+                samples: Vec::new(),
+            });
+            return;
+        };
+        let since = now_ms().saturating_sub(self.retention_ms.load(Ordering::Relaxed));
+        let em = self.emitter.clone();
+        tokio::spawn(async move {
+            let cid = id.0.clone();
+            let samples = tokio::task::spawn_blocking(move || {
+                history.samples_since(&cid, since, 3000).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            em.emit(Event::StatHistory {
+                container: id,
+                samples,
+            });
+        });
+    }
+
+    /// Read the most recent exec-audit rows and answer with
+    /// [`Event::ExecAuditLog`].
+    fn load_exec_audit(&self) {
+        let Some(history) = self.history.clone() else {
+            self.emitter.emit(Event::ExecAuditLog(Vec::new()));
+            return;
+        };
+        let em = self.emitter.clone();
+        tokio::spawn(async move {
+            let rows =
+                tokio::task::spawn_blocking(move || history.recent_exec(200).unwrap_or_default())
+                    .await
+                    .unwrap_or_default();
+            em.emit(Event::ExecAuditLog(rows));
+        });
     }
 
     /// Drop one opener's claim on `id`'s stream, closing it once nobody else
@@ -389,12 +483,26 @@ impl EngineTask {
         };
         let em = self.emitter.clone();
         let (tx, rx) = unbounded_channel::<ExecMsg>();
-        let handle = tokio::spawn(async move { run_exec(docker.raw(), id, em, rx).await });
+        let audit = AuditCtx {
+            history: self.history.clone(),
+            connection_id: self
+                .connection
+                .as_ref()
+                .map(|c| c.0.clone())
+                .unwrap_or_else(|| "local".into()),
+        };
+        let handle = tokio::spawn(async move { run_exec(docker.raw(), id, em, rx, audit).await });
         self.exec = Some(ExecTask {
             task: handle,
             input: tx,
         });
     }
+}
+
+/// What `run_exec` needs to write an audit row when the session ends.
+struct AuditCtx {
+    history: Option<Arc<HistoryStore>>,
+    connection_id: String,
 }
 
 async fn run_logs(docker: bollard::Docker, id: ContainerId, tail: LogTail, em: Emitter) {
@@ -519,7 +627,12 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn run_stats(docker: bollard::Docker, id: ContainerId, em: Emitter) {
+async fn run_stats(
+    docker: bollard::Docker,
+    id: ContainerId,
+    em: Emitter,
+    history: Option<Arc<HistoryStore>>,
+) {
     use bollard::query_parameters::StatsOptionsBuilder;
 
     let opts = StatsOptionsBuilder::new().stream(true).build();
@@ -530,6 +643,11 @@ async fn run_stats(docker: bollard::Docker, id: ContainerId, em: Emitter) {
             Ok(raw) => {
                 let mut sample = service::reduce_stats(&raw);
                 sample.ts_ms = now_ms();
+                if let Some(h) = &history {
+                    // `Durability::None` write: a quick in-memory btree insert,
+                    // no fsync, so this stays off the critical path.
+                    let _ = h.record_sample(&id.0, &sample);
+                }
                 em.emit(Event::Stat {
                     container: id.clone(),
                     sample,
@@ -555,20 +673,22 @@ async fn run_exec(
     id: ContainerId,
     em: Emitter,
     mut input: UnboundedReceiver<ExecMsg>,
+    audit: AuditCtx,
 ) {
     use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 
     // Prefer bash, fall back to sh — the vast majority of images have one.
+    let argv: Vec<String> = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh".into(),
+    ];
     let config: CreateExecOptions<String> = CreateExecOptions {
         attach_stdin: Some(true),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
         tty: Some(true),
-        cmd: Some(vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh".into(),
-        ]),
+        cmd: Some(argv.clone()),
         env: Some(vec!["TERM=xterm-256color".into()]),
         ..Default::default()
     };
@@ -613,14 +733,14 @@ async fn run_exec(
     em.emit(Event::ExecReady {
         container: id.clone(),
     });
+    let started_ms = now_ms();
 
-    loop {
+    let end_reason: Option<String> = loop {
         tokio::select! {
             msg = input.recv() => match msg {
                 Some(ExecMsg::Data(bytes)) => {
                     if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
-                        em.emit(Event::ExecClosed { reason: Some("stdin closed".into()) });
-                        return;
+                        break Some("stdin closed".into());
                     }
                 }
                 Some(ExecMsg::Resize { cols, rows }) => {
@@ -635,24 +755,48 @@ async fn run_exec(
                         )
                         .await;
                 }
-                None => {
-                    em.emit(Event::ExecClosed { reason: None });
-                    return;
-                }
+                None => break None,
             },
             out = output.next() => match out {
                 Some(Ok(chunk)) => em.emit(Event::ExecOutput(chunk.into_bytes().to_vec())),
-                Some(Err(e)) => {
-                    em.emit(Event::ExecClosed { reason: Some(e.to_string()) });
-                    return;
-                }
-                None => {
-                    em.emit(Event::ExecClosed { reason: None });
-                    return;
-                }
+                Some(Err(e)) => break Some(e.to_string()),
+                None => break None,
             },
         }
+    };
+
+    // Audit the finished session. The exit code comes from a follow-up
+    // `inspect_exec`; the container name from a one-shot inspect at close
+    // (cheap, once per session). A failure to write the row is not surfaced.
+    if let Some(history) = audit.history {
+        let exit_code = docker
+            .inspect_exec(&exec_id)
+            .await
+            .ok()
+            .and_then(|r| r.exit_code);
+        let container_name = docker
+            .inspect_container(
+                &id.0,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .ok()
+            .and_then(|r| r.name)
+            .map(|n| n.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| id.short().to_string());
+        let row = ExecAudit {
+            ts_ms: started_ms,
+            connection_id: audit.connection_id,
+            container: id.0.clone(),
+            container_name,
+            argv,
+            exit_code,
+            duration_secs: now_ms().checked_sub(started_ms).map(|ms| ms / 1000),
+        };
+        let _ = tokio::task::spawn_blocking(move || history.record_exec(&row)).await;
     }
+
+    em.emit(Event::ExecClosed { reason: end_reason });
 }
 
 #[cfg(test)]

@@ -48,3 +48,22 @@ pub fn log_time(rfc3339: &str) -> String {
         _ => rfc3339.chars().take(19).collect(),
     }
 }
+
+/// A coarse "how long ago" for a Unix-millis timestamp: `just now`, `5m ago`,
+/// `3h ago`, `2d ago`. A `ts_ms` in the future (clock skew) reads as `just now`.
+pub fn ago(ts_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let secs = now.saturating_sub(ts_ms) / 1000;
+    if secs < 45 {
+        "just now".to_string()
+    } else if secs < 5400 {
+        format!("{}m ago", (secs + 30) / 60)
+    } else if secs < 172_800 {
+        format!("{}h ago", (secs + 1800) / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}

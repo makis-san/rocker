@@ -4,7 +4,7 @@
 //! tasks post [`Event`]s back; the UI drains them each frame and requests a
 //! repaint (PLAN §3.2).
 
-use rocker_core::{ConnectionId, Container, ContainerDetail, ContainerId, StatSample};
+use rocker_core::{ConnectionId, Container, ContainerDetail, ContainerId, ExecAudit, StatSample};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleAction {
@@ -126,6 +126,16 @@ pub enum Command {
     /// evicting the least-recently-opened streams right away if it's now
     /// lower than what's currently open.
     SetMaxStatsStreams(usize),
+    /// Set how long usage samples are kept in the history store before the
+    /// prune timer drops them (Settings > retention).
+    SetStatsRetentionHours(u32),
+    /// Read this container's persisted usage history and answer with
+    /// [`Event::StatHistory`], so the Stats tab opens with real history rather
+    /// than a blank chart that fills over minutes.
+    LoadStatHistory(ContainerId),
+    /// Read recent terminal-session audit rows and answer with
+    /// [`Event::ExecAuditLog`].
+    LoadExecAudit,
     /// Open an interactive `exec` shell session in a container.
     OpenExec(ContainerId),
     /// Bytes typed into the terminal, forwarded to the exec stdin.
@@ -176,6 +186,15 @@ pub enum Event {
         container: ContainerId,
         sample: StatSample,
     },
+    /// A container's persisted usage history, oldest first (answer to
+    /// [`Command::LoadStatHistory`]). Empty if there is no store or no rows.
+    StatHistory {
+        container: ContainerId,
+        samples: Vec<StatSample>,
+    },
+    /// Recent terminal-session audit rows, newest first (answer to
+    /// [`Command::LoadExecAudit`]).
+    ExecAuditLog(Vec<ExecAudit>),
     /// A stats stream ended — closed deliberately, the container stopped, an
     /// engine error, or LRU eviction past the stats-stream cap.
     StatsClosed {

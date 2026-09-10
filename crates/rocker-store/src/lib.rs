@@ -4,14 +4,13 @@
 //! - **Config** — connections, groups, settings — hand-editable TOML.
 //! - **History** — usage samples and the exec audit log — `redb`, pruned on a
 //!   timer to a retention window.
-//!
-//! This scaffold defines the config types and paths; the `redb` schemas land
-//! with the stats collector in Phase 2.
 
 pub mod config;
+pub mod history;
 pub mod paths;
 
 pub use config::{Config, Settings};
+pub use history::HistoryStore;
 pub use paths::AppPaths;
 
 use thiserror::Error;
@@ -22,6 +21,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("config parse: {0}")]
     Parse(String),
+    #[error("history db: {0}")]
+    Db(#[from] redb::Error),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

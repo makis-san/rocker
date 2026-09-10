@@ -137,11 +137,24 @@ impl RockerApp {
         let theme = resolve_theme(&cc.egui_ctx, &config.settings.theme);
         let pal = style::install(&cc.egui_ctx, &theme);
 
+        // Open the history store; if it can't open, the app still runs — stats
+        // just don't persist and the audit log stays empty.
+        let history = match rocker_store::HistoryStore::open(&paths.history_db()) {
+            Ok(h) => Some(std::sync::Arc::new(h)),
+            Err(err) => {
+                tracing::warn!(%err, "history store unavailable; not persisting usage/audit");
+                None
+            }
+        };
+
         let ctx = cc.egui_ctx.clone();
-        let engine = start(&rt, move || ctx.request_repaint());
+        let engine = start(&rt, move || ctx.request_repaint(), history);
         engine.send(Command::Connect(Connection::local_default().id));
         engine.send(Command::SetMaxStatsStreams(
             config.settings.max_stats_streams,
+        ));
+        engine.send(Command::SetStatsRetentionHours(
+            config.settings.stats_retention_hours,
         ));
 
         // The tray only exists when a setting actually calls for it: either
@@ -351,6 +364,18 @@ impl RockerApp {
                     }
                     self.stats.insert(container, sample);
                 }
+                Event::StatHistory { container, samples } => {
+                    if let Some(d) = &mut self.detail {
+                        if *d.id() == container {
+                            d.on_stat_history(samples);
+                        }
+                    }
+                }
+                Event::ExecAuditLog(rows) => {
+                    if let Some(d) = &mut self.detail {
+                        d.on_exec_audit(rows);
+                    }
+                }
                 Event::StatsClosed { container, reason } => {
                     if let Some(d) = &mut self.detail {
                         if *d.id() == container {
@@ -445,6 +470,9 @@ impl RockerApp {
             tail: rocker_engine::LogTail::default(),
         });
         self.engine.send(Command::OpenStats(container.id.clone()));
+        self.engine
+            .send(Command::LoadStatHistory(container.id.clone()));
+        self.engine.send(Command::LoadExecAudit);
         self.detail = Some(screen);
         self.view = View::Containers;
     }
@@ -908,6 +936,9 @@ impl RockerApp {
         {
             self.engine.send(Command::SetMaxStatsStreams(
                 self.config.settings.max_stats_streams,
+            ));
+            self.engine.send(Command::SetStatsRetentionHours(
+                self.config.settings.stats_retention_hours,
             ));
             self.persist();
             let tray_wanted_now =

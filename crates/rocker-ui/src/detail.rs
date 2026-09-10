@@ -13,7 +13,7 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{vec2, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke};
 use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 use regex_lite::Regex;
-use rocker_core::{Container, ContainerDetail, ContainerId, ContainerState, StatSample};
+use rocker_core::{Container, ContainerDetail, ContainerId, ContainerState, ExecAudit, StatSample};
 use rocker_engine::{Command, LifecycleAction, LogLine, LogStream, LogTail};
 use rocker_term::Screen;
 
@@ -221,6 +221,9 @@ pub struct DetailScreen {
     /// Overview sections the user has folded away, by stable key. A key that is
     /// absent means the section is expanded, so the default state is all-open.
     ov_collapsed: HashSet<&'static str>,
+    /// Recent terminal-session audit rows (newest first), filtered to this
+    /// container for the Terminal tab's "recent sessions" list.
+    exec_audit: Vec<ExecAudit>,
 }
 
 impl DetailScreen {
@@ -237,6 +240,7 @@ impl DetailScreen {
             term: Term::default(),
             copied: None,
             ov_collapsed: HashSet::new(),
+            exec_audit: Vec::new(),
         }
     }
 
@@ -316,8 +320,34 @@ impl DetailScreen {
         self.stats.samples.push_back(sample);
     }
 
+    /// Seed the Stats tab with persisted history (from `redb`) on open. Merged
+    /// with whatever the live stream has already delivered, sorted by time and
+    /// de-duplicated on `ts_ms`, capped to `STAT_CAP`.
+    pub fn on_stat_history(&mut self, history: Vec<StatSample>) {
+        if history.is_empty() {
+            return;
+        }
+        let mut merged: Vec<StatSample> = history;
+        merged.extend(self.stats.samples.iter().copied());
+        merged.sort_by_key(|s| s.ts_ms);
+        merged.dedup_by_key(|s| s.ts_ms);
+        if merged.len() > STAT_CAP {
+            merged.drain(0..merged.len() - STAT_CAP);
+        }
+        self.stats.samples = merged.into();
+    }
+
     pub fn on_stats_closed(&mut self, reason: Option<String>) {
         self.stats.ended = Some(reason.unwrap_or_default());
+    }
+
+    /// Receive the recent exec-audit rows; keep only this container's, newest
+    /// first, for the Terminal tab's session history.
+    pub fn on_exec_audit(&mut self, rows: Vec<ExecAudit>) {
+        self.exec_audit = rows
+            .into_iter()
+            .filter(|r| r.container == self.id.0)
+            .collect();
     }
 
     pub fn on_exec_ready(&mut self) {
@@ -1050,6 +1080,27 @@ impl DetailScreen {
                     );
                 }
             });
+
+            if !self.exec_audit.is_empty() {
+                ui.add_space(28.0);
+                let inset = (ui.available_width() - 360.0).max(0.0) / 2.0;
+                ui.horizontal(|ui| {
+                    ui.add_space(inset);
+                    ui.vertical(|ui| {
+                        ui.set_width(360.0);
+                        ui.label(
+                            RichText::new("Recent sessions")
+                                .small()
+                                .strong()
+                                .color(pal.text_muted),
+                        );
+                        ui.add_space(4.0);
+                        for row in self.exec_audit.iter().take(6) {
+                            session_row(ui, pal, row);
+                        }
+                    });
+                });
+            }
             return;
         }
 
@@ -1367,6 +1418,42 @@ fn log_line_job(
         None => job.append(&line.text, 0.0, plain),
     }
     job
+}
+
+// ---- terminal helpers -------------------------------------------
+
+/// One row of the Terminal tab's "Recent sessions" list: a quiet mark, a
+/// relative time, then the duration and a non-zero exit code (tinted).
+fn session_row(ui: &mut egui::Ui, pal: &Palette, row: &ExecAudit) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (ic, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+        icons::draw(ui.painter(), Icon::Terminal, ic, pal.text_faint);
+        ui.label(
+            RichText::new(format::ago(row.ts_ms))
+                .small()
+                .color(pal.text_muted),
+        );
+        if let Some(d) = row.duration_secs {
+            ui.label(
+                RichText::new(format!("{d}s"))
+                    .small()
+                    .monospace()
+                    .color(pal.text_faint),
+            );
+        }
+        match row.exit_code {
+            Some(0) | None => {}
+            Some(code) => {
+                ui.label(
+                    RichText::new(format!("exit {code}"))
+                        .small()
+                        .monospace()
+                        .color(pal.unhealthy.lerp_to_gamma(pal.text, 0.15)),
+                );
+            }
+        }
+    });
 }
 
 // ---- stats helpers ------------------------------------------------
@@ -1785,6 +1872,53 @@ mod tests {
                 .any(|c| matches!(c, Command::OpenExec(_))),
             "the terminal must wait for an explicit Start click"
         );
+    }
+
+    #[test]
+    fn stat_history_merges_dedups_and_caps() {
+        let container = fake_container("aa11bb22cc33");
+        let mut screen = DetailScreen::new(&container);
+        let s = |ts: u64| StatSample {
+            ts_ms: ts,
+            cpu_pct: ts as f32,
+            cpu_cores: 1.0,
+            mem_used: 1,
+            mem_limit: 2,
+            net_rx: 0,
+            net_tx: 0,
+            blk_read: 0,
+            blk_write: 0,
+            pids: 1,
+        };
+        // Live stream has delivered two samples already.
+        screen.on_stat(s(3_000));
+        screen.on_stat(s(4_000));
+        // History overlaps one of them and adds older points.
+        screen.on_stat_history(vec![s(1_000), s(2_000), s(3_000)]);
+
+        let got: Vec<u64> = screen.stats.samples.iter().map(|x| x.ts_ms).collect();
+        assert_eq!(got, vec![1_000, 2_000, 3_000, 4_000], "sorted, no dupes");
+
+        // An empty history answer is a no-op.
+        screen.on_stat_history(vec![]);
+        assert_eq!(screen.stats.samples.len(), 4);
+    }
+
+    #[test]
+    fn exec_audit_is_filtered_to_this_container() {
+        let container = fake_container("dead00beef11");
+        let mut screen = DetailScreen::new(&container);
+        let row = |cid: &str| ExecAudit {
+            ts_ms: 1_000,
+            connection_id: "local".into(),
+            container: cid.into(),
+            container_name: "n".into(),
+            argv: vec!["/bin/sh".into()],
+            exit_code: Some(0),
+            duration_secs: Some(5),
+        };
+        screen.on_exec_audit(vec![row("dead00beef11"), row("other"), row("dead00beef11")]);
+        assert_eq!(screen.exec_audit.len(), 2);
     }
 
     #[test]

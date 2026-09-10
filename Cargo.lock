@@ -3266,6 +3266,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3361,6 +3370,7 @@ dependencies = [
  "bollard",
  "futures-util",
  "rocker-core",
+ "rocker-store",
  "serde",
  "thiserror 2.0.20",
  "tokio",
@@ -3395,8 +3405,10 @@ dependencies = [
 name = "rocker-store"
 version = "0.1.3"
 dependencies = [
+ "redb",
  "rocker-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "toml 1.1.5+spec-1.1.0",
 ]
