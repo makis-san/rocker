@@ -511,6 +511,14 @@ fn flush_logs(id: &ContainerId, pending: &mut Vec<LogLine>, em: &Emitter) {
     });
 }
 
+/// Unix milliseconds now, saturating to `0` if the clock is before the epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn run_stats(docker: bollard::Docker, id: ContainerId, em: Emitter) {
     use bollard::query_parameters::StatsOptionsBuilder;
 
@@ -519,10 +527,14 @@ async fn run_stats(docker: bollard::Docker, id: ContainerId, em: Emitter) {
 
     while let Some(item) = stream.next().await {
         match item {
-            Ok(raw) => em.emit(Event::Stat {
-                container: id.clone(),
-                sample: service::reduce_stats(&raw),
-            }),
+            Ok(raw) => {
+                let mut sample = service::reduce_stats(&raw);
+                sample.ts_ms = now_ms();
+                em.emit(Event::Stat {
+                    container: id.clone(),
+                    sample,
+                });
+            }
             Err(e) => {
                 em.emit(Event::StatsClosed {
                     container: id,

@@ -506,6 +506,9 @@ pub fn reduce_stats(s: &ContainerStatsResponse) -> StatSample {
     }
 
     StatSample {
+        // Stamped by the caller (`run_stats`) right before it emits, so a
+        // sample carries the time it reached us, not the time it was reduced.
+        ts_ms: 0,
         cpu_pct,
         cpu_cores: cores,
         mem_used,

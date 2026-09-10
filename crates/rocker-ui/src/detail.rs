@@ -11,6 +11,7 @@ use std::collections::{HashSet, VecDeque};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{vec2, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke};
+use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 use regex_lite::Regex;
 use rocker_core::{Container, ContainerDetail, ContainerId, ContainerState, StatSample};
 use rocker_engine::{Command, LifecycleAction, LogLine, LogStream, LogTail};
@@ -22,7 +23,10 @@ use crate::terminal;
 use crate::{format, widgets};
 
 const LOG_CAP: usize = 4000;
-const STAT_CAP: usize = 240;
+/// Live samples kept in memory for the open container screen. ~1 Hz, so this is
+/// an hour of history for the Stats tab's chart; the `redb` store (PLAN §6)
+/// holds the longer retention window and seeds this on open.
+const STAT_CAP: usize = 3600;
 
 /// The tail sizes offered in the Logs tab, paired with the label on the
 /// segmented control. `None` == "all".
@@ -997,6 +1001,11 @@ impl DetailScreen {
             ),
         });
 
+        if samples.len() >= 2 {
+            ui.add_space(style::MD + 2.0);
+            history_plot(ui, pal, &self.id.0, &samples);
+        }
+
         if let Some(reason) = self.stats.ended.clone() {
             ui.add_space(8.0);
             let msg = if reason.is_empty() {
@@ -1466,6 +1475,111 @@ fn sparkline(painter: &egui::Painter, rect: Rect, series: &[f32], scale: f32, co
     painter.add(egui::Shape::line(line, Stroke::new(1.5_f32, color)));
 }
 
+/// Format a signed second offset from "now" as a short relative label
+/// (`now`, `-45s`, `-8m`, `-2.5h`). `dt` is expected to be <= 0.
+fn rel_time(dt: f64) -> String {
+    let ago = -dt;
+    if ago < 1.0 {
+        "now".to_string()
+    } else if ago < 90.0 {
+        format!("-{ago:.0}s")
+    } else if ago < 5400.0 {
+        format!("-{:.0}m", ago / 60.0)
+    } else {
+        format!("-{:.1}h", ago / 3600.0)
+    }
+}
+
+/// The Stats tab's history chart: CPU and memory as a percentage over the
+/// retained window, on a shared 0–100 axis. `egui_plot` (PLAN §2) so the line
+/// is pannable/zoomable on the x-axis and hovering reads out a value; styling
+/// stays in the app's language — hairline grid on the levels only, a whisper of
+/// tonal fill, quiet legend, no boxed-zoom rectangle.
+fn history_plot(ui: &mut egui::Ui, pal: &Palette, container_id: &str, samples: &[StatSample]) {
+    let timed = samples.iter().all(|s| s.ts_ms > 0);
+    let x_of = |i: usize, s: &StatSample| {
+        if timed {
+            s.ts_ms as f64 / 1000.0
+        } else {
+            i as f64
+        }
+    };
+    let latest_x = samples
+        .last()
+        .map(|s| x_of(samples.len() - 1, s))
+        .unwrap_or(0.0);
+
+    let has_mem_limit = samples.iter().any(|s| s.mem_limit > 0);
+    let cpu: Vec<[f64; 2]> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| [x_of(i, s), s.cpu_pct as f64])
+        .collect();
+    let mem: Vec<[f64; 2]> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| [x_of(i, s), (s.mem_frac() * 100.0) as f64])
+        .collect();
+
+    let x_fmt = move |mark: egui_plot::GridMark, _r: &std::ops::RangeInclusive<f64>| {
+        if timed {
+            rel_time(mark.value - latest_x)
+        } else {
+            format!("{:.0}", mark.value)
+        }
+    };
+
+    Plot::new(("stats-history", container_id))
+        .height(184.0)
+        .legend(
+            Legend::default()
+                .position(Corner::LeftTop)
+                .background_alpha(0.0)
+                .text_style(egui::TextStyle::Small),
+        )
+        .show_axes([true, true])
+        .show_grid([false, true])
+        .allow_zoom([true, false])
+        .allow_drag([true, false])
+        .allow_scroll(false)
+        .allow_boxed_zoom(false)
+        .set_margin_fraction(vec2(0.0, 0.12))
+        .include_y(0.0)
+        .include_y(100.0)
+        .x_axis_formatter(x_fmt)
+        .y_axis_formatter(|m, _| format!("{:.0}%", m.value))
+        .label_formatter(move |name, p| {
+            let when = if timed {
+                rel_time(p.x - latest_x)
+            } else {
+                format!("#{:.0}", p.x)
+            };
+            if name.is_empty() {
+                format!("{when}\n{:.1}%", p.y)
+            } else {
+                format!("{name}\n{when} · {:.1}%", p.y)
+            }
+        })
+        .show(ui, |plot_ui| {
+            plot_ui.line(
+                Line::new("CPU %", PlotPoints::from(cpu))
+                    .color(pal.accent)
+                    .width(1.5)
+                    .fill(0.0)
+                    .fill_alpha(0.05),
+            );
+            if has_mem_limit {
+                plot_ui.line(
+                    Line::new("Mem %", PlotPoints::from(mem))
+                        .color(pal.running)
+                        .width(1.5)
+                        .fill(0.0)
+                        .fill_alpha(0.05),
+                );
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,6 +1686,7 @@ mod tests {
                 },
             ]);
             screen.on_stat(StatSample {
+                ts_ms: 1_757_512_000_000 + i * 1_000,
                 cpu_pct: (i as f32) * 3.3 % 180.0,
                 cpu_cores: 2.0,
                 mem_used: 64_000_000 + i * 1_000_000,
