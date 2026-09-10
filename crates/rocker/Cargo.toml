@@ -33,7 +33,7 @@ depends = "$auto"
 assets = [
     ["target/release/rocker", "usr/bin/", "755"],
     ["../../packaging/linux/io.github.makis_san.Rocker.desktop", "usr/share/applications/io.github.makis_san.Rocker.desktop", "644"],
-    ["../../packaging/linux/io.github.makis_san.Rocker.appdata.xml", "usr/share/metainfo/io.github.makis_san.Rocker.appdata.xml", "644"],
+    ["../../packaging/linux/io.github.makis_san.Rocker.metainfo.xml", "usr/share/metainfo/io.github.makis_san.Rocker.metainfo.xml", "644"],
     ["../../assets/icon-512.png", "usr/share/icons/hicolor/512x512/apps/io.github.makis_san.Rocker.png", "644"],
 ]
 
@@ -43,7 +43,7 @@ license = "MIT OR Apache-2.0"
 assets = [
     { source = "target/release/rocker", dest = "/usr/bin/rocker", mode = "755" },
     { source = "packaging/linux/io.github.makis_san.Rocker.desktop", dest = "/usr/share/applications/io.github.makis_san.Rocker.desktop", mode = "644" },
-    { source = "packaging/linux/io.github.makis_san.Rocker.appdata.xml", dest = "/usr/share/metainfo/io.github.makis_san.Rocker.appdata.xml", mode = "644" },
+    { source = "packaging/linux/io.github.makis_san.Rocker.metainfo.xml", dest = "/usr/share/metainfo/io.github.makis_san.Rocker.metainfo.xml", mode = "644" },
     { source = "assets/icon-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.makis_san.Rocker.png", mode = "644" },
 ]
 

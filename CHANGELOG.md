@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-09
+
+### Changed
+
+- AppStream metainfo renamed from `io.github.makis_san.Rocker.appdata.xml` to
+  `io.github.makis_san.Rocker.metainfo.xml` (the current AppStream convention;
+  clears a `flatpak-builder-lint` warning) and updated across the `.deb`,
+  `.rpm`, and Flatpak packaging.
+- Added a store screenshot (`packaging/linux/screenshots/screenshot1.png`) and
+  referenced it from the metainfo.
+
 ## [0.1.2] - 2026-09-09
 
 ### Added
