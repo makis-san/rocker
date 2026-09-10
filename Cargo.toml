@@ -7,6 +7,7 @@ members = [
     "crates/rocker-secrets",
     "crates/rocker-term",
     "crates/rocker-theme",
+    "crates/rocker-setup",
     "crates/rocker-ext-api",
     "crates/rocker-ext-host",
     "crates/rocker-ui",
@@ -34,6 +35,7 @@ rocker-theme = { path = "crates/rocker-theme" }
 rocker-ext-api = { path = "crates/rocker-ext-api" }
 rocker-ext-host = { path = "crates/rocker-ext-host" }
 rocker-ui = { path = "crates/rocker-ui" }
+rocker-setup = { path = "crates/rocker-setup" }
 
 # Shared third-party (versions resolved by `cargo add`, see each crate)
 anyhow = "1"

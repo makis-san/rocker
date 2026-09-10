@@ -8,12 +8,13 @@ use rocker_store::{AppPaths, Config};
 use rocker_theme::Theme;
 
 use crate::detail::DetailScreen;
+use crate::groups;
 use crate::icons::{self, Icon};
 use crate::settings::{self, About};
 use crate::style::{self, Palette};
 use crate::tray::{Tray, TrayAction, TraySummary};
 use crate::widgets::{
-    confirm_dialog, container_row, group_header, GroupOutcome, GroupUsage, RowOutcome,
+    confirm_dialog, container_row, group_header, GroupOutcome, GroupUsage, RowOutcome, LIST_ROW_H,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,7 @@ enum ConnStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Containers,
+    Groups,
     Settings,
 }
 
@@ -33,6 +35,7 @@ enum View {
 /// can stay `&self`.
 enum HeaderAction {
     Refresh,
+    ToggleGroups,
     ToggleSettings,
 }
 
@@ -70,6 +73,9 @@ pub struct RockerApp {
     /// frame.
     stats_subscribed: HashSet<ContainerId>,
     last_error: Option<String>,
+    /// A transient, non-error confirmation (e.g. "logs exported to …"), shown
+    /// in a quiet accent banner and dismissable like the error one.
+    last_notice: Option<String>,
     /// The open container screen, if any. Lives alongside `view` rather than
     /// inside it so the list's scroll position and group state survive a trip
     /// into a container and back.
@@ -84,8 +90,11 @@ pub struct RockerApp {
     /// UI-clock time of the last `/system/df` query, so it runs on a cadence
     /// rather than every frame.
     last_disk_poll: f64,
-    /// The system-tray icon, when the platform let us create one.
+    /// The system-tray icon, when a setting calls for it and the platform let
+    /// us create one.
     tray: Option<Tray>,
+    /// Stop flag for the tray heartbeat thread, set when the tray is torn down.
+    tray_stop: Option<Arc<AtomicBool>>,
     /// Shared with the heartbeat thread: `true` while the window is hidden to
     /// the tray, so it repaints often enough to keep tray clicks responsive.
     hidden: Arc<AtomicBool>,
@@ -106,6 +115,18 @@ fn resolve_theme(ctx: &egui::Context, id: &str) -> Theme {
             _ => Theme::dark(),
         },
     }
+}
+
+/// Parse a `#rrggbb` string into a colour, tolerating a missing `#`.
+fn hex_color(s: &str) -> Option<egui::Color32> {
+    let h = s.strip_prefix('#').unwrap_or(s);
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
 }
 
 /// Whether a group-level bulk action is meaningful for a container currently
@@ -131,44 +152,34 @@ impl RockerApp {
         let theme = resolve_theme(&cc.egui_ctx, &config.settings.theme);
         let pal = style::install(&cc.egui_ctx, &theme);
 
+        // Open the history store; if it can't open, the app still runs — stats
+        // just don't persist and the audit log stays empty.
+        let history = match rocker_store::HistoryStore::open(&paths.history_db()) {
+            Ok(h) => Some(std::sync::Arc::new(h)),
+            Err(err) => {
+                tracing::warn!(%err, "history store unavailable; not persisting usage/audit");
+                None
+            }
+        };
+
         let ctx = cc.egui_ctx.clone();
-        let engine = start(&rt, move || ctx.request_repaint());
+        let engine = start(&rt, move || ctx.request_repaint(), history);
         engine.send(Command::Connect(Connection::local_default().id));
         engine.send(Command::SetMaxStatsStreams(
             config.settings.max_stats_streams,
         ));
-
-        let tray = Tray::new();
-        let hidden = Arc::new(AtomicBool::new(
-            config.settings.start_minimized && tray.is_some(),
+        engine.send(Command::SetStatsRetentionHours(
+            config.settings.stats_retention_hours,
         ));
 
-        if tray.is_some() {
-            // A hidden window gets no redraws from the OS, so nothing would
-            // drain the tray's click channel. This wakes the frame loop on a
-            // slow tick — quick while hidden, lazy while the window is up.
-            let ctx = cc.egui_ctx.clone();
-            let hidden = hidden.clone();
-            std::thread::Builder::new()
-                .name("rocker-tray-heartbeat".into())
-                .spawn(move || loop {
-                    let nap = if hidden.load(Ordering::Relaxed) {
-                        std::time::Duration::from_millis(500)
-                    } else {
-                        std::time::Duration::from_secs(2)
-                    };
-                    std::thread::sleep(nap);
-                    ctx.request_repaint();
-                })
-                .ok();
-        } else if config.settings.start_minimized {
-            // Asked to start hidden, but there's no tray to hide in — show the
-            // window so Rocker isn't left invisible and unreachable.
-            cc.egui_ctx
-                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        }
+        // The tray only exists when a setting actually calls for it: either
+        // "minimize to tray" (close/minimize hides instead of quitting) or
+        // "start hidden" (which needs somewhere to be). With both off there is
+        // no tray icon at all and the window close button just quits.
+        let want_tray = config.settings.minimize_to_tray || config.settings.start_minimized;
+        let hidden = Arc::new(AtomicBool::new(false));
 
-        Self {
+        let mut app = Self {
             engine,
             paths,
             config,
@@ -179,13 +190,80 @@ impl RockerApp {
             stats: HashMap::new(),
             stats_subscribed: HashSet::new(),
             last_error: None,
+            last_notice: None,
             detail: None,
             pending_delete: None,
             disk_usage: None,
             last_disk_poll: f64::NEG_INFINITY,
-            tray,
+            tray: None,
+            tray_stop: None,
             hidden,
             quitting: false,
+        };
+
+        if want_tray {
+            app.set_tray_enabled(true, &cc.egui_ctx);
+        }
+
+        if app.config.settings.start_minimized {
+            if app.tray.is_some() {
+                // main() already built the window hidden; just record that.
+                app.hidden.store(true, Ordering::Relaxed);
+            } else {
+                // Asked to start hidden, but there's no tray to hide in — show
+                // the window so Rocker isn't left invisible and unreachable.
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+        }
+
+        app
+    }
+
+    /// Create or tear down the system tray (and its heartbeat thread) so it
+    /// matches `wanted`. Called at startup and whenever the "minimize to tray"
+    /// setting is toggled. Tearing it down removes the icon from the panel.
+    fn set_tray_enabled(&mut self, wanted: bool, ctx: &egui::Context) {
+        if wanted == self.tray.is_some() {
+            return;
+        }
+
+        if wanted {
+            self.tray = Tray::new();
+            if self.tray.is_none() {
+                return;
+            }
+            // A hidden window gets no redraws from the OS, so nothing would
+            // drain the tray's click channel. This wakes the frame loop on a
+            // slow tick — quick while hidden, lazy while the window is up — and
+            // stops itself when the tray goes away.
+            let stop = Arc::new(AtomicBool::new(false));
+            self.tray_stop = Some(stop.clone());
+            let ctx = ctx.clone();
+            let hidden = self.hidden.clone();
+            std::thread::Builder::new()
+                .name("rocker-tray-heartbeat".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let nap = if hidden.load(Ordering::Relaxed) {
+                            std::time::Duration::from_millis(500)
+                        } else {
+                            std::time::Duration::from_secs(2)
+                        };
+                        std::thread::sleep(nap);
+                        ctx.request_repaint();
+                    }
+                })
+                .ok();
+        } else {
+            self.tray = None;
+            if let Some(stop) = self.tray_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            // Nothing to hide into anymore; make sure the window is on screen.
+            if self.hidden.swap(false, Ordering::Relaxed) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
         }
     }
 
@@ -301,6 +379,18 @@ impl RockerApp {
                     }
                     self.stats.insert(container, sample);
                 }
+                Event::StatHistory { container, samples } => {
+                    if let Some(d) = &mut self.detail {
+                        if *d.id() == container {
+                            d.on_stat_history(samples);
+                        }
+                    }
+                }
+                Event::ExecAuditLog(rows) => {
+                    if let Some(d) = &mut self.detail {
+                        d.on_exec_audit(rows);
+                    }
+                }
                 Event::StatsClosed { container, reason } => {
                     if let Some(d) = &mut self.detail {
                         if *d.id() == container {
@@ -390,8 +480,14 @@ impl RockerApp {
         let mut screen = DetailScreen::new(container);
         screen.sync_state(&self.containers);
         self.engine.send(Command::Inspect(container.id.clone()));
-        self.engine.send(Command::OpenLogs(container.id.clone()));
+        self.engine.send(Command::OpenLogs {
+            container: container.id.clone(),
+            tail: rocker_engine::LogTail::default(),
+        });
         self.engine.send(Command::OpenStats(container.id.clone()));
+        self.engine
+            .send(Command::LoadStatHistory(container.id.clone()));
+        self.engine.send(Command::LoadExecAudit);
         self.detail = Some(screen);
         self.view = View::Containers;
     }
@@ -532,11 +628,24 @@ impl RockerApp {
                             }
                             ui.add_space(2.0);
                         }
-                        let open = self.view == View::Settings;
-                        if icons::toggle_icon_button(ui, pal, Icon::Sliders, open, "Settings")
-                            .clicked()
+                        let settings_open = self.view == View::Settings;
+                        if icons::toggle_icon_button(
+                            ui,
+                            pal,
+                            Icon::Sliders,
+                            settings_open,
+                            "Settings",
+                        )
+                        .clicked()
                         {
                             action = Some(HeaderAction::ToggleSettings);
+                        }
+                        ui.add_space(2.0);
+                        let groups_open = self.view == View::Groups;
+                        if icons::toggle_icon_button(ui, pal, Icon::Stack, groups_open, "Groups")
+                            .clicked()
+                        {
+                            action = Some(HeaderAction::ToggleGroups);
                         }
                         ui.add_space(style::SM);
                         self.conn_status(ui);
@@ -603,7 +712,10 @@ impl RockerApp {
         let mut dismiss = false;
         egui::Frame::new()
             .fill(pal.unhealthy.gamma_multiply(0.12))
-            .stroke(egui::Stroke::new(1.0_f32, pal.unhealthy.gamma_multiply(0.42)))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                pal.unhealthy.gamma_multiply(0.42),
+            ))
             .corner_radius(style::radius(pal.corner))
             .inner_margin(egui::Margin::symmetric(12, 10))
             .outer_margin(egui::Margin {
@@ -626,6 +738,42 @@ impl RockerApp {
             });
         if dismiss {
             self.last_error = None;
+        }
+    }
+
+    /// A quiet accent-tinted confirmation banner, same shape as
+    /// [`Self::error_banner`] but for a non-error result the user asked for.
+    fn notice_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(message) = self.last_notice.clone() else {
+            return;
+        };
+        let pal = self.pal;
+        let mut dismiss = false;
+        egui::Frame::new()
+            .fill(pal.accent.gamma_multiply(0.10))
+            .stroke(egui::Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.38)))
+            .corner_radius(style::radius(pal.corner))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .outer_margin(egui::Margin {
+                bottom: 10,
+                ..egui::Margin::ZERO
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    icons::draw(ui.painter(), Icon::Info, rect, pal.accent);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(message).color(pal.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::icon_button(ui, &pal, Icon::Close, None, "Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            });
+        if dismiss {
+            self.last_notice = None;
         }
     }
 
@@ -692,81 +840,114 @@ impl RockerApp {
     }
 
     /// What the container list asked for this frame.
+    ///
+    /// Virtualized (PLAN §8): the groups and their rows are flattened into one
+    /// list of fixed-height slots and only the slots inside the viewport are
+    /// laid out, so a 500-container host still renders a handful of rows per
+    /// frame. A collapsed group contributes just its header slot.
     fn container_list(&self, ui: &mut egui::Ui) -> Option<ListHit> {
+        use egui::collapsing_header::CollapsingState;
+
         let pal = &self.pal;
         let mut pending = None;
 
-        // Consecutive runs of one Compose project (the list is pre-sorted).
-        let mut groups: Vec<(Option<&str>, Vec<&Container>)> = Vec::new();
-        for container in &self.containers {
-            let project = container.compose_project.as_deref();
-            match groups.last_mut() {
-                Some((p, items)) if *p == project => items.push(container),
-                _ => groups.push((project, vec![container])),
+        // User groups first (PLAN §5.1), then Compose smart-grouping for
+        // whatever's left, then the ungrouped remainder.
+        let sections = rocker_core::resolve_groups(&self.containers, &self.config.groups);
+        let ids: Vec<egui::Id> = sections
+            .iter()
+            .map(|s| match &s.id {
+                rocker_core::SectionId::User(g) => {
+                    ui.make_persistent_id(("sect-user", g.0.as_str()))
+                }
+                rocker_core::SectionId::Compose(p) => {
+                    ui.make_persistent_id(("sect-compose", p.as_str()))
+                }
+                rocker_core::SectionId::Ungrouped => ui.make_persistent_id("sect-ungrouped"),
+            })
+            .collect();
+
+        // Flatten to one slot per visible row: every section's header, then its
+        // container rows while the section is open.
+        enum Slot<'a> {
+            Header(usize),
+            Row(&'a Container),
+        }
+        let mut slots: Vec<Slot> = Vec::new();
+        for (si, sec) in sections.iter().enumerate() {
+            let open = CollapsingState::load_with_default_open(ui.ctx(), ids[si], true).is_open();
+            slots.push(Slot::Header(si));
+            if open {
+                slots.extend(sec.containers.iter().map(|c| Slot::Row(c)));
             }
         }
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(10.0);
-                for (i, (project, items)) in groups.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(style::MD + 2.0);
-                    }
-                    let id = ui.make_persistent_id(("group", project.unwrap_or("")));
-                    let mut state =
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            true,
-                        );
-                    let open_t = ui.ctx().animate_bool(id.with("open"), state.is_open());
-                    let any_stopped = items.iter().any(|c| !c.state.is_active());
-                    let any_active = items.iter().any(|c| c.state.is_active());
-                    let usage = self.group_usage(items);
-                    match group_header(
-                        ui,
-                        pal,
-                        *project,
-                        items.len(),
-                        open_t,
-                        any_stopped,
-                        any_active,
-                        usage,
-                    ) {
-                        Some(GroupOutcome::Toggle) => state.toggle(ui),
-                        Some(GroupOutcome::BulkAct(action)) => {
-                            // Narrow to the containers the action actually
-                            // applies to (e.g. "start all" skips ones already
-                            // running), so it never fires a no-op call.
-                            let targets: Vec<ContainerId> = items
-                                .iter()
-                                .filter(|c| bulk_action_applies(c.state, action))
-                                .map(|c| c.id.clone())
-                                .collect();
-                            if !targets.is_empty() {
-                                pending = Some(ListHit::BulkAct(targets, action));
-                            }
-                        }
-                        None => {}
-                    }
-                    state.store(ui.ctx());
-                    state.show_body_unindented(ui, |ui| {
-                        for container in items {
-                            match container_row(ui, pal, container) {
-                                Some(RowOutcome::Act(action)) => {
-                                    pending = Some(ListHit::Act((*container).clone(), action));
+            .show_rows(ui, LIST_ROW_H, slots.len(), |ui, range| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for idx in range {
+                    match &slots[idx] {
+                        Slot::Header(si) => {
+                            let sec = &sections[*si];
+                            let sid = ids[*si];
+                            let mut state =
+                                CollapsingState::load_with_default_open(ui.ctx(), sid, true);
+                            let open_t = ui.ctx().animate_bool(sid.with("open"), state.is_open());
+                            let any_stopped = sec.containers.iter().any(|c| !c.state.is_active());
+                            let any_active = sec.containers.iter().any(|c| c.state.is_active());
+                            let usage = self.group_usage(&sec.containers);
+                            let accent = sec.color.as_deref().and_then(hex_color);
+                            ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
+                                // Header sits at the bottom of its slot; the
+                                // slack above is the section's breathing room.
+                                ui.add_space((LIST_ROW_H - 40.0).max(0.0));
+                                match group_header(
+                                    ui,
+                                    pal,
+                                    &sec.label,
+                                    accent,
+                                    sec.containers.len(),
+                                    open_t,
+                                    any_stopped,
+                                    any_active,
+                                    usage,
+                                ) {
+                                    Some(GroupOutcome::Toggle) => {
+                                        state.toggle(ui);
+                                        state.store(ui.ctx());
+                                    }
+                                    Some(GroupOutcome::BulkAct(action)) => {
+                                        let targets: Vec<ContainerId> = sec
+                                            .containers
+                                            .iter()
+                                            .filter(|c| bulk_action_applies(c.state, action))
+                                            .map(|c| c.id.clone())
+                                            .collect();
+                                        if !targets.is_empty() {
+                                            pending = Some(ListHit::BulkAct(targets, action));
+                                        }
+                                    }
+                                    None => {}
                                 }
-                                Some(RowOutcome::Open) => {
-                                    pending = Some(ListHit::Open((*container).clone()));
-                                }
-                                None => {}
-                            }
+                            });
                         }
-                    });
+                        Slot::Row(container) => {
+                            ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
+                                match container_row(ui, pal, container) {
+                                    Some(RowOutcome::Act(action)) => {
+                                        pending = Some(ListHit::Act((*container).clone(), action));
+                                    }
+                                    Some(RowOutcome::Open) => {
+                                        pending = Some(ListHit::Open((*container).clone()));
+                                    }
+                                    None => {}
+                                }
+                            });
+                        }
+                    }
                 }
-                ui.add_space(6.0);
             });
         pending
     }
@@ -783,13 +964,24 @@ impl RockerApp {
             config_path: &cfg_path,
         };
 
+        let tray_wanted_before =
+            self.config.settings.minimize_to_tray || self.config.settings.start_minimized;
+
         if let Some(edit) =
             settings::settings_screen(ui, &self.pal, &mut self.config.settings, about)
         {
             self.engine.send(Command::SetMaxStatsStreams(
                 self.config.settings.max_stats_streams,
             ));
+            self.engine.send(Command::SetStatsRetentionHours(
+                self.config.settings.stats_retention_hours,
+            ));
             self.persist();
+            let tray_wanted_now =
+                self.config.settings.minimize_to_tray || self.config.settings.start_minimized;
+            if tray_wanted_now != tray_wanted_before {
+                self.set_tray_enabled(tray_wanted_now, ctx);
+            }
             if edit.theme_changed {
                 self.apply_theme(ctx);
             }
@@ -843,6 +1035,12 @@ impl RockerApp {
         }
     }
 
+    fn groups_view(&mut self, ui: &mut egui::Ui) {
+        if groups::groups_screen(ui, &self.pal, &mut self.config.groups, &self.containers) {
+            self.persist();
+        }
+    }
+
     /// Render the open container screen and act on whatever it asks for.
     fn detail_view(&mut self, ui: &mut egui::Ui) {
         let response = self
@@ -853,8 +1051,45 @@ impl RockerApp {
         for cmd in response.commands {
             self.engine.send(cmd);
         }
+        if let Some(export) = response.export {
+            self.write_log_export(export);
+        }
         if response.back {
             self.close_detail();
+        }
+    }
+
+    /// Write a Logs-tab export under `data/rocker/exports/` and report the path
+    /// in the notice banner. Kept off the UI thread's hot path — it only runs
+    /// on an explicit button press.
+    fn write_log_export(&mut self, export: crate::detail::LogExport) {
+        let dir = self.paths.exports_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let safe: String = export
+            .container
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let name = if safe.is_empty() {
+            "container".into()
+        } else {
+            safe
+        };
+        let path = dir.join(format!("{name}-{stamp}.log"));
+        match std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, export.body.as_bytes()))
+        {
+            Ok(()) => self.last_notice = Some(format!("Logs exported to {}", path.display())),
+            Err(e) => self.last_error = Some(format!("Couldn't export logs: {e}")),
         }
     }
 }
@@ -864,7 +1099,7 @@ impl eframe::App for RockerApp {
         self.drain_events();
         self.service_tray(ctx);
 
-        if self.view == View::Settings && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.view != View::Containers && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.view = View::Containers;
         }
 
@@ -875,9 +1110,20 @@ impl eframe::App for RockerApp {
                     if self.view == View::Containers {
                         self.close_detail();
                     }
-                    self.view = match self.view {
-                        View::Settings => View::Containers,
-                        View::Containers => View::Settings,
+                    self.view = if self.view == View::Settings {
+                        View::Containers
+                    } else {
+                        View::Settings
+                    };
+                }
+                HeaderAction::ToggleGroups => {
+                    if self.view == View::Containers {
+                        self.close_detail();
+                    }
+                    self.view = if self.view == View::Groups {
+                        View::Containers
+                    } else {
+                        View::Groups
                     };
                 }
             }
@@ -891,9 +1137,11 @@ impl eframe::App for RockerApp {
             )
             .show(ctx, |ui| {
                 self.error_banner(ui);
+                self.notice_banner(ui);
 
                 match self.view {
                     View::Settings => self.settings_view(ui, ctx),
+                    View::Groups => self.groups_view(ui),
                     View::Containers if self.detail.is_some() => self.detail_view(ui),
                     View::Containers => self.containers_view(ui),
                 }

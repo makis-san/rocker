@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 /// show a rate.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StatSample {
+    /// Wall-clock time the sample was taken, Unix milliseconds. Stamped by the
+    /// engine when it emits the sample; the history plot and the `redb` store
+    /// both key off it. `0` for a sample built without a clock (tests).
+    #[serde(default)]
+    pub ts_ms: u64,
     /// CPU use as a percentage of one core (so 250.0 == 2.5 cores busy).
     pub cpu_pct: f32,
     /// Cores visible to the container, for scaling the CPU axis.

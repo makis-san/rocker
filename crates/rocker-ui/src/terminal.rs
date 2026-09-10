@@ -1,14 +1,35 @@
 //! Rendering and input for the in-app terminal.
 //!
-//! [`rocker_term::Screen`] holds the VT grid; this module paints it with one
-//! monospace galley per row (batched into style runs) and translates `egui`
-//! key/text events into the byte stream a PTY expects. The exec transport lives
-//! in `rocker-engine`; nothing here talks to Docker directly.
+//! [`rocker_term::Screen`] holds the VT grid; this module paints it as one
+//! monospace [`egui::text::LayoutJob`] per row, and caches the resulting galley
+//! keyed by a content hash so an unchanged row costs nothing to re-lay (PLAN
+//! §2, §9). It also translates `egui` key/text events into the byte stream a
+//! PTY expects. The exec transport lives in `rocker-engine`; nothing here talks
+//! to Docker directly.
 
-use egui::{vec2, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, Vec2};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+use egui::text::{LayoutJob, TextFormat};
+use egui::{vec2, Color32, FontId, Galley, Rect, Sense, Stroke, StrokeKind, Vec2};
 use rocker_term::{keys, Cell, Color, Screen};
 
 use crate::style::{self, Palette};
+
+/// Per-row galley cache for one terminal surface. A row whose content hash is
+/// unchanged since last frame reuses its laid-out galley instead of rebuilding
+/// the style runs and re-shaping the text.
+#[derive(Default)]
+pub struct RowCache {
+    rows: Vec<Option<(u64, Arc<Galley>)>>,
+}
+
+impl RowCache {
+    /// Drop everything — used when the session restarts.
+    pub fn clear(&mut self) {
+        self.rows.clear();
+    }
+}
 
 /// Point size for the terminal's monospace grid.
 pub const FONT_PT: f32 = 13.0;
@@ -61,79 +82,47 @@ fn indexed(pal: &Palette, i: u8) -> Color32 {
     }
 }
 
-/// Paint the grid inside `rect`. Returns the response covering the grid so the
-/// caller can manage focus.
-pub fn paint(ui: &mut egui::Ui, pal: &Palette, screen: &Screen, rect: Rect, focused: bool) {
+/// Paint the grid inside `rect`, reusing `cache`'s galley for any row whose
+/// content (and the palette) is unchanged since last frame.
+pub fn paint(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    screen: &Screen,
+    rect: Rect,
+    focused: bool,
+    cache: &mut RowCache,
+) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, style::radius(pal.corner), pal.term_bg);
 
     let cs = cell_size(ui);
-    let font = FontId::monospace(FONT_PT);
-    let (cols, rows) = screen.size();
+    let (_, rows) = screen.size();
     let origin = rect.left_top() + vec2(6.0, 5.0);
+    let pal_fp = palette_fingerprint(pal);
+
+    if cache.rows.len() != rows as usize {
+        cache.rows.clear();
+        cache.rows.resize(rows as usize, None);
+    }
 
     for (y, row) in screen.rows().enumerate() {
-        if y as u16 >= rows {
+        if y >= rows as usize {
             break;
         }
-        let y_px = origin.y + y as f32 * cs.y;
-
-        // Background runs first, so glyphs sit on top of their cell fill.
-        let mut x0 = 0usize;
-        while x0 < row.len() {
-            let bg = run_bg(pal, &row[x0]);
-            let mut x1 = x0 + 1;
-            while x1 < row.len() && run_bg(pal, &row[x1]) == bg {
-                x1 += 1;
+        let h = row_hash(pal_fp, row);
+        let galley = match &cache.rows[y] {
+            Some((cached, g)) if *cached == h => g.clone(),
+            _ => {
+                let g = ui.fonts_mut(|f| f.layout_job(row_job(pal, row)));
+                cache.rows[y] = Some((h, g.clone()));
+                g
             }
-            if let Some(fill) = bg {
-                let r = Rect::from_min_size(
-                    egui::pos2(origin.x + x0 as f32 * cs.x, y_px),
-                    vec2((x1 - x0) as f32 * cs.x, cs.y),
-                );
-                painter.rect_filled(r, 0.0, fill);
-            }
-            x0 = x1;
-        }
-
-        // Then glyph runs sharing fg + attributes.
-        let mut x = 0usize;
-        while x < row.len() {
-            let cell = row[x];
-            if cell.ch == ' ' && !cell.underline {
-                x += 1;
-                continue;
-            }
-            let key = style_key(&cell);
-            let mut text = String::new();
-            let start = x;
-            while x < row.len() {
-                let c = row[x];
-                if style_key(&c) != key {
-                    break;
-                }
-                text.push(if c.ch == '\0' { ' ' } else { c.ch });
-                x += 1;
-            }
-            let mut fg = resolve(pal, cell.fg, true);
-            if cell.inverse {
-                fg = resolve(pal, cell.bg, false);
-            }
-            if cell.dim {
-                fg = fg.lerp_to_gamma(pal.term_bg, 0.4);
-            }
-            let pos = egui::pos2(origin.x + start as f32 * cs.x, y_px);
-            painter.text(pos, Align2::LEFT_TOP, &text, font.clone(), fg);
-            if cell.underline {
-                let uy = y_px + cs.y - 1.5;
-                painter.hline(
-                    pos.x..=pos.x + (x - start) as f32 * cs.x,
-                    uy,
-                    Stroke::new(1.0_f32, fg),
-                );
-            }
-        }
-        let _ = cols;
+        };
+        painter.galley(
+            egui::pos2(origin.x, origin.y + y as f32 * cs.y),
+            galley,
+            pal.term_fg,
+        );
     }
 
     // Cursor.
@@ -157,22 +146,90 @@ pub fn paint(ui: &mut egui::Ui, pal: &Palette, screen: &Screen, rect: Rect, focu
     }
 }
 
-fn run_bg(pal: &Palette, c: &Cell) -> Option<Color32> {
-    let bg = if c.inverse {
-        resolve(pal, c.fg, true)
-    } else {
-        match c.bg {
-            Color::Default => return None,
-            other => resolve(pal, other, false),
-        }
+/// The effective (foreground, optional background) a cell paints in, after
+/// inverse and dim are folded in.
+fn cell_colors(pal: &Palette, c: &Cell) -> (Color32, Option<Color32>) {
+    let mut fg = resolve(pal, c.fg, true);
+    let mut bg = match c.bg {
+        Color::Default => None,
+        other => Some(resolve(pal, other, false)),
     };
-    Some(bg)
+    if c.inverse {
+        let f = resolve(pal, c.fg, true);
+        bg = Some(f);
+        fg = resolve(pal, c.bg, false);
+    }
+    if c.dim {
+        fg = fg.lerp_to_gamma(pal.term_bg, 0.4);
+    }
+    (fg, bg)
 }
 
-/// A hashable-ish key so consecutive cells with the same visual style batch into
-/// one `painter.text` call.
-fn style_key(c: &Cell) -> (Color, bool, bool, bool) {
-    (c.fg, c.bold, c.italic, c.inverse)
+/// Build one row as a single `LayoutJob`, coalescing cells that share a visual
+/// style into one styled run. Spaces are kept so background fills and the
+/// monospace advance stay correct.
+fn row_job(pal: &Palette, row: &[Cell]) -> LayoutJob {
+    let font = FontId::monospace(FONT_PT);
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+
+    let mut x = 0usize;
+    while x < row.len() {
+        let (fg, bg) = cell_colors(pal, &row[x]);
+        let underline = row[x].underline;
+        let italics = row[x].italic;
+        let mut text = String::new();
+        while x < row.len() {
+            let c = row[x];
+            let (cfg, cbg) = cell_colors(pal, &c);
+            if cfg != fg || cbg != bg || c.underline != underline || c.italic != italics {
+                break;
+            }
+            text.push(if c.ch == '\0' || c.ch == ' ' {
+                ' '
+            } else {
+                c.ch
+            });
+            x += 1;
+        }
+        job.append(
+            &text,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: fg,
+                background: bg.unwrap_or(Color32::TRANSPARENT),
+                italics,
+                underline: if underline {
+                    Stroke::new(1.0, fg)
+                } else {
+                    Stroke::NONE
+                },
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+/// Hash a row's cells together with a palette fingerprint, so a theme change
+/// invalidates every cached galley even though the cells didn't change.
+fn row_hash(pal_fp: u64, row: &[Cell]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    pal_fp.hash(&mut h);
+    row.hash(&mut h);
+    h.finish()
+}
+
+fn palette_fingerprint(pal: &Palette) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for c in [pal.term_bg, pal.term_fg, pal.accent] {
+        c.to_array().hash(&mut h);
+    }
+    for c in pal.term_ansi {
+        c.to_array().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// An interactive surface for the grid: click to focus, and while focused it
@@ -300,4 +357,64 @@ fn ctrl_combo(key: egui::Key) -> Option<u8> {
         _ => return None,
     };
     keys::ctrl_byte(ch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(ch: char) -> Cell {
+        Cell {
+            ch,
+            ..Cell::default()
+        }
+    }
+
+    #[test]
+    fn row_hash_tracks_content_and_palette() {
+        let row_a = [cell('h'), cell('i'), cell(' ')];
+        let row_b = [cell('h'), cell('o'), cell(' ')];
+
+        assert_eq!(row_hash(1, &row_a), row_hash(1, &row_a), "stable");
+        assert_ne!(row_hash(1, &row_a), row_hash(1, &row_b), "content change");
+        assert_ne!(
+            row_hash(1, &row_a),
+            row_hash(2, &row_a),
+            "palette change invalidates"
+        );
+
+        let mut bold = row_a;
+        bold[0].bold = true;
+        assert_ne!(row_hash(1, &row_a), row_hash(1, &bold), "attr change");
+    }
+
+    #[test]
+    fn paint_reuses_cached_rows() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let mut screen = Screen::new(20, 6);
+        screen.feed(b"hello world\r\nsecond line\r\n");
+        let mut cache = RowCache::default();
+
+        let render = |cache: &mut RowCache| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect =
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+                    paint(ui, &pal, &screen, rect, true, cache);
+                });
+            });
+        };
+
+        render(&mut cache);
+        let first: Vec<u64> = cache.rows.iter().flatten().map(|(h, _)| *h).collect();
+        assert_eq!(cache.rows.len(), 6);
+
+        render(&mut cache);
+        let second: Vec<u64> = cache.rows.iter().flatten().map(|(h, _)| *h).collect();
+        assert_eq!(
+            first, second,
+            "unchanged rows keep their hash across frames"
+        );
+    }
 }

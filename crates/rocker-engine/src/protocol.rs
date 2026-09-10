@@ -4,7 +4,7 @@
 //! tasks post [`Event`]s back; the UI drains them each frame and requests a
 //! repaint (PLAN §3.2).
 
-use rocker_core::{ConnectionId, Container, ContainerDetail, ContainerId, StatSample};
+use rocker_core::{ConnectionId, Container, ContainerDetail, ContainerId, ExecAudit, StatSample};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleAction {
@@ -41,10 +41,41 @@ pub enum LogStream {
     Stderr,
 }
 
+/// How much history to pull before switching to follow mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTail {
+    /// The last `n` lines.
+    Lines(u32),
+    /// Every line the engine still has.
+    All,
+}
+
+impl LogTail {
+    /// The value Docker's `tail=` query parameter expects.
+    pub fn as_param(self) -> String {
+        match self {
+            LogTail::Lines(n) => n.to_string(),
+            LogTail::All => "all".to_string(),
+        }
+    }
+}
+
+impl Default for LogTail {
+    fn default() -> Self {
+        LogTail::Lines(400)
+    }
+}
+
 /// One line of container output, newline stripped.
+///
+/// The engine always asks Docker for timestamps, so `ts` is populated whenever
+/// Docker prefixed the line with one (`Some` for real container output, `None`
+/// for a synthetic line the client itself produced). The UI decides whether to
+/// show it — toggling that is a pure view change, no stream restart.
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub stream: LogStream,
+    pub ts: Option<String>,
     pub text: String,
 }
 
@@ -77,8 +108,13 @@ pub enum Command {
     },
     /// One-shot full inspect of a container for the Overview tab.
     Inspect(ContainerId),
-    /// Start following a container's logs (tail + follow).
-    OpenLogs(ContainerId),
+    /// Start following a container's logs: pull `tail` of history, then follow.
+    /// Sending this again (e.g. after the tail size changes) replaces the
+    /// running stream.
+    OpenLogs {
+        container: ContainerId,
+        tail: LogTail,
+    },
     CloseLogs,
     /// Start streaming a container's resource stats. Independent callers (a
     /// group's combined header total, a detail screen) can each open the same
@@ -90,11 +126,26 @@ pub enum Command {
     /// evicting the least-recently-opened streams right away if it's now
     /// lower than what's currently open.
     SetMaxStatsStreams(usize),
+    /// Set how long usage samples are kept in the history store before the
+    /// prune timer drops them (Settings > retention).
+    SetStatsRetentionHours(u32),
+    /// Read this container's persisted usage history and answer with
+    /// [`Event::StatHistory`], so the Stats tab opens with real history rather
+    /// than a blank chart that fills over minutes.
+    LoadStatHistory(ContainerId),
+    /// Read recent terminal-session audit rows and answer with
+    /// [`Event::ExecAuditLog`].
+    LoadExecAudit,
     /// Open an interactive `exec` shell session in a container.
     OpenExec(ContainerId),
-    /// Bytes typed into the terminal, forwarded to the exec stdin.
+    /// Attach to the container's main process stdio (PLAN §5.3). Shares the
+    /// entrypoint's TTY — input, Ctrl-C and resize reach it directly. Uses the
+    /// same `Exec*` input/output/close vocabulary as a shell session; only one
+    /// interactive session is open at a time.
+    OpenAttach(ContainerId),
+    /// Bytes typed into the terminal, forwarded to the session's stdin.
     ExecInput(Vec<u8>),
-    /// The terminal grid was resized; mirror it to the exec TTY.
+    /// The terminal grid was resized; mirror it to the session's TTY.
     ExecResize {
         cols: u16,
         rows: u16,
@@ -140,6 +191,15 @@ pub enum Event {
         container: ContainerId,
         sample: StatSample,
     },
+    /// A container's persisted usage history, oldest first (answer to
+    /// [`Command::LoadStatHistory`]). Empty if there is no store or no rows.
+    StatHistory {
+        container: ContainerId,
+        samples: Vec<StatSample>,
+    },
+    /// Recent terminal-session audit rows, newest first (answer to
+    /// [`Command::LoadExecAudit`]).
+    ExecAuditLog(Vec<ExecAudit>),
     /// A stats stream ended — closed deliberately, the container stopped, an
     /// engine error, or LRU eviction past the stats-stream cap.
     StatsClosed {

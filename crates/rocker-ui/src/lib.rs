@@ -7,6 +7,7 @@ mod app;
 mod autostart;
 mod detail;
 mod format;
+mod groups;
 mod icons;
 mod settings;
 mod style;

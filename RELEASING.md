@@ -13,8 +13,15 @@ Everything is triggered by pushing a version tag; nothing is uploaded by hand.
 
 The `.deb`/`.rpm` also install a desktop entry, AppStream metadata, and an icon
 (`packaging/linux/`), so Rocker shows up in the GNOME/KDE application menu.
-A Flatpak manifest exists too (`flatpak/`) for a Flathub submission, but that's
-a separate, manual process — see `flatpak/README.md`.
+A Flatpak manifest exists too (`flatpak/`) but it is community maintained, not
+the recommended path.
+
+The primary install path is the **`install.sh` / `install.ps1`** scripts at the
+repo root: they fetch the `.tar.xz`/`.zip` archive, verify it against
+`SHA256SUMS` (+ `SHA256SUMS.minisig` once a key is configured), and run
+`rocker install`, which writes the desktop entry, icon set, and URL handler
+into `~/.local` with no package manager. `rocker self-update` uses the same two
+files. See `.local/DISTRIBUTION.md` for the design.
 
 ## How it's wired
 
@@ -27,9 +34,12 @@ a separate, manual process — see `flatpak/README.md`.
 - **`.github/workflows/linux-packages.yml`** — hand-written, runs after
   `release.yml` finishes and attaches `.deb`/`.rpm` packages (`dist` has no
   Debian/RPM support as of 0.28.7).
+- **`.github/workflows/checksums.yml`** — hand-written, runs after
+  `linux-packages.yml` and attaches a single `SHA256SUMS` over every release
+  asset, plus `SHA256SUMS.minisig` when the signing secret is set.
 
-Both trigger on pushing a tag matching `v<major>.<minor>.<patch>` (or a bare
-`<major>.<minor>.<patch>`).
+`release.yml` triggers on pushing a tag matching `v<major>.<minor>.<patch>` (or
+a bare `<major>.<minor>.<patch>`); the other two chain off it via `workflow_run`.
 
 ## Cutting a release
 
@@ -52,6 +62,31 @@ push it:
 Until that secret exists, the `publish-homebrew-formula` job in `release.yml`
 will fail — the rest of the release (binaries, shell/MSI installers) still
 succeeds independently.
+
+## Release signing key
+
+`install.sh`, `install.ps1`, and `rocker self-update` verify `SHA256SUMS` with a
+minisign public key.
+
+- **Public key** (`RWTfmkhmM6bfkPa36B5q/LZZ4LEY5tVCqAO5t5fkiGbOBp5ztbkwc3VE`,
+  keyid `90DFA63366489ADF`) is compiled into `crates/rocker-setup/src/update.rs`
+  (`MINISIGN_PUBKEY`), `install.sh` (`ROCKER_MINISIGN_PUBKEY`), and `install.ps1`
+  (`$MinisignPubKey`).
+- **Private key** is the passwordless key in the `MINISIGN_SECRET_KEY` repo
+  secret; `checksums.yml` uses `rsign2` to produce `SHA256SUMS.minisig`.
+
+`rocker self-update` always enforces the signature (fails closed). The install
+scripts enforce the HTTPS checksum always and the signature when `minisign` is
+on `PATH`.
+
+Verify a release by hand with `minisign -Vm SHA256SUMS -P <public key>` (or
+`rsign verify -P <public key> SHA256SUMS`).
+
+### Rotating the key
+
+Generate a new one (`rsign generate -W -p rocker.pub -s rocker.key`), replace
+the public key in the three files above, and update the `MINISIGN_SECRET_KEY`
+secret with the new `rocker.key`.
 
 ## Why macOS builds are unsigned
 

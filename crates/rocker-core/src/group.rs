@@ -68,18 +68,111 @@ impl Group {
 }
 
 fn rule_matches(rule: &GroupRule, c: &Container) -> bool {
-    if let Some(g) = &rule.name_glob {
+    // An entirely empty rule matches nothing — a group with no selector is a
+    // mistake, not "everything".
+    if rule.name_glob.as_deref().unwrap_or("").is_empty()
+        && rule.image_glob.as_deref().unwrap_or("").is_empty()
+        && rule.labels.is_empty()
+    {
+        return false;
+    }
+    if let Some(g) = rule.name_glob.as_deref().filter(|s| !s.is_empty()) {
         if !glob_match(g, &c.name) {
             return false;
         }
     }
-    if let Some(g) = &rule.image_glob {
+    if let Some(g) = rule.image_glob.as_deref().filter(|s| !s.is_empty()) {
         if !glob_match(g, &c.image) {
             return false;
         }
     }
-    // Label matching is wired once the engine layer surfaces labels.
+    for (k, v) in &rule.labels {
+        let hit = c
+            .labels
+            .iter()
+            .any(|(ck, cv)| ck == k && (v.is_empty() || cv == v));
+        if !hit {
+            return false;
+        }
+    }
     true
+}
+
+/// Which kind of section a resolved row belongs to. `User` sections are
+/// editable/removable in the Groups screen; the others are automatic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectionId {
+    User(GroupId),
+    Compose(String),
+    Ungrouped,
+}
+
+/// One rendered section of the container list.
+pub struct ResolvedSection<'a> {
+    pub id: SectionId,
+    pub label: String,
+    /// `#rrggbb` accent for a user group, `None` for an automatic section.
+    pub color: Option<String>,
+    pub containers: Vec<&'a Container>,
+}
+
+/// Resolve `containers` (already sorted by the caller) and the user `groups`
+/// into display sections (PLAN §5.1):
+///
+/// 1. every user group that currently has at least one member, in config
+///    order — a container can appear under more than one;
+/// 2. then the containers claimed by no user group, smart-grouped by Compose
+///    project (consecutive runs), with the project-less remainder last.
+pub fn resolve<'a>(containers: &'a [Container], groups: &[Group]) -> Vec<ResolvedSection<'a>> {
+    let mut out: Vec<ResolvedSection<'a>> = Vec::new();
+    let mut claimed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for g in groups {
+        let members: Vec<&Container> = containers.iter().filter(|c| g.contains(c)).collect();
+        for c in &members {
+            claimed.insert(c.id.0.as_str());
+        }
+        if members.is_empty() {
+            continue;
+        }
+        out.push(ResolvedSection {
+            id: SectionId::User(g.id.clone()),
+            label: g.name.clone(),
+            color: Some(g.color.clone()),
+            containers: members,
+        });
+    }
+
+    let leftover: Vec<&Container> = containers
+        .iter()
+        .filter(|c| !claimed.contains(c.id.0.as_str()))
+        .collect();
+
+    let mut i = 0;
+    while i < leftover.len() {
+        let project = leftover[i].compose_project.as_deref();
+        let start = i;
+        while i < leftover.len() && leftover[i].compose_project.as_deref() == project {
+            i += 1;
+        }
+        let run = leftover[start..i].to_vec();
+        out.push(match project {
+            Some(p) => ResolvedSection {
+                id: SectionId::Compose(p.to_string()),
+                label: p.to_string(),
+                color: None,
+                containers: run,
+            },
+            None => ResolvedSection {
+                id: SectionId::Ungrouped,
+                label: "Ungrouped".to_string(),
+                color: None,
+                containers: run,
+            },
+        });
+    }
+
+    out
 }
 
 /// Minimal `*` / `?` glob, case-sensitive. Good enough for name and image
@@ -109,21 +202,101 @@ mod tests {
         assert!(!glob_match("api?", "api"));
     }
 
-    #[test]
-    fn member_key_prefers_compose() {
-        let mut c = Container {
-            id: crate::ContainerId::new("abc123"),
-            name: "proj-web-1".into(),
-            image: "nginx".into(),
+    fn container(name: &str, image: &str) -> Container {
+        Container {
+            id: crate::ContainerId::new(format!("id-{name}")),
+            name: name.into(),
+            image: image.into(),
             state: crate::ContainerState::Running,
             status: "Up".into(),
             ports: vec![],
-            compose_project: Some("proj".into()),
-            compose_service: Some("web".into()),
-        };
+            compose_project: None,
+            compose_service: None,
+            labels: vec![],
+        }
+    }
+
+    #[test]
+    fn member_key_prefers_compose() {
+        let mut c = container("proj-web-1", "nginx");
+        c.compose_project = Some("proj".into());
+        c.compose_service = Some("web".into());
         assert_eq!(Group::member_key(&c), "compose:proj/web");
         c.compose_service = None;
         c.compose_project = None;
         assert_eq!(Group::member_key(&c), "name:proj-web-1");
+    }
+
+    #[test]
+    fn rule_matches_globs_and_labels() {
+        let mut c = container("api-1", "ghcr.io/acme/api:1.2");
+        c.labels = vec![("tier".into(), "backend".into())];
+
+        let r = GroupRule {
+            name_glob: Some("api-*".into()),
+            image_glob: None,
+            labels: vec![],
+        };
+        assert!(rule_matches(&r, &c));
+        assert!(!rule_matches(
+            &GroupRule {
+                name_glob: Some("web-*".into()),
+                ..r.clone()
+            },
+            &c
+        ));
+
+        // Label selector: key-only matches any value; key=value must match.
+        assert!(rule_matches(
+            &GroupRule {
+                name_glob: None,
+                image_glob: None,
+                labels: vec![("tier".into(), String::new())],
+            },
+            &c
+        ));
+        assert!(!rule_matches(
+            &GroupRule {
+                name_glob: None,
+                image_glob: None,
+                labels: vec![("tier".into(), "frontend".into())],
+            },
+            &c
+        ));
+
+        // An empty rule matches nothing.
+        assert!(!rule_matches(&GroupRule::default(), &c));
+    }
+
+    #[test]
+    fn resolve_sections_user_then_smart() {
+        let mut a = container("a", "img");
+        a.compose_project = Some("proj".into());
+        let mut b = container("b", "img");
+        b.compose_project = Some("proj".into());
+        let mut cc = container("db", "postgres");
+        cc.labels = vec![("role".into(), "db".into())];
+        let list = vec![a, b, cc];
+
+        let groups = vec![Group {
+            id: GroupId::new("g1"),
+            name: "Databases".into(),
+            color: "#886644".into(),
+            icon: String::new(),
+            kind: GroupKind::Rule {
+                rule: GroupRule {
+                    name_glob: None,
+                    image_glob: Some("postgres*".into()),
+                    labels: vec![],
+                },
+            },
+        }];
+
+        let sections = resolve(&list, &groups);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].id, SectionId::User(GroupId::new("g1")));
+        assert_eq!(sections[0].containers.len(), 1);
+        assert_eq!(sections[1].id, SectionId::Compose("proj".into()));
+        assert_eq!(sections[1].containers.len(), 2);
     }
 }

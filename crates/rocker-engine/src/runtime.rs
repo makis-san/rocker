@@ -10,6 +10,7 @@
 //! reassignment. The command loop itself never blocks on a stream.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +19,18 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use rocker_core::{ConnectionId, ContainerId};
+use rocker_core::{ConnectionId, ContainerId, ExecAudit};
+use rocker_store::HistoryStore;
 
-use crate::protocol::{Command, Event, LogLine, LogStream};
+use crate::protocol::{Command, Event, LogLine, LogStream, LogTail};
 use crate::service::{self, DockerService, LocalDocker};
+
+/// Default retention window until the UI sends the persisted value.
+const DEFAULT_RETENTION_HOURS: u64 = 24;
+/// The exec audit log is kept far longer than usage samples — it's tiny.
+const AUDIT_RETENTION_MS: u64 = 90 * 24 * 3600 * 1000;
+/// How often the prune timer sweeps the history store.
+const PRUNE_EVERY: Duration = Duration::from_secs(300);
 
 pub struct EngineHandle {
     commands: UnboundedSender<Command>,
@@ -48,10 +57,13 @@ const DEFAULT_MAX_STATS_STREAMS: usize = 12;
 /// Spawn the engine task on `rt` and return its handle.
 ///
 /// `repaint` is invoked after every emitted event; wire it to
-/// `egui::Context::request_repaint`.
+/// `egui::Context::request_repaint`. `history`, when present, receives usage
+/// samples and exec-audit rows, and a background timer prunes it to the
+/// retention window (updated via [`Command::SetStatsRetentionHours`]).
 pub fn start(
     rt: &tokio::runtime::Handle,
     repaint: impl Fn() + Send + Sync + 'static,
+    history: Option<Arc<HistoryStore>>,
 ) -> EngineHandle {
     let (cmd_tx, cmd_rx) = unbounded_channel::<Command>();
     let (evt_tx, evt_rx) = unbounded_channel::<Event>();
@@ -61,10 +73,34 @@ pub fn start(
         repaint: Arc::new(repaint),
     };
 
+    let retention_ms = Arc::new(AtomicU64::new(DEFAULT_RETENTION_HOURS * 3600 * 1000));
+
+    if let Some(h) = history.clone() {
+        let ret = retention_ms.clone();
+        rt.spawn(async move {
+            let mut tick = tokio::time::interval(PRUNE_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let now = now_ms();
+                let usage_before = now.saturating_sub(ret.load(Ordering::Relaxed));
+                let h = h.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = h.prune_samples(usage_before);
+                    let _ = h.prune_exec(now.saturating_sub(AUDIT_RETENTION_MS));
+                })
+                .await;
+            }
+        });
+    }
+
     rt.spawn(async move {
         let mut task = EngineTask {
             docker: None,
+            connection: None,
             emitter,
+            history,
+            retention_ms,
             logs: None,
             stats: HashMap::new(),
             stats_order: VecDeque::new(),
@@ -124,7 +160,13 @@ enum ExecMsg {
 
 struct EngineTask {
     docker: Option<LocalDocker>,
+    /// The connection id currently in use, for the exec audit trail.
+    connection: Option<ConnectionId>,
     emitter: Emitter,
+    /// Persisted usage + audit history, when a store opened.
+    history: Option<Arc<HistoryStore>>,
+    /// Retention window in milliseconds, shared with the prune timer.
+    retention_ms: Arc<AtomicU64>,
     logs: Option<StreamTask>,
     /// One entry per container currently streaming stats, plus how many
     /// callers have it open (the list view's group aggregates and a detail
@@ -150,12 +192,19 @@ impl EngineTask {
                     self.bulk_lifecycle(containers, action)
                 }
                 Command::Inspect(id) => self.inspect(id),
-                Command::OpenLogs(id) => self.open_logs(id),
+                Command::OpenLogs { container, tail } => self.open_logs(container, tail),
                 Command::CloseLogs => self.logs = None,
                 Command::OpenStats(id) => self.open_stats(id),
                 Command::CloseStats(id) => self.close_stats(id),
                 Command::SetMaxStatsStreams(n) => self.set_max_stats_streams(n),
+                Command::SetStatsRetentionHours(h) => {
+                    self.retention_ms
+                        .store((h as u64).max(1) * 3600 * 1000, Ordering::Relaxed);
+                }
+                Command::LoadStatHistory(id) => self.load_stat_history(id),
+                Command::LoadExecAudit => self.load_exec_audit(),
                 Command::OpenExec(id) => self.open_exec(id),
+                Command::OpenAttach(id) => self.open_attach(id),
                 Command::ExecInput(bytes) => {
                     if let Some(exec) = &self.exec {
                         let _ = exec.input.send(ExecMsg::Data(bytes));
@@ -178,6 +227,7 @@ impl EngineTask {
         self.stats.clear();
         self.stats_order.clear();
         self.exec = None;
+        self.connection = Some(id.clone());
 
         match LocalDocker::connect() {
             Ok(docker) => match docker.version().await {
@@ -301,7 +351,7 @@ impl EngineTask {
         });
     }
 
-    fn open_logs(&mut self, id: ContainerId) {
+    fn open_logs(&mut self, id: ContainerId, tail: LogTail) {
         self.logs = None;
         let Some(docker) = self.docker.clone() else {
             self.emitter.emit(Event::LogsClosed {
@@ -310,7 +360,7 @@ impl EngineTask {
             return;
         };
         let em = self.emitter.clone();
-        let handle = tokio::spawn(async move { run_logs(docker.raw(), id, em).await });
+        let handle = tokio::spawn(async move { run_logs(docker.raw(), id, tail, em).await });
         self.logs = Some(StreamTask(handle));
     }
 
@@ -336,9 +386,54 @@ impl EngineTask {
         }
         let em = self.emitter.clone();
         let cid = id.clone();
-        let handle = tokio::spawn(async move { run_stats(docker.raw(), cid, em).await });
+        let history = self.history.clone();
+        let handle = tokio::spawn(async move { run_stats(docker.raw(), cid, em, history).await });
         self.stats.insert(id.clone(), (StreamTask(handle), 1));
         self.stats_order.push_back(id);
+    }
+
+    /// Read `id`'s persisted usage history over the current retention window
+    /// (down-sampled) and answer with [`Event::StatHistory`]. Empty answer if
+    /// no store opened.
+    fn load_stat_history(&self, id: ContainerId) {
+        let Some(history) = self.history.clone() else {
+            self.emitter.emit(Event::StatHistory {
+                container: id,
+                samples: Vec::new(),
+            });
+            return;
+        };
+        let since = now_ms().saturating_sub(self.retention_ms.load(Ordering::Relaxed));
+        let em = self.emitter.clone();
+        tokio::spawn(async move {
+            let cid = id.0.clone();
+            let samples = tokio::task::spawn_blocking(move || {
+                history.samples_since(&cid, since, 3000).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            em.emit(Event::StatHistory {
+                container: id,
+                samples,
+            });
+        });
+    }
+
+    /// Read the most recent exec-audit rows and answer with
+    /// [`Event::ExecAuditLog`].
+    fn load_exec_audit(&self) {
+        let Some(history) = self.history.clone() else {
+            self.emitter.emit(Event::ExecAuditLog(Vec::new()));
+            return;
+        };
+        let em = self.emitter.clone();
+        tokio::spawn(async move {
+            let rows =
+                tokio::task::spawn_blocking(move || history.recent_exec(200).unwrap_or_default())
+                    .await
+                    .unwrap_or_default();
+            em.emit(Event::ExecAuditLog(rows));
+        });
     }
 
     /// Drop one opener's claim on `id`'s stream, closing it once nobody else
@@ -379,6 +474,17 @@ impl EngineTask {
         false
     }
 
+    fn audit_ctx(&self) -> AuditCtx {
+        AuditCtx {
+            history: self.history.clone(),
+            connection_id: self
+                .connection
+                .as_ref()
+                .map(|c| c.0.clone())
+                .unwrap_or_else(|| "local".into()),
+        }
+    }
+
     fn open_exec(&mut self, id: ContainerId) {
         self.exec = None;
         let Some(docker) = self.docker.clone() else {
@@ -389,7 +495,26 @@ impl EngineTask {
         };
         let em = self.emitter.clone();
         let (tx, rx) = unbounded_channel::<ExecMsg>();
-        let handle = tokio::spawn(async move { run_exec(docker.raw(), id, em, rx).await });
+        let audit = self.audit_ctx();
+        let handle = tokio::spawn(async move { run_exec(docker.raw(), id, em, rx, audit).await });
+        self.exec = Some(ExecTask {
+            task: handle,
+            input: tx,
+        });
+    }
+
+    fn open_attach(&mut self, id: ContainerId) {
+        self.exec = None;
+        let Some(docker) = self.docker.clone() else {
+            self.emitter.emit(Event::ExecClosed {
+                reason: Some("not connected".into()),
+            });
+            return;
+        };
+        let em = self.emitter.clone();
+        let (tx, rx) = unbounded_channel::<ExecMsg>();
+        let audit = self.audit_ctx();
+        let handle = tokio::spawn(async move { run_attach(docker.raw(), id, em, rx, audit).await });
         self.exec = Some(ExecTask {
             task: handle,
             input: tx,
@@ -397,14 +522,56 @@ impl EngineTask {
     }
 }
 
-async fn run_logs(docker: bollard::Docker, id: ContainerId, em: Emitter) {
+/// What an interactive session needs to write an audit row when it ends.
+struct AuditCtx {
+    history: Option<Arc<HistoryStore>>,
+    connection_id: String,
+}
+
+/// Record one finished-session audit row (best effort). `exit_code` comes from
+/// the caller (an `inspect_exec` for a shell; `None` for an attach).
+async fn write_audit(
+    docker: &bollard::Docker,
+    audit: AuditCtx,
+    id: &ContainerId,
+    started_ms: u64,
+    argv: Vec<String>,
+    exit_code: Option<i64>,
+) {
+    let Some(history) = audit.history else { return };
+    let container_name = docker
+        .inspect_container(
+            &id.0,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .ok()
+        .and_then(|r| r.name)
+        .map(|n| n.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| id.short().to_string());
+    let row = ExecAudit {
+        ts_ms: started_ms,
+        connection_id: audit.connection_id,
+        container: id.0.clone(),
+        container_name,
+        argv,
+        exit_code,
+        duration_secs: now_ms().checked_sub(started_ms).map(|ms| ms / 1000),
+    };
+    let _ = tokio::task::spawn_blocking(move || history.record_exec(&row)).await;
+}
+
+async fn run_logs(docker: bollard::Docker, id: ContainerId, tail: LogTail, em: Emitter) {
     use bollard::query_parameters::LogsOptionsBuilder;
 
+    // Timestamps are always requested; the UI decides whether to show them, so
+    // toggling that never restarts the stream.
     let opts = LogsOptionsBuilder::new()
         .follow(true)
         .stdout(true)
         .stderr(true)
-        .tail("400")
+        .timestamps(true)
+        .tail(&tail.as_param())
         .build();
     let mut stream = docker.logs(&id.0, Some(opts));
 
@@ -455,28 +622,46 @@ fn drain_lines(buf: &mut Vec<u8>, stream: LogStream, out: &mut Vec<LogLine>) {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        out.push(LogLine {
-            stream,
-            text: String::from_utf8_lossy(&line).into_owned(),
-        });
+        out.push(make_line(stream, &line));
     }
     // Guard against a single pathological line growing without bound.
     if buf.len() > 64 * 1024 {
         let line = std::mem::take(buf);
-        out.push(LogLine {
-            stream,
-            text: String::from_utf8_lossy(&line).into_owned(),
-        });
+        out.push(make_line(stream, &line));
     }
 }
 
 fn flush_tail(buf: &mut Vec<u8>, stream: LogStream, out: &mut Vec<LogLine>) {
     if !buf.is_empty() {
         let line = std::mem::take(buf);
-        out.push(LogLine {
+        out.push(make_line(stream, &line));
+    }
+}
+
+/// Split Docker's leading RFC 3339 timestamp off a raw log line. With
+/// `timestamps=true` every real line looks like
+/// `2026-09-10T14:03:11.482331Z the message`; a line without that shape (a
+/// client-synthesised note, or an image that writes its own odd prefix) keeps
+/// `ts = None` and its full text.
+fn make_line(stream: LogStream, raw: &[u8]) -> LogLine {
+    let text = String::from_utf8_lossy(raw).into_owned();
+    match text.split_once(' ') {
+        Some((head, rest))
+            if head.len() >= 20
+                && head.as_bytes().get(10) == Some(&b'T')
+                && head.as_bytes().get(4) == Some(&b'-') =>
+        {
+            LogLine {
+                stream,
+                ts: Some(head.to_string()),
+                text: rest.to_string(),
+            }
+        }
+        _ => LogLine {
             stream,
-            text: String::from_utf8_lossy(&line).into_owned(),
-        });
+            ts: None,
+            text,
+        },
     }
 }
 
@@ -490,7 +675,20 @@ fn flush_logs(id: &ContainerId, pending: &mut Vec<LogLine>, em: &Emitter) {
     });
 }
 
-async fn run_stats(docker: bollard::Docker, id: ContainerId, em: Emitter) {
+/// Unix milliseconds now, saturating to `0` if the clock is before the epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn run_stats(
+    docker: bollard::Docker,
+    id: ContainerId,
+    em: Emitter,
+    history: Option<Arc<HistoryStore>>,
+) {
     use bollard::query_parameters::StatsOptionsBuilder;
 
     let opts = StatsOptionsBuilder::new().stream(true).build();
@@ -498,10 +696,19 @@ async fn run_stats(docker: bollard::Docker, id: ContainerId, em: Emitter) {
 
     while let Some(item) = stream.next().await {
         match item {
-            Ok(raw) => em.emit(Event::Stat {
-                container: id.clone(),
-                sample: service::reduce_stats(&raw),
-            }),
+            Ok(raw) => {
+                let mut sample = service::reduce_stats(&raw);
+                sample.ts_ms = now_ms();
+                if let Some(h) = &history {
+                    // `Durability::None` write: a quick in-memory btree insert,
+                    // no fsync, so this stays off the critical path.
+                    let _ = h.record_sample(&id.0, &sample);
+                }
+                em.emit(Event::Stat {
+                    container: id.clone(),
+                    sample,
+                });
+            }
             Err(e) => {
                 em.emit(Event::StatsClosed {
                     container: id,
@@ -522,20 +729,22 @@ async fn run_exec(
     id: ContainerId,
     em: Emitter,
     mut input: UnboundedReceiver<ExecMsg>,
+    audit: AuditCtx,
 ) {
     use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 
     // Prefer bash, fall back to sh — the vast majority of images have one.
+    let argv: Vec<String> = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh".into(),
+    ];
     let config: CreateExecOptions<String> = CreateExecOptions {
         attach_stdin: Some(true),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
         tty: Some(true),
-        cmd: Some(vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh".into(),
-        ]),
+        cmd: Some(argv.clone()),
         env: Some(vec!["TERM=xterm-256color".into()]),
         ..Default::default()
     };
@@ -580,14 +789,14 @@ async fn run_exec(
     em.emit(Event::ExecReady {
         container: id.clone(),
     });
+    let started_ms = now_ms();
 
-    loop {
+    let end_reason: Option<String> = loop {
         tokio::select! {
             msg = input.recv() => match msg {
                 Some(ExecMsg::Data(bytes)) => {
                     if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
-                        em.emit(Event::ExecClosed { reason: Some("stdin closed".into()) });
-                        return;
+                        break Some("stdin closed".into());
                     }
                 }
                 Some(ExecMsg::Resize { cols, rows }) => {
@@ -602,22 +811,133 @@ async fn run_exec(
                         )
                         .await;
                 }
-                None => {
-                    em.emit(Event::ExecClosed { reason: None });
-                    return;
-                }
+                None => break None,
             },
             out = output.next() => match out {
                 Some(Ok(chunk)) => em.emit(Event::ExecOutput(chunk.into_bytes().to_vec())),
-                Some(Err(e)) => {
-                    em.emit(Event::ExecClosed { reason: Some(e.to_string()) });
-                    return;
-                }
-                None => {
-                    em.emit(Event::ExecClosed { reason: None });
-                    return;
-                }
+                Some(Err(e)) => break Some(e.to_string()),
+                None => break None,
             },
         }
+    };
+
+    // Audit the finished session: exit code from a follow-up `inspect_exec`.
+    let exit_code = docker
+        .inspect_exec(&exec_id)
+        .await
+        .ok()
+        .and_then(|r| r.exit_code);
+    write_audit(&docker, audit, &id, started_ms, argv, exit_code).await;
+
+    em.emit(Event::ExecClosed { reason: end_reason });
+}
+
+/// Attach to a container's main-process stdio (PLAN §5.3). No exec wrapper —
+/// input, Ctrl-C and TTY resize go straight to the entrypoint. Otherwise the
+/// same byte-stream loop and audit as [`run_exec`].
+async fn run_attach(
+    docker: bollard::Docker,
+    id: ContainerId,
+    em: Emitter,
+    mut input: UnboundedReceiver<ExecMsg>,
+    audit: AuditCtx,
+) {
+    use bollard::query_parameters::{
+        AttachContainerOptionsBuilder, ResizeContainerTTYOptionsBuilder,
+    };
+
+    let opts = AttachContainerOptionsBuilder::new()
+        .stream(true)
+        .stdin(true)
+        .stdout(true)
+        .stderr(true)
+        .logs(true)
+        .build();
+
+    let (mut output, mut writer) = match docker.attach_container(&id.0, Some(opts)).await {
+        Ok(r) => (r.output, r.input),
+        Err(e) => {
+            em.emit(Event::ExecClosed {
+                reason: Some(e.to_string()),
+            });
+            return;
+        }
+    };
+
+    em.emit(Event::ExecReady {
+        container: id.clone(),
+    });
+    let started_ms = now_ms();
+
+    let end_reason: Option<String> = loop {
+        tokio::select! {
+            msg = input.recv() => match msg {
+                Some(ExecMsg::Data(bytes)) => {
+                    if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                        break Some("stdin closed".into());
+                    }
+                }
+                Some(ExecMsg::Resize { cols, rows }) => {
+                    let _ = docker
+                        .resize_container_tty(
+                            &id.0,
+                            ResizeContainerTTYOptionsBuilder::new()
+                                .w(cols as i32)
+                                .h(rows as i32)
+                                .build(),
+                        )
+                        .await;
+                }
+                None => break None,
+            },
+            out = output.next() => match out {
+                Some(Ok(chunk)) => em.emit(Event::ExecOutput(chunk.into_bytes().to_vec())),
+                Some(Err(e)) => break Some(e.to_string()),
+                None => break None,
+            },
+        }
+    };
+
+    write_audit(
+        &docker,
+        audit,
+        &id,
+        started_ms,
+        vec!["<attach>".into()],
+        None,
+    )
+    .await;
+    em.emit(Event::ExecClosed { reason: end_reason });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn make_line_splits_docker_timestamp() {
+        let l = make_line(
+            LogStream::Stdout,
+            b"2026-09-10T14:03:11.482331Z listening on :80",
+        );
+        assert_eq!(l.ts.as_deref(), Some("2026-09-10T14:03:11.482331Z"));
+        assert_eq!(l.text, "listening on :80");
+    }
+
+    #[test]
+    fn make_line_keeps_untimestamped_text_whole() {
+        let l = make_line(LogStream::Stderr, b"panic: runtime error");
+        assert_eq!(l.ts, None);
+        assert_eq!(l.text, "panic: runtime error");
+        // A leading token that only looks vaguely date-ish is not mistaken for one.
+        let l = make_line(LogStream::Stdout, b"12:34:56 not-a-date message");
+        assert_eq!(l.ts, None);
+    }
+
+    #[test]
+    fn log_tail_param() {
+        assert_eq!(LogTail::Lines(100).as_param(), "100");
+        assert_eq!(LogTail::All.as_param(), "all");
+        assert_eq!(LogTail::default(), LogTail::Lines(400));
     }
 }

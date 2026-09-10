@@ -15,9 +15,15 @@ rocker-term = { workspace = true }
 rocker-theme = { workspace = true }
 eframe = "0.33.3"
 egui = "0.33.3"
+# The Stats tab's history chart. 0.34 tracks egui 0.33 (its version no longer
+# matches egui's), so this resolves to a single egui in the tree.
+egui_plot = "0.34"
 tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
 tracing = { workspace = true }
 auto-launch = "0.6"
+# Log-filter regex. `regex-lite` (no DFA, no SIMD) keeps the binary-size budget
+# — a log filter never needs the full `regex` engine.
+regex-lite = "0.1.9"
 
 # System-tray integration (on by default). On Linux this pulls GTK 3 +
 # libappindicator, so a headless or GTK-less build can drop it with

@@ -65,47 +65,45 @@ progress. The config format may change before `1.0`.
 ### macOS / Linux
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/makis-san/rocker/releases/latest/download/rocker-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/makis-san/rocker/main/install.sh | sh
 ```
 
-Or via Homebrew (macOS and Linux):
+Downloads the latest release, verifies its checksum, and runs `rocker install`:
+the binary lands in `~/.local/bin` (no `sudo`) and Rocker shows up in your
+application menu / Launchpad with its icon and a `docker://` URL handler. Works
+on any distro and any desktop (GNOME, KDE, XFCE, Sway, ...). Pass options after
+`| sh -s --`, e.g. `--modify-path` to add `~/.local/bin` to your shell `PATH`,
+`--tag v0.1.4` to pin a version, `--system` to install into `/usr/local`.
 
-```sh
-brew install makis-san/tap/rocker
-```
-
-### Linux: GNOME / KDE app menu
-
-The shell installer and Homebrew both drop a bare `rocker` binary on `PATH`.
-For a proper desktop-menu entry (icon, launcher, `.desktop` file), grab the
-`.deb` or `.rpm` from the [latest release](https://github.com/makis-san/rocker/releases/latest)
-instead:
-
-```sh
-# Debian / Ubuntu
-sudo dpkg -i rocker-x86_64-unknown-linux-gnu.deb
-
-# Fedora / openSUSE
-sudo rpm -i rocker-x86_64-unknown-linux-gnu.rpm
-```
-
-(swap in the `aarch64` artifact on ARM64.) A Flatpak manifest also exists in
-[`flatpak/`](flatpak/) for a future Flathub submission.
+Update in place with `rocker self-update`; remove everything with
+`rocker uninstall`. `rocker doctor` reports what's installed and whether a
+newer release exists.
 
 ### Windows
 
 ```powershell
-powershell -c "irm https://github.com/makis-san/rocker/releases/latest/download/rocker-installer.ps1 | iex"
+irm https://raw.githubusercontent.com/makis-san/rocker/main/install.ps1 | iex
 ```
 
-A `.msi` is also attached to each release for a normal installer experience.
+Same idea: verified download, then a Start-menu shortcut, an "Apps & features"
+entry, and the binary under `%LOCALAPPDATA%\Programs\Rocker`. A `.msi` is also
+attached to each release for a double-click install.
 
-### Prebuilt archives
+### Other ways
 
-Plain `.tar.xz` (macOS/Linux) and `.zip` (Windows) archives for every target
-are on the [latest release](https://github.com/makis-san/rocker/releases/latest)
-page, if you'd rather place the binary yourself.
+- **Homebrew** (macOS / Linux): `brew install makis-san/tap/rocker` — drops the
+  bare binary on `PATH` (run `rocker install` afterwards for the menu entry).
+- **`.deb` / `.rpm`**: on the [latest release](https://github.com/makis-san/rocker/releases/latest);
+  `sudo dpkg -i rocker-x86_64-unknown-linux-gnu.deb` or
+  `sudo rpm -i rocker-x86_64-unknown-linux-gnu.rpm` (swap in `aarch64` on ARM64).
+  These carry their own desktop entry, so no `rocker install` step is needed.
+- **Prebuilt archives**: plain `.tar.xz` / `.zip` for every target, if you'd
+  rather place the binary yourself. Run `rocker install` from the extracted
+  folder to get the desktop integration.
+
+A Flatpak manifest also lives in [`flatpak/`](flatpak/); it is community
+maintained and not the recommended path.
 
 ### From source
 
