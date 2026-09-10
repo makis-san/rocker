@@ -111,10 +111,11 @@ jobs:
           rm -f SHA256SUMS SHA256SUMS.minisig
 
       - name: Compute SHA256SUMS
-        working-directory: dist
         run: |
-          sha256sum -- * | sort -k2 > SHA256SUMS
-          cat SHA256SUMS
+          # Hash from outside `dist/` so the output file can't glob itself in.
+          ( cd dist && sha256sum -- * ) | sort -k2 > SHA256SUMS
+          mv SHA256SUMS dist/SHA256SUMS
+          cat dist/SHA256SUMS
 
       - name: Sign SHA256SUMS
         if: env.MINISIGN_SECRET_KEY != ''
