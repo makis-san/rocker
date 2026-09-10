@@ -17,7 +17,24 @@ eframe = "0.33.3"
 egui = "0.33.3"
 tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
 tracing = { workspace = true }
+auto-launch = "0.6"
+
+# System-tray integration (on by default). On Linux this pulls GTK 3 +
+# libappindicator, so a headless or GTK-less build can drop it with
+# `--no-default-features`. `muda` (the menu) comes in via `tray_icon::menu`.
+tray-icon = { version = "0.24", default-features = false, features = ["gtk"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Direct handle on the GTK loop so `tray` can pump it from the egui frame
+# (the tray + its menu are GTK objects and must be driven on this thread).
+gtk = { version = "0.18", optional = true }
 
 [dev-dependencies]
 # Drives the real engine while the `screenshot` example captures a frame.
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread"] }
+
+# Opt-in: the tray stack needs GTK 3 + libappindicator dev libraries on Linux,
+# which a bare dev box often lacks. CI and the Linux packaging jobs turn it on.
+[features]
+tray = ["dep:tray-icon", "dep:image", "dep:gtk"]

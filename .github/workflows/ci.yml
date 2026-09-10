@@ -21,6 +21,12 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # GTK 3 + libappindicator back the optional `tray` feature (clippy runs --all-features).
+      - name: Install system-tray build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -48,6 +54,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # GTK 3 + libappindicator back the optional `tray` feature on Linux.
+      - name: Install system-tray build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -59,6 +72,9 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+      - name: Build with tray feature
+        run: cargo build --release -p rocker --features tray
 
       - name: Run tests
         run: cargo test --all

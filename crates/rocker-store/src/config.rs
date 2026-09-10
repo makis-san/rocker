@@ -34,6 +34,15 @@ pub struct Settings {
     pub stats_retention_hours: u32,
     /// Max concurrent stats streams before LRU eviction (PLAN §5.3).
     pub max_stats_streams: usize,
+    /// Hide to the system tray instead of quitting when the window is closed
+    /// or minimized. The tray icon itself is shown whenever the platform
+    /// supports it; this only governs the close/minimize behaviour.
+    pub minimize_to_tray: bool,
+    /// Launch with the window already hidden to the tray — used when Rocker
+    /// starts itself at login.
+    pub start_minimized: bool,
+    /// Register Rocker to start automatically when you log in.
+    pub open_at_login: bool,
 }
 
 impl Default for Settings {
@@ -42,6 +51,9 @@ impl Default for Settings {
             theme: "system".to_string(),
             stats_retention_hours: 24,
             max_stats_streams: 12,
+            minimize_to_tray: true,
+            start_minimized: false,
+            open_at_login: false,
         }
     }
 }
@@ -63,5 +75,28 @@ impl Config {
         let text = toml::to_string_pretty(self).map_err(|e| StoreError::Parse(e.to_string()))?;
         std::fs::write(paths.config_file(), text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config written before the tray/autostart keys existed still loads,
+    /// with the new keys taking their defaults rather than `false`.
+    #[test]
+    fn pre_tray_config_loads_with_sensible_defaults() {
+        let text = r#"
+            [settings]
+            theme = "dark"
+            stats_retention_hours = 48
+            max_stats_streams = 8
+        "#;
+        let cfg: Config = toml::from_str(text).expect("legacy config parses");
+        assert_eq!(cfg.settings.theme, "dark");
+        assert_eq!(cfg.settings.stats_retention_hours, 48);
+        assert!(cfg.settings.minimize_to_tray);
+        assert!(!cfg.settings.start_minimized);
+        assert!(!cfg.settings.open_at_login);
     }
 }

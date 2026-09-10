@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rocker_core::{Connection, Container, ContainerId, ContainerState, StatSample};
 use rocker_engine::{start, Command, EngineHandle, Event, LifecycleAction};
@@ -9,6 +11,7 @@ use crate::detail::DetailScreen;
 use crate::icons::{self, Icon};
 use crate::settings::{self, About};
 use crate::style::{self, Palette};
+use crate::tray::{Tray, TrayAction, TraySummary};
 use crate::widgets::{
     confirm_dialog, container_row, group_header, GroupOutcome, GroupUsage, RowOutcome,
 };
@@ -74,6 +77,21 @@ pub struct RockerApp {
     /// A group's "delete all" waiting on confirmation before it is sent —
     /// destructive and irreversible, so it never fires straight off the click.
     pending_delete: Option<PendingDelete>,
+    /// Docker's total on-disk usage (bytes) from `/system/df`, polled on a
+    /// timer for the tray summary. `None` until the first answer, or when the
+    /// daemon doesn't report it.
+    disk_usage: Option<u64>,
+    /// UI-clock time of the last `/system/df` query, so it runs on a cadence
+    /// rather than every frame.
+    last_disk_poll: f64,
+    /// The system-tray icon, when the platform let us create one.
+    tray: Option<Tray>,
+    /// Shared with the heartbeat thread: `true` while the window is hidden to
+    /// the tray, so it repaints often enough to keep tray clicks responsive.
+    hidden: Arc<AtomicBool>,
+    /// A real quit is underway (the tray's "Quit"), so a close request is let
+    /// through instead of being turned into a hide-to-tray.
+    quitting: bool,
 }
 
 /// Resolve a stored theme id (`system` / `light` / `dark`, or a future file
@@ -120,6 +138,36 @@ impl RockerApp {
             config.settings.max_stats_streams,
         ));
 
+        let tray = Tray::new();
+        let hidden = Arc::new(AtomicBool::new(
+            config.settings.start_minimized && tray.is_some(),
+        ));
+
+        if tray.is_some() {
+            // A hidden window gets no redraws from the OS, so nothing would
+            // drain the tray's click channel. This wakes the frame loop on a
+            // slow tick — quick while hidden, lazy while the window is up.
+            let ctx = cc.egui_ctx.clone();
+            let hidden = hidden.clone();
+            std::thread::Builder::new()
+                .name("rocker-tray-heartbeat".into())
+                .spawn(move || loop {
+                    let nap = if hidden.load(Ordering::Relaxed) {
+                        std::time::Duration::from_millis(500)
+                    } else {
+                        std::time::Duration::from_secs(2)
+                    };
+                    std::thread::sleep(nap);
+                    ctx.request_repaint();
+                })
+                .ok();
+        } else if config.settings.start_minimized {
+            // Asked to start hidden, but there's no tray to hide in — show the
+            // window so Rocker isn't left invisible and unreachable.
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+
         Self {
             engine,
             paths,
@@ -133,6 +181,11 @@ impl RockerApp {
             last_error: None,
             detail: None,
             pending_delete: None,
+            disk_usage: None,
+            last_disk_poll: f64::NEG_INFINITY,
+            tray,
+            hidden,
+            quitting: false,
         }
     }
 
@@ -183,10 +236,14 @@ impl RockerApp {
                 Event::Connected { version, .. } => {
                     self.status = ConnStatus::Connected { version };
                     self.last_error = None;
+                    // Pull a fresh disk figure for the tray on the next frame.
+                    self.last_disk_poll = f64::NEG_INFINITY;
                 }
                 Event::Disconnected { reason, .. } => {
                     self.status = ConnStatus::Failed { reason };
+                    self.disk_usage = None;
                 }
+                Event::DiskUsage(bytes) => self.disk_usage = bytes,
                 Event::Containers(mut list) => {
                     // Grouped containers first (by Compose project, then name),
                     // ungrouped last, so the list reads as sections.
@@ -364,6 +421,85 @@ impl RockerApp {
     fn apply_theme(&mut self, ctx: &egui::Context) {
         let theme = resolve_theme(ctx, &self.config.settings.theme);
         self.pal = style::install(ctx, &theme);
+    }
+
+    /// The numbers behind the tray menu: combined CPU and memory across the
+    /// running containers (the only ones with an open stats stream), Docker's
+    /// disk footprint, and the running / stopped split.
+    fn tray_summary(&self) -> TraySummary {
+        let running = self
+            .containers
+            .iter()
+            .filter(|c| c.state.is_active())
+            .count();
+        TraySummary {
+            connected: matches!(self.status, ConnStatus::Connected { .. }),
+            cpu_pct: self.stats.values().map(|s| s.cpu_pct).sum(),
+            mem_used: self.stats.values().map(|s| s.mem_used).sum(),
+            disk_bytes: self.disk_usage,
+            running,
+            stopped: self.containers.len().saturating_sub(running),
+        }
+    }
+
+    /// Pull the window off-screen into the tray (not a real close).
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        self.hidden.store(true, Ordering::Relaxed);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    /// Bring the window back from the tray and focus it.
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden.store(false, Ordering::Relaxed);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Turn a close or minimize into a hide-to-tray when that's what the user
+    /// asked for, and keep the tray menu's numbers current. Runs every frame.
+    fn service_tray(&mut self, ctx: &egui::Context) {
+        if self.tray.is_none() {
+            return;
+        }
+
+        if self.config.settings.minimize_to_tray && !self.quitting {
+            let (close_requested, minimized) = ctx.input(|i| {
+                (
+                    i.viewport().close_requested(),
+                    i.viewport().minimized == Some(true),
+                )
+            });
+            if close_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide_to_tray(ctx);
+            } else if minimized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                self.hide_to_tray(ctx);
+            }
+        }
+
+        let now = ctx.input(|i| i.time);
+        if matches!(self.status, ConnStatus::Connected { .. }) && now - self.last_disk_poll >= 15.0
+        {
+            self.engine.send(Command::RefreshDiskUsage);
+            self.last_disk_poll = now;
+        }
+
+        let summary = self.tray_summary();
+        let action = {
+            let tray = self.tray.as_mut().expect("tray present, checked above");
+            tray.render(&summary);
+            tray.poll()
+        };
+        match action {
+            Some(TrayAction::Show) => self.show_window(ctx),
+            Some(TrayAction::Quit) => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
+        }
     }
 
     fn header(&self, ctx: &egui::Context) -> Option<HeaderAction> {
@@ -657,6 +793,9 @@ impl RockerApp {
             if edit.theme_changed {
                 self.apply_theme(ctx);
             }
+            if edit.autostart_changed {
+                crate::autostart::sync(self.config.settings.open_at_login);
+            }
         }
     }
 
@@ -723,6 +862,7 @@ impl RockerApp {
 impl eframe::App for RockerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.service_tray(ctx);
 
         if self.view == View::Settings && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.view = View::Containers;

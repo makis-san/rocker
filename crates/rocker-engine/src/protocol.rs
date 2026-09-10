@@ -59,6 +59,9 @@ pub enum Command {
     Connect(ConnectionId),
     /// One-shot refresh of the container list.
     RefreshContainers,
+    /// One-shot query of Docker's on-disk usage (`/system/df`) for the tray
+    /// summary. Answered with [`Event::DiskUsage`].
+    RefreshDiskUsage,
     /// Run a lifecycle action against a container.
     Lifecycle {
         container: ContainerId,
@@ -115,6 +118,9 @@ pub enum Event {
     },
     /// Full container list after a refresh or an events-driven reconcile.
     Containers(Vec<Container>),
+    /// Docker's total on-disk usage in bytes, or `None` if the daemon didn't
+    /// report it. Answer to [`Command::RefreshDiskUsage`].
+    DiskUsage(Option<u64>),
     /// A lifecycle action finished.
     LifecycleDone {
         container: ContainerId,

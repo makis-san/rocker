@@ -38,6 +38,12 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.1.2" date="2026-09-09">
+      <description>
+        <p>System tray with a live Docker summary, and an "Open at login"
+        setting.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-09-09">
       <description>
         <p>Flathub-ready packaging: corrected app-id, icon, and Flatpak

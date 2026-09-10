@@ -18,10 +18,12 @@ pub struct About<'a> {
     pub config_path: &'a str,
 }
 
-/// What changed this frame. `None` from [`settings_screen`] means nothing did;
-/// `theme_changed` tells the caller to also re-apply the palette.
+/// What changed this frame. `None` from [`settings_screen`] means nothing did.
+/// `theme_changed` tells the caller to re-apply the palette; `autostart_changed`
+/// tells it to reconcile the "open at login" entry on disk.
 pub struct Edit {
     pub theme_changed: bool,
+    pub autostart_changed: bool,
 }
 
 /// Fixed column width, so the screen holds one measured measure regardless of
@@ -60,6 +62,7 @@ pub fn settings_screen(
     about: About<'_>,
 ) -> Option<Edit> {
     let mut theme_changed = false;
+    let mut autostart_changed = false;
     let mut other_changed = false;
 
     egui::ScrollArea::vertical()
@@ -119,6 +122,50 @@ pub fn settings_screen(
                         },
                     );
 
+                    section(ui, pal, "System");
+                    row(
+                        ui,
+                        pal,
+                        "Minimize to tray",
+                        "Closing or minimizing hides Rocker to the tray.",
+                        |ui| {
+                            if let Some(next) =
+                                toggle(ui, pal, "min-to-tray", settings.minimize_to_tray)
+                            {
+                                settings.minimize_to_tray = next;
+                                other_changed = true;
+                            }
+                        },
+                    );
+                    row(
+                        ui,
+                        pal,
+                        "Start hidden",
+                        "Launch straight to the tray, no window.",
+                        |ui| {
+                            if let Some(next) =
+                                toggle(ui, pal, "start-hidden", settings.start_minimized)
+                            {
+                                settings.start_minimized = next;
+                                other_changed = true;
+                            }
+                        },
+                    );
+                    row(
+                        ui,
+                        pal,
+                        "Open at login",
+                        "Start Rocker automatically when you sign in.",
+                        |ui| {
+                            if let Some(next) =
+                                toggle(ui, pal, "open-at-login", settings.open_at_login)
+                            {
+                                settings.open_at_login = next;
+                                autostart_changed = true;
+                            }
+                        },
+                    );
+
                     section(ui, pal, "About");
                     row(ui, pal, "Version", "The build you're running.", |ui| {
                         value(ui, pal, about.app_version)
@@ -150,7 +197,16 @@ pub fn settings_screen(
             });
         });
 
-    (theme_changed || other_changed).then_some(Edit { theme_changed })
+    (theme_changed || autostart_changed || other_changed).then_some(Edit {
+        theme_changed,
+        autostart_changed,
+    })
+}
+
+/// An Off/On segmented control for a boolean row. Returns the new value only
+/// when it actually flips.
+fn toggle(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, value: bool) -> Option<bool> {
+    segmented(ui, pal, id_salt, &["Off", "On"], value as usize).map(|i| i == 1)
 }
 
 /// A quiet section label with air above and below. Not a heading — the rows

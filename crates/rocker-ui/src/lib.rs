@@ -4,12 +4,14 @@
 //! CLI).
 
 mod app;
+mod autostart;
 mod detail;
 mod format;
 mod icons;
 mod settings;
 mod style;
 mod terminal;
+mod tray;
 mod widgets;
 
 pub use app::RockerApp;

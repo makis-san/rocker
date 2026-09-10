@@ -144,6 +144,7 @@ impl EngineTask {
             match cmd {
                 Command::Connect(id) => self.connect(id).await,
                 Command::RefreshContainers => self.refresh().await,
+                Command::RefreshDiskUsage => self.refresh_disk_usage(),
                 Command::Lifecycle { container, action } => self.lifecycle(container, action),
                 Command::BulkLifecycle { containers, action } => {
                     self.bulk_lifecycle(containers, action)
@@ -206,6 +207,25 @@ impl EngineTask {
             Ok(list) => self.emitter.emit(Event::Containers(list)),
             Err(e) => self.emitter.emit(Event::Error(e.to_string())),
         }
+    }
+
+    /// Query `/system/df` off the command loop and report the total back as a
+    /// [`Event::DiskUsage`]. A failure is downgraded to `DiskUsage(None)` — the
+    /// tray just shows "—", it is not worth an error banner.
+    fn refresh_disk_usage(&self) {
+        let Some(docker) = self.docker.clone() else {
+            return;
+        };
+        let em = self.emitter.clone();
+        tokio::spawn(async move {
+            match docker.disk_usage().await {
+                Ok(bytes) => em.emit(Event::DiskUsage(bytes)),
+                Err(e) => {
+                    tracing::debug!(error = %e, "disk usage query failed");
+                    em.emit(Event::DiskUsage(None));
+                }
+            }
+        });
     }
 
     fn lifecycle(&self, container: ContainerId, action: crate::protocol::LifecycleAction) {

@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Context as _;
+use rocker_store::{AppPaths, Config};
 
 /// App icon shown in the window title bar, taskbar/dock, and Alt-Tab switcher.
 const ICON_PNG_BYTES: &[u8] = include_bytes!("../../../assets/icon-1024.png");
@@ -30,12 +31,19 @@ fn main() -> anyhow::Result<()> {
     let icon =
         eframe::icon_data::from_png_bytes(ICON_PNG_BYTES).expect("bundled app icon is a valid PNG");
 
+    // Honor "start hidden" before the window is ever mapped, so it doesn't
+    // flash on screen on its way to the tray.
+    let start_hidden = Config::load(&AppPaths::resolve())
+        .map(|c| c.settings.start_minimized)
+        .unwrap_or(false);
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rocker")
             .with_inner_size([980.0, 680.0])
             .with_min_inner_size([560.0, 360.0])
-            .with_icon(icon),
+            .with_icon(icon)
+            .with_visible(!start_hidden),
         ..Default::default()
     };
 

@@ -8,6 +8,21 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-09
+
+### Added
+
+- **System tray**: Rocker minimizes to a tray icon instead of quitting, and the
+  tray menu shows a live Docker summary — combined CPU and memory across running
+  containers, Docker's on-disk usage (`/system/df`), and the running/stopped
+  container split. "Show Rocker" and "Quit Rocker" round it out. Opt-in via the
+  `tray` Cargo feature (`cargo build --features tray`), which pulls GTK 3 +
+  libappindicator dev libraries on Linux; release packages enable it.
+- **Open at login**: a Settings toggle registers Rocker to start automatically
+  when you sign in (autostart `.desktop` on Linux, LaunchAgent on macOS, Run key
+  on Windows). Does not yet take effect inside the Flatpak sandbox.
+- Settings > System: "Minimize to tray", "Start hidden", and "Open at login".
+
 ## [0.1.1] - 2026-09-09
 
 ### Changed

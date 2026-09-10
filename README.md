@@ -49,6 +49,10 @@ progress. The config format may change before `1.0`.
 - **Interactive shell** into a container via Docker `exec`, backed by a real VT parser
 - **Container groups**: manual, or rule-based on name and label
 - **Themes**: light and dark built-ins, plus custom themes loaded from TOML
+- **System tray**: minimize to tray instead of quitting, with a live menu
+  summary (combined CPU/memory, Docker disk usage, running/stopped counts) and
+  an "open at login" toggle. Opt-in: build with `--features tray` (needs GTK 3 +
+  libappindicator dev libraries on Linux). Release packages ship it enabled.
 
 ### Planned
 

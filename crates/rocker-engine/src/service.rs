@@ -64,6 +64,32 @@ impl LocalDocker {
             .map_err(|e| EngineError::Docker(e.to_string()))?;
         Ok(map_detail(raw))
     }
+
+    /// Total bytes Docker is holding on disk — image layers, container
+    /// writable layers, local volumes, and build cache — summed from
+    /// `/system/df`.
+    ///
+    /// `Ok(None)` means the daemon answered but carried no usage figures: the
+    /// pre-API-1.53 `/system/df` body shape, which this client doesn't parse.
+    pub async fn disk_usage(&self) -> Result<Option<u64>> {
+        let df = self
+            .inner
+            .df(None::<qp::DataUsageOptions>)
+            .await
+            .map_err(|e| EngineError::Docker(e.to_string()))?;
+
+        let sections = [
+            df.image_usage.and_then(|u| u.total_size),
+            df.container_usage.and_then(|u| u.total_size),
+            df.volume_usage.and_then(|u| u.total_size),
+            df.build_cache_usage.and_then(|u| u.total_size),
+        ];
+        if sections.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let total: i64 = sections.into_iter().flatten().filter(|&n| n > 0).sum();
+        Ok(Some(total as u64))
+    }
 }
 
 impl DockerService for LocalDocker {

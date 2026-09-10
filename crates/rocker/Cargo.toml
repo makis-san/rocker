@@ -53,9 +53,15 @@ path = "src/main.rs"
 
 [dependencies]
 rocker-ui = { workspace = true }
+rocker-store = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 eframe = "0.33.3"
 egui = "0.33.3"
 tokio = "1.53.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+# System-tray icon + "minimize to tray". Opt-in: on Linux it pulls GTK 3 and
+# libappindicator dev libraries. Build with `cargo run --features tray`.
+tray = ["rocker-ui/tray"]
