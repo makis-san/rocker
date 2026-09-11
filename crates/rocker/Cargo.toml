@@ -16,6 +16,12 @@ path-guid = "1035E96C-4E12-405E-89FA-92FF9D32625D"
 license = false
 eula = false
 
+# The extension host remains a separate supervised process, but it is shipped
+# as the second binary in the Rocker distribution rather than as a standalone
+# release product.
+[package.metadata.dist]
+dist = true
+
 # `cargo deb -p rocker` (built from the workspace root; see
 # .github/workflows/linux-packages.yml). Desktop entry, AppStream metadata and
 # icon are shared with the Flatpak build (../../packaging/linux/).
@@ -32,6 +38,7 @@ priority = "optional"
 depends = "$auto"
 assets = [
     ["target/release/rocker", "usr/bin/", "755"],
+    ["target/release/rocker-ext-host", "usr/bin/", "755"],
     ["../../packaging/linux/io.github.makis_san.Rocker.desktop", "usr/share/applications/io.github.makis_san.Rocker.desktop", "644"],
     ["../../packaging/linux/io.github.makis_san.Rocker.metainfo.xml", "usr/share/metainfo/io.github.makis_san.Rocker.metainfo.xml", "644"],
     ["../../assets/icon-512.png", "usr/share/icons/hicolor/512x512/apps/io.github.makis_san.Rocker.png", "644"],
@@ -42,6 +49,7 @@ assets = [
 license = "MIT OR Apache-2.0"
 assets = [
     { source = "target/release/rocker", dest = "/usr/bin/rocker", mode = "755" },
+    { source = "target/release/rocker-ext-host", dest = "/usr/bin/rocker-ext-host", mode = "755" },
     { source = "packaging/linux/io.github.makis_san.Rocker.desktop", dest = "/usr/share/applications/io.github.makis_san.Rocker.desktop", mode = "644" },
     { source = "packaging/linux/io.github.makis_san.Rocker.metainfo.xml", dest = "/usr/share/metainfo/io.github.makis_san.Rocker.metainfo.xml", mode = "644" },
     { source = "assets/icon-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.makis_san.Rocker.png", mode = "644" },
@@ -51,11 +59,18 @@ assets = [
 name = "rocker"
 path = "src/main.rs"
 
+[[bin]]
+name = "rocker-ext-host"
+path = "src/bin/rocker-ext-host.rs"
+
 [dependencies]
 rocker-ui = { workspace = true }
 rocker-store = { workspace = true }
 rocker-setup = { workspace = true }
+rocker-ext-api = { workspace = true }
+rocker-ext-host = { workspace = true }
 anyhow = { workspace = true }
+serde_json = "1.0.151"
 tracing = { workspace = true }
 eframe = "0.33.3"
 egui = "0.33.3"

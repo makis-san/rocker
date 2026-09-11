@@ -7,9 +7,9 @@ Everything is triggered by pushing a version tag; nothing is uploaded by hand.
 
 | Platform | Artifacts | Command-line install |
 | --- | --- | --- |
-| Linux (x86_64, aarch64) | `.tar.xz`, `.deb`, `.rpm`, shell installer, Homebrew formula | `curl ... \| sh`, `sudo dpkg -i`, `sudo rpm -i`, or `brew install makis-san/tap/rocker` |
-| macOS (x86_64, aarch64) | `.tar.xz`, shell installer, Homebrew formula | `curl ... \| sh` or `brew install makis-san/tap/rocker` |
-| Windows (x86_64) | `.zip`, `.msi`, PowerShell installer | `irm ... \| iex`, or run the `.msi` |
+| Linux (x86_64, aarch64) | one `.tar.xz` containing both executables, `.deb`, `.rpm`, shell installer, Homebrew formula | `curl ... \| sh`, `sudo dpkg -i`, `sudo rpm -i`, or `brew install makis-san/tap/rocker` |
+| macOS (x86_64, aarch64) | one `.tar.xz` containing both executables, shell installer, Homebrew formula | `curl ... \| sh` or `brew install makis-san/tap/rocker` |
+| Windows (x86_64) | one `.zip` containing both executables, `.msi`, PowerShell installer | `irm ... \| iex`, or run the `.msi` |
 
 The `.deb`/`.rpm` also install a desktop entry, AppStream metadata, and an icon
 (`packaging/linux/`), so Rocker shows up in the GNOME/KDE application menu.
@@ -17,11 +17,12 @@ A Flatpak manifest exists too (`flatpak/`) but it is community maintained, not
 the recommended path.
 
 The primary install path is the **`install.sh` / `install.ps1`** scripts at the
-repo root: they fetch both the main app and `rocker-ext-host`, verify them
-against `SHA256SUMS` (+ `SHA256SUMS.minisig` once a key is configured), and run
-`rocker install` once to place both binaries plus the desktop entry, icon set,
-and URL handler into the user install location. See `.local/DISTRIBUTION.md`
-for the design.
+repo root: they fetch one release archive containing both the main app and
+`rocker-ext-host`, verify that archive against `SHA256SUMS` (plus
+`SHA256SUMS.minisig` once a key is configured), and run `rocker install` once.
+The setup command refuses to install either side without its sibling, then
+places both binaries plus the desktop entry, icon set, and URL handler into the
+user install location. See `.local/DISTRIBUTION.md` for the design.
 
 ## How it's wired
 
@@ -44,7 +45,8 @@ a bare `<major>.<minor>.<patch>`); `linux-packages.yml` chains off it via
 ## Cutting a release
 
 1. Bump `version` under `[workspace.package]` in the root `Cargo.toml`.
-2. Update `CHANGELOG.md`.
+2. Update `CHANGELOG.md` and confirm `dist plan --tag=v<version>` lists one
+   `rocker` release containing both executables.
 3. Commit, then tag and push: `git tag v0.1.0 && git push origin v0.1.0`.
 4. Watch the `Release` and `Linux packages` workflow runs.
 

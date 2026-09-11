@@ -69,10 +69,9 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/makis-san/rocker/main/install.sh | sh
 ```
 
-Downloads the latest release and its companion extension host, verifies both
-checksums, and runs `rocker install`: the binaries land together in the
-Rocker install location, while the main binary also lands in `~/.local/bin`
-(no `sudo`) and Rocker shows up in your
+Downloads one release archive containing both the Rocker app and its supervised
+extension host, verifies the archive checksum, and runs `rocker install`. The
+two executables are installed together, while Rocker also appears in your
 application menu / Launchpad with its icon and a `docker://` URL handler. Works
 on any distro and any desktop (GNOME, KDE, XFCE, Sway, ...). Pass options after
 `| sh -s --`, e.g. `--modify-path` to add `~/.local/bin` to your shell `PATH`,
@@ -88,22 +87,23 @@ newer release exists.
 irm https://raw.githubusercontent.com/makis-san/rocker/main/install.ps1 | iex
 ```
 
-Same idea: verified download of both binaries, then a Start-menu shortcut, an
-"Apps & features" entry, and both binaries under
+Same idea: verified download of one archive containing both binaries, then a
+Start-menu shortcut, an "Apps & features" entry, and both binaries under
 `%LOCALAPPDATA%\Programs\Rocker`. A `.msi` is also
 attached to each release for a double-click install.
 
 ### Other ways
 
-- **Homebrew** (macOS / Linux): `brew install makis-san/tap/rocker` — drops the
-  bare binary on `PATH` (run `rocker install` afterwards for the menu entry).
+- **Homebrew** (macOS / Linux): `brew install makis-san/tap/rocker` — installs
+  Rocker and its extension host together (run `rocker install` afterwards for
+  the menu entry).
 - **`.deb` / `.rpm`**: on the [latest release](https://github.com/makis-san/rocker/releases/latest);
   `sudo dpkg -i rocker-x86_64-unknown-linux-gnu.deb` or
   `sudo rpm -i rocker-x86_64-unknown-linux-gnu.rpm` (swap in `aarch64` on ARM64).
   These carry their own desktop entry, so no `rocker install` step is needed.
-- **Prebuilt archives**: plain `.tar.xz` / `.zip` for every target, if you'd
-  rather place the binary yourself. Run `rocker install` from the extracted
-  folder to get the desktop integration.
+- **Prebuilt archives**: each `.tar.xz` / `.zip` contains Rocker and its
+  extension host. Run `rocker install` from the extracted folder to get the
+  desktop integration; do not split the two executables apart.
 
 A Flatpak manifest also lives in [`flatpak/`](flatpak/); it is community
 maintained and not the recommended path.

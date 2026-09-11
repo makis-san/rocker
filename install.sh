@@ -68,14 +68,12 @@ say "installing $TAG for $TRIPLE"
 
 BASE="https://github.com/${REPO}/releases/download/${TAG}"
 ARCHIVE="rocker-${TRIPLE}.${ext}"
-EXT_HOST_ARCHIVE="rocker-ext-host-${TRIPLE}.${ext}"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/rocker-install.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-say "downloading $ARCHIVE and $EXT_HOST_ARCHIVE"
+say "downloading $ARCHIVE (Rocker app + extension host)"
 dl "${BASE}/${ARCHIVE}" "${TMP}/${ARCHIVE}"        || die "download failed: ${BASE}/${ARCHIVE}"
-dl "${BASE}/${EXT_HOST_ARCHIVE}" "${TMP}/${EXT_HOST_ARCHIVE}" || die "download failed: ${BASE}/${EXT_HOST_ARCHIVE}"
 dl "${BASE}/SHA256SUMS" "${TMP}/SHA256SUMS"        || die "download failed: SHA256SUMS"
 dl "${BASE}/SHA256SUMS.minisig" "${TMP}/SHA256SUMS.minisig" 2>/dev/null || true
 
@@ -92,7 +90,6 @@ verify_checksum() {
 	[ "$want" = "$got" ] || die "checksum mismatch for $name (expected $want, got $got)"
 }
 verify_checksum "$ARCHIVE"
-verify_checksum "$EXT_HOST_ARCHIVE"
 say "checksums ok"
 
 # --- verify signature -----------------------------------------------------
@@ -119,14 +116,13 @@ BIN="$(find "$TMP" -type f -name rocker -perm -u+x | head -1)"
 [ -n "$BIN" ] || BIN="$(find "$TMP" -type f -name rocker | head -1)"
 [ -n "$BIN" ] || die "archive did not contain the rocker binary"
 chmod +x "$BIN"
-tar -xf "${TMP}/${EXT_HOST_ARCHIVE}" -C "$TMP"
 EXT_HOST_BIN="$(find "$TMP" -type f -name rocker-ext-host -perm -u+x | head -1)"
 [ -n "$EXT_HOST_BIN" ] || EXT_HOST_BIN="$(find "$TMP" -type f -name rocker-ext-host | head -1)"
-[ -n "$EXT_HOST_BIN" ] || die "archive did not contain the rocker extension host"
+[ -n "$EXT_HOST_BIN" ] || die "archive did not contain the Rocker extension host"
 chmod +x "$EXT_HOST_BIN"
 
-say "running: rocker install --ext-host $EXT_HOST_BIN$FORWARD"
+say "running: rocker install (app + extension host)$FORWARD"
 # shellcheck disable=SC2086
-"$BIN" install --ext-host "$EXT_HOST_BIN" $FORWARD
+"$BIN" install $FORWARD
 
 say "done. launch Rocker from your application menu, or run: rocker"

@@ -8,10 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-11
+
 ### Changed
 
 - The macOS/Linux shell installer and Windows PowerShell installer now install
-  `rocker` and `rocker-ext-host` together in one command.
+  one archive containing `rocker` and its supervised `rocker-ext-host`
+  companion in a single command; neither executable is installed alone.
+- The release no longer publishes `rocker-ext-host` as a separate application
+  or installer.
 
 ## [0.2.0] - 2026-09-11
 

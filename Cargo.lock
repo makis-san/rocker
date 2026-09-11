@@ -3903,14 +3903,17 @@ dependencies = [
 
 [[package]]
 name = "rocker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "rocker-ext-api",
+ "rocker-ext-host",
  "rocker-setup",
  "rocker-store",
  "rocker-ui",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3918,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "rocker-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3926,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "rocker-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bollard",
  "futures-util",
@@ -3940,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "rocker-ext-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3948,7 +3951,7 @@ dependencies = [
 
 [[package]]
 name = "rocker-ext-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -3970,14 +3973,14 @@ dependencies = [
 
 [[package]]
 name = "rocker-secrets"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "rocker-setup"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "minisign-verify",
@@ -3994,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "rocker-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "redb",
  "rocker-core",
@@ -4006,14 +4009,14 @@ dependencies = [
 
 [[package]]
 name = "rocker-term"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "rocker-theme"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rocker-core",
  "serde",
@@ -4023,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "rocker-ui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "auto-launch",
  "eframe",
@@ -6416,7 +6419,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
 ]

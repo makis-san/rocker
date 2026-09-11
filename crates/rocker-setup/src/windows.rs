@@ -9,9 +9,9 @@ use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
 use crate::{
-    assets, place_companion, remove_path, write_file, Change, ChangeVerb, Diagnosis,
-    InstallOptions, Report, Scope, UninstallOptions, APP_NAME, BIN_NAME, EXT_HOST_BIN_NAME,
-    VERSION,
+    assets, companion_source, place_companion, remove_path, write_file, Change, ChangeVerb,
+    Diagnosis, InstallOptions, Report, Scope, UninstallOptions, APP_NAME, BIN_NAME,
+    EXT_HOST_BIN_NAME, VERSION,
 };
 
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Rocker";
@@ -56,15 +56,14 @@ fn env_var(name: &str) -> anyhow::Result<String> {
 
 pub(crate) fn install(opts: &InstallOptions, report: &mut Report) -> anyhow::Result<()> {
     let layout = Layout::resolve(opts.scope, opts.bin_dir.as_deref())?;
+    let ext_host_source = companion_source()?;
     std::fs::create_dir_all(&layout.dir)
         .with_context(|| format!("create {}", layout.dir.display()))?;
 
     if !opts.refresh_only {
         place_binary(&layout, report)?;
     }
-    if let Some(source) = opts.ext_host.as_deref() {
-        place_companion(source, &layout.ext_host(), report)?;
-    }
+    place_companion(&ext_host_source, &layout.ext_host(), report)?;
     write_file(report, &layout.icon(), &assets::ico())?;
     create_shortcut(&layout, report)?;
     write_uninstall_entry(&layout, report)?;

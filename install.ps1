@@ -37,7 +37,6 @@ switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 $Triple  = "$cpu-pc-windows-msvc"
 $Archive = "rocker-$Triple.zip"
-$ExtHostArchive = "rocker-ext-host-$Triple.zip"
 
 # --- resolve the release tag --------------------------------------------------
 $headers = @{ "User-Agent" = "rocker-install"; "Accept" = "application/vnd.github+json" }
@@ -53,9 +52,8 @@ $Base = "https://github.com/$Repo/releases/download/$Tag"
 $Tmp  = Join-Path $env:TEMP ("rocker-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
-    Say "downloading $Archive and $ExtHostArchive"
+    Say "downloading $Archive (Rocker app + extension host)"
     Invoke-WebRequest -Headers $headers "$Base/$Archive"    -OutFile (Join-Path $Tmp $Archive)
-    Invoke-WebRequest -Headers $headers "$Base/$ExtHostArchive" -OutFile (Join-Path $Tmp $ExtHostArchive)
     Invoke-WebRequest -Headers $headers "$Base/SHA256SUMS"  -OutFile (Join-Path $Tmp "SHA256SUMS")
     try {
         Invoke-WebRequest -Headers $headers "$Base/SHA256SUMS.minisig" -OutFile (Join-Path $Tmp "SHA256SUMS.minisig")
@@ -74,7 +72,6 @@ try {
         }
     }
     Verify-Archive $Archive
-    Verify-Archive $ExtHostArchive
     Say "checksums ok"
 
     # --- verify signature --------------------------------------------
@@ -97,13 +94,12 @@ try {
     # --- unpack and hand off to the binary ---------------------------
     Say "unpacking"
     Expand-Archive -Path (Join-Path $Tmp $Archive) -DestinationPath $Tmp -Force
-    Expand-Archive -Path (Join-Path $Tmp $ExtHostArchive) -DestinationPath $Tmp -Force
     $exe = Get-ChildItem -Path $Tmp -Recurse -Filter "rocker.exe" | Select-Object -First 1
     if (-not $exe) { Die "archive did not contain rocker.exe" }
     $extHostExe = Get-ChildItem -Path $Tmp -Recurse -Filter "rocker-ext-host.exe" | Select-Object -First 1
-    if (-not $extHostExe) { Die "archive did not contain rocker-ext-host.exe" }
+    if (-not $extHostExe) { Die "archive did not contain the Rocker extension host" }
 
-    $fwd = @("install", "--ext-host", $extHostExe.FullName)
+    $fwd = @("install")
     if ($ModifyPath) { $fwd += "--modify-path" }
     if ($System)     { $fwd += "--system" }
     Say "running: rocker $($fwd -join ' ')"

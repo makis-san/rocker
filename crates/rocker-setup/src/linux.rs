@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 use crate::{
-    assets, home, is_flatpak, place_companion, remove_path, run_hook, write_file, Change,
-    ChangeVerb, Diagnosis, InstallOptions, Report, Scope, UninstallOptions, APP_ID, BIN_NAME,
-    EXT_HOST_BIN_NAME, VERSION,
+    assets, companion_source, home, is_flatpak, place_companion, remove_path, run_hook, write_file,
+    Change, ChangeVerb, Diagnosis, InstallOptions, Report, Scope, UninstallOptions, APP_ID,
+    BIN_NAME, EXT_HOST_BIN_NAME, VERSION,
 };
 
 struct Layout {
@@ -79,6 +79,8 @@ fn xdg_bin_home() -> anyhow::Result<PathBuf> {
 pub(crate) fn install(opts: &InstallOptions, report: &mut Report) -> anyhow::Result<()> {
     let layout = Layout::resolve(opts.scope, opts.bin_dir.as_deref())?;
 
+    let ext_host_source = companion_source()?;
+
     if is_flatpak() {
         report.push(
             Change::new(ChangeVerb::Warning, "flatpak sandbox").with_note(
@@ -92,9 +94,7 @@ pub(crate) fn install(opts: &InstallOptions, report: &mut Report) -> anyhow::Res
     } else {
         place_binary(&layout.bin, report)?
     };
-    if let Some(source) = opts.ext_host.as_deref() {
-        place_companion(source, &layout.ext_host(), report)?;
-    }
+    place_companion(&ext_host_source, &layout.ext_host(), report)?;
 
     // Desktop entry, with every Exec= made absolute and a TryExec= guard added.
     let desktop = rewrite_desktop_entry(assets::DESKTOP_ENTRY, &exec_target);

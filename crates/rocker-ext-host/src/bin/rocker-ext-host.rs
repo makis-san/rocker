@@ -1,10 +1,10 @@
-//! Isolated process for one Rocker extension, either tier.
-//!
-//! The parent application owns Docker access. This binary executes only the
-//! sandboxed script or component and writes requested actions to stdout as
-//! newline-delimited JSON. A Tier 2 (component) extension's data queries
-//! (`HostQuery`) block on a matching `HostRequest::Answer` read back from
-//! standard input before the extension can resume.
+// Isolated process for one Rocker extension, either tier.
+//
+// The parent application owns Docker access. This binary executes only the
+// sandboxed script or component and writes requested actions to stdout as
+// newline-delimited JSON. A Tier 2 (component) extension's data queries
+// (`HostQuery`) block on a matching `HostRequest::Answer` read back from
+// standard input before the extension can resume.
 
 use std::{
     io::{self, BufRead, BufReader, BufWriter},

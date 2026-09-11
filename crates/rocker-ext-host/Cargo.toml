@@ -9,6 +9,11 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+# This crate remains a library dependency and test target. Its executable is
+# included in the main Rocker distribution package instead of released alone.
+[package.metadata.dist]
+dist = false
+
 [package.metadata.wix]
 upgrade-guid = "B7927A75-88CB-4A31-BF8A-F03C4371697D"
 path-guid = "A11693DD-3BC4-49AC-BCEF-8A87AF69F15B"

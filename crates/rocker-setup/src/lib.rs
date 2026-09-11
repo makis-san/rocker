@@ -12,6 +12,8 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
+
 mod assets;
 pub mod cli;
 
@@ -66,8 +68,6 @@ pub struct InstallOptions {
     pub modify_path: bool,
     /// Override the directory the binary is copied into.
     pub bin_dir: Option<PathBuf>,
-    /// Optional extension-host executable to install beside the main binary.
-    pub ext_host: Option<PathBuf>,
     /// Rewrite the desktop/bundle metadata only; don't touch the binary.
     /// Used by `self-update` after it swaps the executable.
     pub refresh_only: bool,
@@ -141,6 +141,30 @@ pub fn install(opts: &InstallOptions) -> anyhow::Result<Report> {
     let mut report = Report::default();
     platform::install(opts, &mut report)?;
     Ok(report)
+}
+
+/// Locate the extension host shipped beside the running Rocker executable.
+///
+/// The application and its supervised helper are one installation unit. By
+/// deriving this path from the running executable, every supported installer
+/// can ship one archive and cannot accidentally install only half the pair.
+pub(crate) fn companion_source() -> anyhow::Result<PathBuf> {
+    let running = std::env::current_exe().context("resolve the running executable")?;
+    let parent = running
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("running executable has no parent directory"))?;
+    let filename = if cfg!(windows) {
+        format!("{EXT_HOST_BIN_NAME}.exe")
+    } else {
+        EXT_HOST_BIN_NAME.to_owned()
+    };
+    let source = parent.join(filename);
+    anyhow::ensure!(
+        source.is_file(),
+        "Rocker and its extension host must be installed together; missing {}",
+        source.display()
+    );
+    Ok(source)
 }
 
 /// Remove everything [`install`] created (keeps user config unless `purge`).
@@ -272,10 +296,6 @@ fn same_contents(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 /// Install an already-extracted companion executable beside the main binary.
-///
-/// The main binary is the process invoking `rocker install`, so it keeps its
-/// platform-specific placement logic. The extension host is supplied by the
-/// release installer and uses this shared atomic copy path on every platform.
 pub(crate) fn place_companion(
     source: &std::path::Path,
     destination: &std::path::Path,

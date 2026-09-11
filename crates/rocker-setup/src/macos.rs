@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 use crate::{
-    assets, home, place_companion, remove_path, run_hook, write_file, Change, ChangeVerb,
-    Diagnosis, InstallOptions, Report, Scope, UninstallOptions, APP_ID, APP_NAME, BIN_NAME,
-    EXT_HOST_BIN_NAME, VERSION,
+    assets, companion_source, home, place_companion, remove_path, run_hook, write_file, Change,
+    ChangeVerb, Diagnosis, InstallOptions, Report, Scope, UninstallOptions, APP_ID, APP_NAME,
+    BIN_NAME, EXT_HOST_BIN_NAME, VERSION,
 };
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
@@ -58,13 +58,12 @@ impl Layout {
 
 pub(crate) fn install(opts: &InstallOptions, report: &mut Report) -> anyhow::Result<()> {
     let layout = Layout::resolve(opts.scope, opts.bin_dir.as_deref())?;
+    let ext_host_source = companion_source()?;
 
     if !opts.refresh_only {
         place_binary(&layout, report)?;
     }
-    if let Some(source) = opts.ext_host.as_deref() {
-        place_companion(source, &layout.ext_host(), report)?;
-    }
+    place_companion(&ext_host_source, &layout.ext_host(), report)?;
     write_file(report, &layout.info_plist(), info_plist().as_bytes())?;
     write_file(report, &layout.pkginfo(), b"APPL????")?;
     write_file(report, &layout.icon(), &assets::icns())?;
