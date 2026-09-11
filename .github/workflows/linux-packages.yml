@@ -16,6 +16,12 @@ on:
   workflow_run:
     workflows: [Release]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,14 +33,17 @@ jobs:
   resolve-tag:
     name: resolve release tag
     if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+      (github.event_name == 'workflow_dispatch' && inputs.tag != '') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      RELEASE_TAG: ${{ inputs.tag }}
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -42,11 +51,15 @@ jobs:
         name: Resolve tag for release commit
         shell: bash
         run: |
-          tag="$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" \
-            --jq '.[] | select(.object.sha == env.RELEASE_SHA) | .ref | sub("^refs/tags/"; "")' \
-            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$' \
-            | head -1)"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$RELEASE_TAG"
+          else
+            tag="$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" \
+              --jq '.[] | select(.object.sha == env.RELEASE_SHA) | .ref | sub("^refs/tags/"; "")' \
+              | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$' \
+              | head -1)"
+          fi
           test -n "$tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
