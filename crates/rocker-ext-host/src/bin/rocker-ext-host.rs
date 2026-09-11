@@ -9,7 +9,6 @@
 use std::{
     io::{self, BufRead, BufReader, BufWriter},
     path::PathBuf,
-    process::ExitCode,
     sync::{Arc, Mutex},
 };
 
@@ -20,17 +19,7 @@ use rocker_ext_host::{
     Result as HostResult, ScriptHostApi, ScriptRuntime, ToastLevel,
 };
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("rocker-ext-host: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), String> {
+pub fn run() -> Result<(), String> {
     let mut arguments = std::env::args_os().skip(1);
     let extension_dir = arguments
         .next()
