@@ -1,6 +1,6 @@
 [package]
 name = "rocker-secrets"
-description = "OS keychain wrapper and docker-credential-* helper bridge."
+description = "OS keychain wrapper, docker-credential-* helper bridge, and the registry auth probe."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,3 +15,7 @@ serde_json = "1"
 # Linux secret-service over `zbus` (pure Rust, no libdbus C dependency).
 keyring = "4"
 base64 = "0.23"
+# Matches rocker-setup's HTTP choice (rustls, small dependency tree) rather
+# than PLAN §2's original reqwest sketch — one sync HTTP client is enough for
+# a one-shot `/v2/` probe and keeps the dependency graph smaller.
+ureq = "3"

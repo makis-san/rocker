@@ -5,12 +5,14 @@
 //! crate (macOS Keychain / Windows Credential Manager / Linux secret-service
 //! over `zbus`). [`MemorySecretStore`] is a non-persistent fake for tests and
 //! headless runs. [`docker_config`] imports existing credentials from
-//! `~/.docker/config.json`.
+//! `~/.docker/config.json`. [`probe`] runs a real `/v2/` auth check against a
+//! registry.
 //!
 //! Native cloud-provider registries (AWS ECR, GCR) are not handled here —
 //! those ship as extensions, not core secret providers (PLAN §5.2).
 
 pub mod docker_config;
+pub mod probe;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
