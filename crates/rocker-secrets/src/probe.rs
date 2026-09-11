@@ -4,9 +4,11 @@
 //! Covers the two challenge shapes real v2 registries use: an OAuth2-ish
 //! Bearer-token exchange (Docker Hub, GHCR, GitLab, quay.io, ...) per the
 //! [Docker Registry token spec], and HTTP Basic sent straight to `/v2/`
-//! (some self-hosted registries with no separate token service). Native
-//! cloud-provider auth (AWS ECR's own token exchange, GCR's) is out of
-//! scope here — that ships as an extension (PLAN §5.2), not this probe.
+//! (some self-hosted registries with no separate token service).
+//! [`test_helper_connection`] covers a third case the same way: a
+//! `Helper`-typed registry (AWS ECR via `ecr-login`, GCR, ...), whose
+//! credential comes from [`crate::credential_helper`] instead of the
+//! keychain.
 //!
 //! [Docker Registry token spec]: https://distribution.github.io/distribution/spec/auth/token/
 
@@ -41,6 +43,10 @@ pub enum ConnectionOutcome {
     Unsupported { status: u16 },
     /// Couldn't complete the exchange (DNS, TCP, TLS, timeout, ...).
     NetworkError(String),
+    /// A `Helper`-typed registry's `docker-credential-*` helper couldn't be
+    /// run, or didn't hand back a usable credential (not installed, no
+    /// credential stored for this host, malformed response, ...).
+    HelperError(String),
 }
 
 /// Probe `host` with `username`/`password`. An empty `username`/`password`
@@ -79,6 +85,19 @@ pub fn test_connection(host: &str, username: &str, password: &str) -> Connection
             password,
         ),
         None => ConnectionOutcome::Unsupported { status: 401 },
+    }
+}
+
+/// Probe a `Helper`-typed registry: resolve a fresh credential from its
+/// `docker-credential-<helper>` binary — the same request `docker login`/
+/// `docker pull` make against a `credHelpers`-configured host — then run the
+/// same `/v2/` auth check [`test_connection`] does with any other credential.
+/// This is how a host set up for AWS ECR, GCR, or any other helper-backed
+/// registry gets tested without Rocker ever storing a secret for it.
+pub fn test_helper_connection(host: &str, helper: &str) -> ConnectionOutcome {
+    match crate::credential_helper::fetch(helper, host) {
+        Ok(credential) => test_connection(host, &credential.username, &credential.secret),
+        Err(error) => ConnectionOutcome::HelperError(error.to_string()),
     }
 }
 
@@ -401,5 +420,15 @@ mod tests {
             "",
         );
         assert!(matches!(outcome, ConnectionOutcome::NetworkError(_)));
+    }
+
+    /// No fixture needed, and no network touched: a helper binary that isn't
+    /// installed fails before `test_connection` would ever run, so this
+    /// exercises the `HelperError` branch without `#[ignore]`.
+    #[test]
+    fn a_missing_credential_helper_is_a_helper_error() {
+        let outcome =
+            test_helper_connection("example.com", "this-does-not-exist-anywhere");
+        assert!(matches!(outcome, ConnectionOutcome::HelperError(_)));
     }
 }

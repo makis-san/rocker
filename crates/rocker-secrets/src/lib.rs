@@ -6,11 +6,19 @@
 //! over `zbus`). [`MemorySecretStore`] is a non-persistent fake for tests and
 //! headless runs. [`docker_config`] imports existing credentials from
 //! `~/.docker/config.json`. [`probe`] runs a real `/v2/` auth check against a
-//! registry.
+//! registry. [`credential_helper`] shells out to a `docker-credential-*`
+//! helper binary for a `Helper`-typed registry, the same request `docker
+//! login`/`docker pull` make.
 //!
-//! Native cloud-provider registries (AWS ECR, GCR) are not handled here —
-//! those ship as extensions, not core secret providers (PLAN §5.2).
+//! Cloud-native registries (AWS ECR, GCR, ...) are not modeled with any
+//! provider-specific code here — a user sets them up the standard way (a
+//! `credHelpers` entry in `~/.docker/config.json` pointing at, say,
+//! `docker-credential-ecr-login`), `docker_config` imports the host as
+//! `Helper`-typed with no secret stored, and `credential_helper` resolves a
+//! fresh credential from it exactly like the Docker CLI would. No AWS SDK or
+//! other cloud-provider dependency belongs in this crate (PLAN §5.2).
 
+pub mod credential_helper;
 pub mod docker_config;
 pub mod probe;
 

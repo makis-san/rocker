@@ -12,8 +12,12 @@
 //! (`RockerApp::new`, via [`apply_import`]) — the button here is only a
 //! manual re-scan for mid-session changes, not the only way in.
 //!
-//! Native cloud-provider registries (AWS ECR, GCR) don't get a form here —
-//! they ship as extensions (PLAN §5.2), with their own settings surface.
+//! Cloud-native registries (AWS ECR, GCR, ...) don't get their own add form
+//! here either: a user sets one up the standard way outside Rocker (a
+//! `credHelpers` entry in `~/.docker/config.json` pointing at, say,
+//! `docker-credential-ecr-login`), the importer above notes it as a
+//! `Helper`-typed entry with no secret, and its card's "Test connection"
+//! resolves a fresh credential from that helper (PLAN §5.2).
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
@@ -67,16 +71,34 @@ impl RegistriesScreen {
         }
     }
 
-    /// Kick off a background probe; the outcome lands in `tests` on a later
-    /// `registries_screen` call via [`Self::drain`].
+    /// Kick off a background probe with a stored credential; the outcome
+    /// lands in `tests` on a later `registries_screen` call via [`Self::drain`].
     fn spawn_test(&mut self, host: String, username: String, password: String) {
+        self.spawn(host.clone(), move || {
+            probe::test_connection(&host, &username, &password)
+        });
+    }
+
+    /// Kick off a background probe for a `Helper`-typed registry: the
+    /// credential comes from its `docker-credential-*` helper, resolved
+    /// fresh in the background thread, never held by this screen.
+    fn spawn_helper_test(&mut self, host: String, helper: String) {
+        self.spawn(host.clone(), move || {
+            probe::test_helper_connection(&host, &helper)
+        });
+    }
+
+    /// Shared plumbing for both probe kinds: mark the row "Testing…", then
+    /// run `probe` on a background thread (real network and/or subprocess
+    /// I/O, so it never runs inline in the UI closure) and report back over
+    /// the channel [`Self::drain`] reads.
+    fn spawn(&mut self, host: String, probe: impl FnOnce() -> ConnectionOutcome + Send + 'static) {
         self.tests.insert(host.clone(), TestState::Testing);
         let tx = self.test_tx.clone();
         std::thread::Builder::new()
             .name("rocker-registry-probe".into())
             .spawn(move || {
-                let outcome = probe::test_connection(&host, &username, &password);
-                let _ = tx.send((host, outcome));
+                let _ = tx.send((host, probe()));
             })
             .ok(); // A failed spawn just leaves the row at "Testing…" forever
                    // rather than crashing the app; vanishingly unlikely in practice.
@@ -144,8 +166,10 @@ pub fn registries_screen(
                     ui.label(
                         RichText::new(
                             "Docker Hub, GHCR, GitLab, or any generic v2 host. Credentials \
-                             live in your OS keychain, never in the config file. AWS ECR and \
-                             other cloud-native registries are extensions, not here.",
+                             live in your OS keychain, never in the config file. A host set up \
+                             with its own credential helper — AWS ECR via \
+                             docker-credential-ecr-login, for instance — is tested by asking \
+                             that helper for a fresh credential, never stored here.",
                         )
                         .small()
                         .color(pal.text_muted),
@@ -388,24 +412,30 @@ fn registry_card(
                         *delete = Some(i);
                     }
                     ui.add_space(4.0);
-                    if r.auth_type == AuthType::Basic {
-                        let testing = matches!(state.tests.get(&r.host), Some(TestState::Testing));
-                        if icons::icon_button_enabled(
-                            ui,
-                            pal,
-                            Icon::Refresh,
-                            None,
-                            "Test connection",
-                            !testing,
-                        )
-                        .clicked()
-                        {
-                            let password = r
-                                .keychain_ref
-                                .as_ref()
-                                .and_then(|k| state.secrets.get(&KeychainRef(k.clone())).ok())
-                                .unwrap_or_default();
-                            state.spawn_test(r.host.clone(), r.username.clone(), password);
+                    let testing = matches!(state.tests.get(&r.host), Some(TestState::Testing));
+                    if icons::icon_button_enabled(
+                        ui,
+                        pal,
+                        Icon::Refresh,
+                        None,
+                        "Test connection",
+                        !testing,
+                    )
+                    .clicked()
+                    {
+                        match r.auth_type {
+                            AuthType::Basic => {
+                                let password = r
+                                    .keychain_ref
+                                    .as_ref()
+                                    .and_then(|k| state.secrets.get(&KeychainRef(k.clone())).ok())
+                                    .unwrap_or_default();
+                                state.spawn_test(r.host.clone(), r.username.clone(), password);
+                            }
+                            AuthType::Helper => {
+                                let helper = r.helper.clone().unwrap_or_default();
+                                state.spawn_helper_test(r.host.clone(), helper);
+                            }
                         }
                     }
                 });
@@ -424,13 +454,7 @@ fn status_line(ui: &mut egui::Ui, pal: &Palette, state: &RegistriesScreen, r: &R
         Some(TestState::Outcome(outcome)) => outcome_text(pal, outcome),
         None => match r.verified_at_ms {
             Some(ts) => (format!("Verified {}", format::ago(ts)), pal.text_faint),
-            None => match r.auth_type {
-                AuthType::Basic => ("Not yet tested".to_string(), pal.text_faint),
-                AuthType::Helper => (
-                    "Rocker can't test a credential-helper entry directly".to_string(),
-                    pal.text_faint,
-                ),
-            },
+            None => ("Not yet tested".to_string(), pal.text_faint),
         },
     };
     ui.label(RichText::new(text).small().color(color));
@@ -446,6 +470,7 @@ fn outcome_text(pal: &Palette, outcome: &ConnectionOutcome) -> (String, egui::Co
             pal.unhealthy,
         ),
         ConnectionOutcome::NetworkError(e) => (format!("Network error: {e}"), pal.unhealthy),
+        ConnectionOutcome::HelperError(e) => (e.clone(), pal.unhealthy),
     }
 }
 
@@ -609,5 +634,27 @@ mod tests {
         let changed = state.drain(&mut registries);
         assert!(!changed);
         assert!(registries[0].verified_at_ms.is_none());
+    }
+
+    /// Unlike the `drain_*` tests above (which feed the channel directly),
+    /// this exercises the real background thread `spawn_helper_test` starts,
+    /// end to end through `probe::test_helper_connection`, for a helper that
+    /// isn't installed — proving the Helper test path is wired up, not just
+    /// `drain`'s channel handling.
+    #[test]
+    fn spawn_helper_test_reports_a_missing_helper_through_the_real_thread() {
+        let mut state = screen();
+        state.spawn_helper_test(
+            "123.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+            "this-does-not-exist-anywhere".to_string(),
+        );
+
+        let (host, outcome) = state
+            .test_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the background thread reports back");
+
+        assert_eq!(host, "123.dkr.ecr.us-east-1.amazonaws.com");
+        assert!(matches!(outcome, ConnectionOutcome::HelperError(_)));
     }
 }

@@ -19,3 +19,6 @@ base64 = "0.23"
 # than PLAN §2's original reqwest sketch — one sync HTTP client is enough for
 # a one-shot `/v2/` probe and keeps the dependency graph smaller.
 ureq = "3"
+
+[dev-dependencies]
+tempfile = "3"
