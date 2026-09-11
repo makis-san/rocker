@@ -21,8 +21,10 @@
 use egui::{vec2, Align, Layout, RichText, Sense, Stroke};
 
 use rocker_ext_api::{Capability, Tier, UiEvent, UiNode};
-use rocker_ext_host::{Discovery, ExtensionRegistry, HostError, InstalledExtension};
-use rocker_store::AppPaths;
+use rocker_ext_host::{
+    Discovery, ExtensionRegistry, HostError, InstalledExtension, TrustedRegistry,
+};
+use rocker_store::{AppPaths, ExtensionRegistrySource};
 
 use crate::icons::{self, Icon};
 use crate::style::{self, Palette};
@@ -42,6 +44,35 @@ const MAX_NODE_DEPTH: u8 = 24;
 pub struct ExtensionsScreen {
     registry: Result<ExtensionRegistry, String>,
     discovery: Discovery,
+    registry_draft: RegistryDraft,
+    tab: ExtensionsTab,
+}
+
+#[derive(Default)]
+struct RegistryDraft {
+    id: String,
+    index_url: String,
+    signature_url: String,
+    public_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionsTab {
+    Installed,
+    Browse,
+    Registries,
+}
+
+impl ExtensionsTab {
+    const ALL: [Self; 3] = [Self::Installed, Self::Browse, Self::Registries];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Installed => "Installed Extensions",
+            Self::Browse => "Browse",
+            Self::Registries => "Extensions Registry",
+        }
+    }
 }
 
 impl ExtensionsScreen {
@@ -58,6 +89,8 @@ impl ExtensionsScreen {
                 Self {
                     registry: Ok(registry),
                     discovery,
+                    registry_draft: RegistryDraft::default(),
+                    tab: ExtensionsTab::Installed,
                 }
             }
             Err(err) => {
@@ -65,6 +98,8 @@ impl ExtensionsScreen {
                 Self {
                     registry: Err(err.to_string()),
                     discovery: Discovery::default(),
+                    registry_draft: RegistryDraft::default(),
+                    tab: ExtensionsTab::Installed,
                 }
             }
         }
@@ -90,6 +125,8 @@ impl ExtensionsScreen {
 /// rather than something still waiting to be written.
 pub struct Edit {
     pub error: Option<String>,
+    /// The app config changed and should be saved by the caller.
+    pub registries_changed: bool,
 }
 
 /// Render the Extensions screen.
@@ -97,8 +134,10 @@ pub fn extensions_screen(
     ui: &mut egui::Ui,
     pal: &Palette,
     screen: &mut ExtensionsScreen,
+    registries: &mut Vec<ExtensionRegistrySource>,
 ) -> Option<Edit> {
     let mut changed = false;
+    let mut registries_changed = false;
     let mut error = None;
 
     egui::ScrollArea::vertical()
@@ -114,68 +153,30 @@ pub fn extensions_screen(
                     ui.set_width(col);
                     ui.add_space(6.0);
 
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("Extensions")
-                                .size(19.0)
-                                .strong()
-                                .color(pal.text),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icons::icon_button(
-                                ui,
-                                pal,
-                                Icon::Refresh,
-                                None,
-                                "Rescan the extensions folder",
-                            )
-                            .clicked()
-                            {
-                                screen.refresh();
-                            }
-                        });
-                    });
-                    ui.add_space(3.0);
                     ui.label(
-                        RichText::new(
-                            "Installed from a local folder. Every capability below is only \
-                             what its manifest actually requests.",
-                        )
-                        .small()
-                        .color(pal.text_muted),
+                        RichText::new("Extensions")
+                            .size(19.0)
+                            .strong()
+                            .color(pal.text),
                     );
+                    ui.add_space(10.0);
+                    extensions_tabstrip(ui, pal, &mut screen.tab);
                     ui.add_space(16.0);
 
-                    match &mut screen.registry {
-                        Err(load_err) => {
-                            broken_banner(
+                    match screen.tab {
+                        ExtensionsTab::Installed => {
+                            installed_extensions_section(ui, pal, screen, &mut changed, &mut error)
+                        }
+                        ExtensionsTab::Browse => browse_extensions_section(ui, pal, registries),
+                        ExtensionsTab::Registries => {
+                            if registry_sources_section(
                                 ui,
                                 pal,
-                                "Extensions folder unavailable",
-                                load_err.as_str(),
-                            );
-                        }
-                        Ok(registry) => {
-                            if !screen.discovery.failures.is_empty() {
-                                failures_section(ui, pal, &screen.discovery.failures);
-                                ui.add_space(14.0);
-                            }
-
-                            if screen.discovery.extensions.is_empty()
-                                && screen.discovery.failures.is_empty()
-                            {
-                                ui.add_space(10.0);
-                                ui.label(
-                                    RichText::new("No extensions installed yet.")
-                                        .color(pal.text_faint),
-                                );
-                            } else if !screen.discovery.extensions.is_empty() {
-                                for ext in &mut screen.discovery.extensions {
-                                    ui.add_space(10.0);
-                                    if extension_card(ui, pal, registry, ext, &mut error) {
-                                        changed = true;
-                                    }
-                                }
+                                registries,
+                                &mut screen.registry_draft,
+                                &mut error,
+                            ) {
+                                registries_changed = true;
                             }
                         }
                     }
@@ -185,7 +186,290 @@ pub fn extensions_screen(
             });
         });
 
-    (changed || error.is_some()).then_some(Edit { error })
+    (changed || registries_changed || error.is_some()).then_some(Edit {
+        error,
+        registries_changed,
+    })
+}
+
+fn extensions_tabstrip(ui: &mut egui::Ui, pal: &Palette, selected: &mut ExtensionsTab) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for tab in ExtensionsTab::ALL {
+            let active = *selected == tab;
+            if icons::toggle_text_button(ui, pal, tab.label(), active, tab.label()).clicked() {
+                *selected = tab;
+            }
+        }
+    });
+}
+
+fn installed_extensions_section(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    screen: &mut ExtensionsScreen,
+    changed: &mut bool,
+    error: &mut Option<String>,
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                RichText::new("Installed extensions")
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.label(
+                RichText::new("Installed on this computer. Permissions reflect each manifest.")
+                    .small()
+                    .color(pal.text_muted),
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if icons::icon_button(ui, pal, Icon::Refresh, None, "Rescan the extensions folder")
+                .clicked()
+            {
+                screen.refresh();
+            }
+        });
+    });
+    ui.add_space(10.0);
+
+    match &mut screen.registry {
+        Err(load_err) => broken_banner(ui, pal, "Extensions folder unavailable", load_err.as_str()),
+        Ok(registry) => {
+            if !screen.discovery.failures.is_empty() {
+                failures_section(ui, pal, &screen.discovery.failures);
+                ui.add_space(14.0);
+            }
+            if screen.discovery.extensions.is_empty() && screen.discovery.failures.is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new("No extensions installed yet.").color(pal.text_faint));
+            } else {
+                for ext in &mut screen.discovery.extensions {
+                    ui.add_space(10.0);
+                    if extension_card(ui, pal, registry, ext, error) {
+                        *changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn browse_extensions_section(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    registries: &[ExtensionRegistrySource],
+) {
+    ui.label(RichText::new("Browse extensions").strong().color(pal.text));
+    ui.add_space(10.0);
+    if registries.is_empty() {
+        ui.label(RichText::new("Add a registry to browse extensions.").color(pal.text_faint));
+        return;
+    }
+    for source in registries {
+        registry_catalog_card(ui, pal, source, false);
+        ui.add_space(6.0);
+    }
+}
+
+/// Render and edit the trusted catalog list. A registry can be removed even
+/// when it is the compiled-in default: default only means new installations
+/// start with it, never that it is forced on an existing user.
+fn registry_sources_section(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    registries: &mut Vec<ExtensionRegistrySource>,
+    draft: &mut RegistryDraft,
+    error: &mut Option<String>,
+) -> bool {
+    let mut changed = false;
+    ui.label(
+        RichText::new("Extension registries")
+            .size(15.0)
+            .strong()
+            .color(pal.text),
+    );
+    ui.add_space(3.0);
+    ui.label(
+        RichText::new("Browse signed catalogs you trust. Removing one keeps extensions already installed from it.")
+            .small()
+            .color(pal.text_muted),
+    );
+    ui.add_space(8.0);
+
+    let mut remove = None;
+    for (index, source) in registries.iter().enumerate() {
+        if registry_catalog_card(ui, pal, source, true) {
+            remove = Some(index);
+        }
+        ui.add_space(6.0);
+    }
+    if let Some(index) = remove {
+        registries.remove(index);
+        changed = true;
+    }
+
+    egui::CollapsingHeader::new(
+        RichText::new("Add registry")
+            .small()
+            .strong()
+            .color(pal.text),
+    )
+    .id_salt("add-extension-registry")
+    .show(ui, |ui| {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Add only catalogs whose signing key you trust.")
+                .small()
+                .color(pal.text_muted),
+        );
+        ui.add_space(6.0);
+        registry_field(ui, pal, "ID", "e.g. community", &mut draft.id);
+        registry_field(
+            ui,
+            pal,
+            "Index URL",
+            "https://…/index-v1.json",
+            &mut draft.index_url,
+        );
+        registry_field(
+            ui,
+            pal,
+            "Signature URL",
+            "https://…/index-v1.sig",
+            &mut draft.signature_url,
+        );
+        registry_field(
+            ui,
+            pal,
+            "Public key",
+            "64-character Ed25519 hex key",
+            &mut draft.public_key,
+        );
+        ui.add_space(4.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if icons::primary_button(ui, pal, "Add registry").clicked() {
+                match registry_from_draft(draft) {
+                    Ok(source) if registries.iter().any(|item| item.id == source.id) => {
+                        *error = Some(format!("A registry named `{}` already exists.", source.id));
+                    }
+                    Ok(source) => {
+                        registries.push(source);
+                        *draft = RegistryDraft::default();
+                        changed = true;
+                    }
+                    Err(message) => *error = Some(message),
+                }
+            }
+        });
+    });
+    changed
+}
+
+/// A compact registry identity. GitHub-backed catalogs deliberately show the
+/// repository rather than an implementation-specific raw index URL.
+fn registry_catalog_card(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    source: &ExtensionRegistrySource,
+    removable: bool,
+) -> bool {
+    let mut remove = false;
+    egui::Frame::new()
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.0, pal.border))
+        .corner_radius(style::radius(pal.corner))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new(&source.id).strong().color(pal.text));
+                    if let Some((name, url)) = github_repository(&source.index_url) {
+                        let link = ui.link(RichText::new(name).small().color(pal.accent));
+                        if link.clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Signed HTTPS registry")
+                                .small()
+                                .color(pal.text_muted),
+                        );
+                    }
+                });
+                if removable {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icons::text_button(ui, pal, "Remove").clicked() {
+                            remove = true;
+                        }
+                    });
+                }
+            });
+        });
+    remove
+}
+
+/// Return the GitHub repository represented by an ordinary or raw-content URL.
+fn github_repository(index_url: &str) -> Option<(String, String)> {
+    let path = index_url
+        .strip_prefix("https://github.com/")
+        .or_else(|| index_url.strip_prefix("https://raw.githubusercontent.com/"))?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((
+        format!("{owner}/{repo}"),
+        format!("https://github.com/{owner}/{repo}"),
+    ))
+}
+
+fn registry_field(ui: &mut egui::Ui, pal: &Palette, label: &str, hint: &str, value: &mut String) {
+    ui.label(RichText::new(label).small().color(pal.text_muted));
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            .desired_width(f32::INFINITY)
+            .text_color(pal.text),
+    );
+    ui.add_space(4.0);
+}
+
+fn registry_from_draft(draft: &RegistryDraft) -> Result<ExtensionRegistrySource, String> {
+    let public_key = decode_public_key(&draft.public_key)?;
+    TrustedRegistry::new(
+        draft.id.trim(),
+        draft.index_url.trim(),
+        draft.signature_url.trim(),
+        public_key,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(ExtensionRegistrySource {
+        id: draft.id.trim().to_owned(),
+        index_url: draft.index_url.trim().to_owned(),
+        signature_url: draft.signature_url.trim().to_owned(),
+        public_key: draft.public_key.trim().to_ascii_lowercase(),
+    })
+}
+
+fn decode_public_key(value: &str) -> Result<[u8; 32], String> {
+    let value = value.trim();
+    if value.len() != 64 {
+        return Err("The public key must be 64 hexadecimal characters.".to_string());
+    }
+    let mut key = [0_u8; 32];
+    for (offset, byte) in key.iter_mut().enumerate() {
+        let start = offset * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .map_err(|_| "The public key must be valid hexadecimal.".to_string())?;
+    }
+    Ok(key)
 }
 
 /// A load failure kept off to the side: title + detail, tinted like the
@@ -640,6 +924,8 @@ mod tests {
                 extensions,
                 failures,
             },
+            registry_draft: RegistryDraft::default(),
+            tab: ExtensionsTab::Installed,
         }
     }
 
@@ -679,6 +965,7 @@ mod tests {
         );
 
         for width in [420.0_f32, 700.0, 1200.0] {
+            let mut registries = vec![ExtensionRegistrySource::official()];
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::pos2(0.0, 0.0),
@@ -689,7 +976,7 @@ mod tests {
             let mut edit = None;
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    edit = extensions_screen(ui, &pal, &mut screen);
+                    edit = extensions_screen(ui, &pal, &mut screen, &mut registries);
                 });
             });
             assert!(edit.is_none(), "no pointer input, so nothing should change");
@@ -707,9 +994,12 @@ mod tests {
         let mut broken = ExtensionsScreen {
             registry: Err("permission denied".into()),
             discovery: Discovery::default(),
+            registry_draft: RegistryDraft::default(),
+            tab: ExtensionsTab::Installed,
         };
 
         for screen in [&mut empty, &mut broken] {
+            let mut registries = vec![ExtensionRegistrySource::official()];
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::pos2(0.0, 0.0),
@@ -719,7 +1009,7 @@ mod tests {
             };
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    extensions_screen(ui, &pal, screen);
+                    extensions_screen(ui, &pal, screen, &mut registries);
                 });
             });
         }
@@ -741,6 +1031,42 @@ mod tests {
         ] {
             assert!(!capability_label(cap).is_empty());
         }
+    }
+
+    #[test]
+    fn registry_draft_accepts_a_signed_https_source() {
+        let draft = RegistryDraft {
+            id: "community".into(),
+            index_url: "https://registry.example/index-v1.json".into(),
+            signature_url: "https://registry.example/index-v1.sig".into(),
+            public_key: "21bc5889a2e5293ee6a22da5678f0497e90b2c67a2c55fd79f1ca0434af21e0a".into(),
+        };
+
+        let source = registry_from_draft(&draft).expect("valid registry draft");
+
+        assert_eq!(source.id, "community");
+    }
+
+    #[test]
+    fn registry_draft_rejects_a_non_hex_public_key() {
+        let error = decode_public_key("z".repeat(64).as_str()).expect_err("invalid key");
+
+        assert_eq!(error, "The public key must be valid hexadecimal.");
+    }
+
+    #[test]
+    fn github_repository_turns_a_raw_index_url_into_a_repository_link() {
+        let repository = github_repository(
+            "https://raw.githubusercontent.com/makis-san/rocker-registry/main/index-v1.json",
+        );
+
+        assert_eq!(
+            repository,
+            Some((
+                "makis-san/rocker-registry".into(),
+                "https://github.com/makis-san/rocker-registry".into(),
+            ))
+        );
     }
 
     /// Every `UiNode` variant, including nested `Row`/`Column`/`Table` and a

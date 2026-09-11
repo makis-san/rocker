@@ -1146,13 +1146,21 @@ impl RockerApp {
         }
     }
 
-    /// Render the Extensions screen. Unlike `groups_view`/`settings_view`,
-    /// grant and toggle edits persist themselves straight through the
-    /// extension registry — this only needs to surface a save failure.
+    /// Render the Extensions screen. Extension grants persist through the
+    /// local installer; registry sources are app configuration and are saved
+    /// here with the rest of that configuration.
     fn extensions_view(&mut self, ui: &mut egui::Ui) {
-        if let Some(edit) = extensions::extensions_screen(ui, &self.pal, &mut self.extensions) {
+        if let Some(edit) = extensions::extensions_screen(
+            ui,
+            &self.pal,
+            &mut self.extensions,
+            &mut self.config.extension_registries,
+        ) {
+            if edit.registries_changed {
+                self.persist();
+            }
             if let Some(err) = edit.error {
-                self.last_error = Some(format!("Couldn't save extension settings: {err}"));
+                self.last_error = Some(format!("Couldn't save extensions: {err}"));
             }
         }
     }
