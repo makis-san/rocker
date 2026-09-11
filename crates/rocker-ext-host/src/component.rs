@@ -192,7 +192,11 @@ impl ComponentRuntime {
                 actual: manifest.tier,
             });
         }
-        let entry_path = std::fs::canonicalize(extension_dir.join(&manifest.entry))?;
+        let entry = manifest
+            .entry
+            .as_deref()
+            .expect("validated above: component tier always has an entry");
+        let entry_path = std::fs::canonicalize(extension_dir.join(entry))?;
         if !entry_path.starts_with(&extension_dir) {
             return Err(HostError::EntryOutsideInstall);
         }
@@ -297,8 +301,9 @@ mod tests {
             version: "0.1.0".into(),
             tier: Tier::Component,
             capabilities: caps,
-            entry: "extension.wasm".into(),
+            entry: Some("extension.wasm".into()),
             schedule_seconds: None,
+            theme_variants: Vec::new(),
         }
     }
 

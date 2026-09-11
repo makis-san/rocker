@@ -8,8 +8,9 @@
 
 use rocker_store::Settings;
 
+use crate::extensions::ThemeExtensionOption;
 use crate::style::{self, Palette};
-use crate::widgets::{segmented, stepper};
+use crate::widgets::{dropdown, segmented, stepper};
 
 /// Read-only facts shown in the "About" section.
 pub struct About<'a> {
@@ -37,12 +38,13 @@ const CONTROL_W: f32 = 232.0;
 /// controls sit on one shared grid regardless of description length.
 const ROW_H: f32 = 44.0;
 
-const THEME_OPTS: [&str; 3] = ["System", "Light", "Dark"];
+const THEME_OPTS: [&str; 4] = ["System", "Light", "Dark", "Custom"];
 
 fn theme_index(id: &str) -> usize {
     match id {
         "light" => 1,
         "dark" => 2,
+        "custom" => 3,
         _ => 0,
     }
 }
@@ -51,6 +53,7 @@ fn theme_id(index: usize) -> &'static str {
     match index {
         1 => "light",
         2 => "dark",
+        3 => "custom",
         _ => "system",
     }
 }
@@ -59,6 +62,7 @@ pub fn settings_screen(
     ui: &mut egui::Ui,
     pal: &Palette,
     settings: &mut Settings,
+    custom_themes: &[ThemeExtensionOption],
     about: About<'_>,
 ) -> Option<Edit> {
     let mut theme_changed = false;
@@ -92,6 +96,9 @@ pub fn settings_screen(
                             theme_changed = true;
                         }
                     });
+                    if settings.theme == "custom" {
+                        theme_changed |= custom_theme_rows(ui, pal, settings, custom_themes);
+                    }
 
                     section(ui, pal, "Usage history");
                     row(
@@ -203,6 +210,93 @@ pub fn settings_screen(
     })
 }
 
+/// The rows shown under "Theme" once "Custom" is picked: a dropdown of every
+/// installed, enabled theme extension, and — only when that extension ships
+/// more than one look — a second dropdown for its variant. With none
+/// installed, a quiet pointer to Extensions stands in for the dropdown rather
+/// than leaving it looking like a dead control. Keeps `settings.theme_*`
+/// pointed at a real extension and variant whenever one is available, so a
+/// stale reference (the extension was uninstalled, or an id changed) is
+/// corrected here rather than left pointing at nothing. Returns whether the
+/// resolved theme selection changed.
+fn custom_theme_rows(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    settings: &mut Settings,
+    custom_themes: &[ThemeExtensionOption],
+) -> bool {
+    if custom_themes.is_empty() {
+        row(
+            ui,
+            pal,
+            "Custom theme",
+            "No enabled theme extensions installed. Install one from Extensions.",
+            |_ui| {},
+        );
+        return false;
+    }
+
+    let mut changed = false;
+
+    let mut ext_idx = custom_themes
+        .iter()
+        .position(|t| Some(t.id.as_str()) == settings.theme_extension.as_deref())
+        .unwrap_or(0);
+    if settings.theme_extension.as_deref() != Some(custom_themes[ext_idx].id.as_str()) {
+        settings.theme_extension = Some(custom_themes[ext_idx].id.clone());
+        settings.theme_variant = None;
+        changed = true;
+    }
+
+    let names: Vec<&str> = custom_themes.iter().map(|t| t.name.as_str()).collect();
+    row(
+        ui,
+        pal,
+        "Custom theme",
+        "An installed theme extension.",
+        |ui| {
+            if let Some(next) = dropdown(ui, pal, "theme-ext", &names, ext_idx) {
+                ext_idx = next;
+                settings.theme_extension = Some(custom_themes[ext_idx].id.clone());
+                settings.theme_variant = None;
+                changed = true;
+            }
+        },
+    );
+
+    let ext = &custom_themes[ext_idx];
+    let mut variant_idx = ext
+        .variants
+        .iter()
+        .position(|(id, _)| Some(id.as_str()) == settings.theme_variant.as_deref())
+        .unwrap_or(0);
+    if ext.variants.get(variant_idx).map(|(id, _)| id.as_str()) != settings.theme_variant.as_deref()
+    {
+        settings.theme_variant = ext.variants.get(variant_idx).map(|(id, _)| id.clone());
+        changed = true;
+    }
+
+    if ext.variants.len() > 1 {
+        let variant_names: Vec<&str> = ext.variants.iter().map(|(_, name)| name.as_str()).collect();
+        row(
+            ui,
+            pal,
+            "Variant",
+            "This theme ships more than one look.",
+            |ui| {
+                if let Some(next) = dropdown(ui, pal, "theme-variant", &variant_names, variant_idx)
+                {
+                    variant_idx = next;
+                    settings.theme_variant = Some(ext.variants[variant_idx].0.clone());
+                    changed = true;
+                }
+            },
+        );
+    }
+
+    changed
+}
+
 /// An Off/On segmented control for a boolean row. Returns the new value only
 /// when it actually flips.
 fn toggle(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, value: bool) -> Option<bool> {
@@ -309,6 +403,7 @@ mod tests {
                         ui,
                         &pal,
                         &mut settings,
+                        &[],
                         About {
                             app_version: "0.0.0",
                             engine: None,
@@ -320,5 +415,78 @@ mod tests {
             assert!(edit.is_none(), "no pointer input, so nothing should change");
             assert_eq!(settings.theme, rocker_store::Settings::default().theme);
         }
+    }
+
+    /// With "Custom" already selected and a couple of installed theme
+    /// extensions on hand, the screen must lay out (and settle on a valid
+    /// extension/variant) without panicking, whether the chosen extension
+    /// has one variant or several. A first pass may repair a stale or empty
+    /// selection even with no pointer input (PLAN §5.4: always resolve to a
+    /// real installed theme); a second pass against the now-settled state
+    /// must report nothing left to fix.
+    #[test]
+    fn custom_theme_rows_settle_without_panic() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let custom_themes = [
+            ThemeExtensionOption {
+                id: "acme.mono".into(),
+                name: "Mono".into(),
+                variants: vec![("only".into(), "Only".into())],
+            },
+            ThemeExtensionOption {
+                id: "acme.catppuccin".into(),
+                name: "Catppuccin".into(),
+                variants: vec![
+                    ("mocha".into(), "Mocha".into()),
+                    ("latte".into(), "Latte".into()),
+                ],
+            },
+        ];
+        let mut settings = rocker_store::Settings {
+            theme: "custom".into(),
+            ..rocker_store::Settings::default()
+        };
+
+        let run = |ctx: &egui::Context, settings: &mut rocker_store::Settings| -> Option<Edit> {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(700.0, 640.0),
+                )),
+                ..Default::default()
+            };
+            let mut edit = None;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    edit = settings_screen(
+                        ui,
+                        &pal,
+                        settings,
+                        &custom_themes,
+                        About {
+                            app_version: "0.0.0",
+                            engine: None,
+                            config_path: "/tmp/rocker/config.toml",
+                        },
+                    );
+                });
+            });
+            edit
+        };
+
+        let first = run(&ctx, &mut settings);
+        assert!(
+            first.is_some_and(|edit| edit.theme_changed),
+            "an empty selection must be repaired to a real installed theme"
+        );
+        assert_eq!(settings.theme_extension.as_deref(), Some("acme.mono"));
+        assert_eq!(settings.theme_variant.as_deref(), Some("only"));
+
+        let second = run(&ctx, &mut settings);
+        assert!(
+            second.is_none(),
+            "a settled selection with no pointer input must report no further change"
+        );
     }
 }

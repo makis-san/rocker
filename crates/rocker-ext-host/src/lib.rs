@@ -13,9 +13,9 @@ pub use component::{
     ComponentContainer, ComponentHostApi, ComponentLimits, ComponentRuntime, ToastLevel,
 };
 pub use registry::{
-    official_registry, RegistryClient, RegistryIndex, RegistryRelease, RegistryTransport,
-    TrustedRegistry, OFFICIAL_REGISTRY_ID, OFFICIAL_REGISTRY_INDEX_URL,
-    OFFICIAL_REGISTRY_PUBLIC_KEY, OFFICIAL_REGISTRY_SIGNATURE_URL,
+    compare_versions, official_registry, HttpTransport, RegistryClient, RegistryIndex,
+    RegistryRelease, RegistryTransport, TrustedRegistry, OFFICIAL_REGISTRY_ID,
+    OFFICIAL_REGISTRY_INDEX_URL, OFFICIAL_REGISTRY_PUBLIC_KEY, OFFICIAL_REGISTRY_SIGNATURE_URL,
 };
 
 use std::{
@@ -53,6 +53,14 @@ pub enum HostError {
     Io(#[from] std::io::Error),
     #[error("extension `{0}` is already installed")]
     AlreadyInstalled(String),
+    #[error(
+        "extension `{id}` v{installed} is already installed; `{requested}` is not a newer version"
+    )]
+    Downgrade {
+        id: String,
+        installed: String,
+        requested: String,
+    },
     #[error("extension source contains a symbolic link: {0}")]
     SymbolicLink(PathBuf),
     #[error("registry metadata is invalid: {0}")]
@@ -185,7 +193,11 @@ impl ScriptRuntime {
             });
         }
 
-        let entry_path = std::fs::canonicalize(extension_dir.join(&manifest.entry))?;
+        let entry = manifest
+            .entry
+            .as_deref()
+            .expect("validated above: script tier always has an entry");
+        let entry_path = std::fs::canonicalize(extension_dir.join(entry))?;
         if !entry_path.starts_with(&extension_dir) {
             return Err(HostError::EntryOutsideInstall);
         }
@@ -398,7 +410,7 @@ impl ExtensionRegistry {
         let cleanup_path = staging.clone();
         let install = (|| {
             copy_extension_dir(&source, &staging)?;
-            self.activate_staged_install(manifest, staging)
+            self.activate_staged_install(manifest, staging, false)
         })();
         if install.is_err() {
             let _ = fs::remove_dir_all(cleanup_path);
@@ -410,7 +422,14 @@ impl ExtensionRegistry {
     ///
     /// The archive is verified and extracted into a new directory before an
     /// atomic rename makes it discoverable. Registry packages never inherit
-    /// local permissions; the new extension starts disabled with no grants.
+    /// local permissions; a fresh install starts disabled with no grants.
+    ///
+    /// If the extension is already installed, this is an *update*: the
+    /// release's version must be strictly newer (by semver) than what's on
+    /// disk, or the install is refused rather than silently overwriting an
+    /// equal or older version. An update replaces the extension's files in
+    /// place but leaves its enabled/dev-mode/capability settings untouched,
+    /// since those are the user's decisions, not the package's.
     pub fn install_registry_package(
         &mut self,
         registry: &TrustedRegistry,
@@ -418,6 +437,25 @@ impl ExtensionRegistry {
         package: &[u8],
     ) -> Result<InstalledExtension> {
         release.verify_package(package, registry.verifying_key())?;
+        if let Some(installed) = self.installed_version(&release.id)? {
+            match registry::compare_versions(&release.version, &installed) {
+                Some(std::cmp::Ordering::Greater) => {}
+                Some(_) => {
+                    return Err(HostError::Downgrade {
+                        id: release.id.clone(),
+                        installed,
+                        requested: release.version.clone(),
+                    })
+                }
+                None => {
+                    return Err(HostError::Registry(format!(
+                        "cannot compare installed version {installed} to {} for `{}`; refusing to overwrite",
+                        release.version, release.id
+                    )))
+                }
+            }
+        }
+
         let staging = self.create_staging_dir(&release.id)?;
         let cleanup_path = staging.clone();
         let install = (|| {
@@ -429,7 +467,7 @@ impl ExtensionRegistry {
                     version: release.version.clone(),
                 });
             }
-            let installed = self.activate_staged_install(manifest, staging)?;
+            let installed = self.activate_staged_install(manifest, staging, true)?;
             self.state.provenance.insert(
                 release.id.clone(),
                 RegistryProvenance {
@@ -446,6 +484,18 @@ impl ExtensionRegistry {
         install
     }
 
+    /// The version currently installed under `id`, or `None` if it isn't
+    /// installed at all. Reads the on-disk manifest directly rather than the
+    /// last `discover()` pass, since an update decision must never be made
+    /// against a stale snapshot.
+    fn installed_version(&self, id: &str) -> Result<Option<String>> {
+        let destination = self.root.join(id);
+        if !destination.exists() {
+            return Ok(None);
+        }
+        Ok(Some(read_manifest(&destination)?.version))
+    }
+
     /// Return the verified registry origin recorded for an installed extension.
     pub fn provenance(&self, extension_id: &str) -> Option<&RegistryProvenance> {
         self.state.provenance.get(extension_id)
@@ -458,6 +508,38 @@ impl ExtensionRegistry {
         settings: ExtensionSettings,
     ) -> Result<()> {
         self.state.extensions.insert(extension_id, settings);
+        self.save()
+    }
+
+    /// Remove an installed extension and its persisted settings.
+    ///
+    /// The extension ID is also the direct child directory name under the
+    /// registry root. It is validated before constructing that path so a UI
+    /// action can never turn this into an arbitrary filesystem removal.
+    pub fn delete_extension(&mut self, extension_id: &str) -> Result<()> {
+        if extension_id.is_empty()
+            || !extension_id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+            })
+        {
+            return Err(HostError::Manifest(ManifestError::InvalidId {
+                id: extension_id.to_owned(),
+            }));
+        }
+
+        let destination = self.root.join(extension_id);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(HostError::SymbolicLink(destination));
+            }
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&destination)?,
+            Ok(_) => fs::remove_file(&destination)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        self.state.extensions.remove(extension_id);
+        self.state.provenance.remove(extension_id);
         self.save()
     }
 
@@ -534,14 +616,26 @@ impl ExtensionRegistry {
         self.root.join(".staging")
     }
 
+    /// Rename a staged extension into place. When `replace` is `false` (a
+    /// local `install_from_dir`), an existing directory is left untouched and
+    /// reported as [`HostError::AlreadyInstalled`]. When `true` (a registry
+    /// update, already version-checked by the caller), the previous files are
+    /// removed first so the rename lands cleanly — settings survive because
+    /// they live in `self.state`, keyed by ID, never inside the extension's
+    /// own directory.
     fn activate_staged_install(
         &mut self,
         manifest: Manifest,
         staging: PathBuf,
+        replace: bool,
     ) -> Result<InstalledExtension> {
         let destination = self.root.join(&manifest.id);
         if destination.exists() {
-            return Err(HostError::AlreadyInstalled(manifest.id));
+            if replace {
+                fs::remove_dir_all(&destination)?;
+            } else {
+                return Err(HostError::AlreadyInstalled(manifest.id));
+            }
         }
         fs::rename(staging, &destination)?;
         let settings = self
@@ -1104,8 +1198,9 @@ mod tests {
             version: "0.1.0".into(),
             tier: Tier::Script,
             capabilities: caps,
-            entry: "main.rhai".into(),
+            entry: Some("main.rhai".into()),
             schedule_seconds: None,
+            theme_variants: Vec::new(),
         }
     }
 
@@ -1333,6 +1428,55 @@ mod tests {
     }
 
     #[test]
+    fn delete_extension_removes_files_and_persisted_state() {
+        let source = tempdir().expect("source directory is created");
+        let install = tempdir().expect("installation directory is created");
+        fs::write(
+            source.path().join("extension.toml"),
+            r#"
+                id = "example.extension"
+                name = "Example"
+                version = "0.1.0"
+                tier = "theme"
+
+                [[theme_variants]]
+                id = "dark"
+                name = "Dark"
+                file = "dark.toml"
+            "#,
+        )
+        .expect("manifest is written");
+        fs::write(source.path().join("dark.toml"), "{}").expect("theme is written");
+
+        let root = install.path().join("extensions");
+        let mut registry = ExtensionRegistry::load(root.clone()).expect("registry loads");
+        registry
+            .install_from_dir(source.path())
+            .expect("extension installs");
+        registry
+            .set_settings(
+                "example.extension".into(),
+                ExtensionSettings {
+                    enabled: true,
+                    ..ExtensionSettings::default()
+                },
+            )
+            .expect("settings save");
+
+        registry
+            .delete_extension("example.extension")
+            .expect("extension deletes");
+
+        assert!(!root.join("example.extension").exists());
+        let reloaded = ExtensionRegistry::load(root).expect("registry reloads");
+        assert!(reloaded
+            .discover()
+            .expect("discovery succeeds")
+            .extensions
+            .is_empty());
+    }
+
+    #[test]
     fn protocol_messages_round_trip_as_json() {
         let request = HostRequest::Event {
             event: "health_status".into(),
@@ -1365,8 +1509,9 @@ mod tests {
         for extension in ["container-notifier", "container-summary"] {
             let directory = root.join(extension);
             let manifest = read_manifest(&directory).expect("reference manifest is valid");
-            let source = fs::read_to_string(directory.join(&manifest.entry))
-                .expect("reference script is readable");
+            let entry = manifest.entry.as_deref().expect("script tier has an entry");
+            let source =
+                fs::read_to_string(directory.join(entry)).expect("reference script is readable");
             ScriptRuntime::compile(
                 &manifest,
                 &source,
@@ -1376,6 +1521,21 @@ mod tests {
             )
             .expect("reference script compiles");
         }
+    }
+
+    /// The reference theme extension has nothing to compile (it's pure data),
+    /// but its manifest must still discover and validate as a well-formed
+    /// `Tier::Theme` extension. The theme TOML itself is parsed against
+    /// `rocker_theme::Theme` by `rocker-ui`, which owns that schema.
+    #[test]
+    fn reference_theme_extension_manifest_is_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/examples");
+        let manifest = read_manifest(&root.join("catppuccin")).expect("theme manifest is valid");
+
+        assert_eq!(manifest.tier, Tier::Theme);
+        assert!(manifest.entry.is_none());
+        assert!(manifest.capabilities.is_empty());
+        assert!(!manifest.theme_variants.is_empty());
     }
 
     // The isolated process's query/answer exchange (`drive_request` on the

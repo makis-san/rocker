@@ -65,8 +65,17 @@ impl ExtensionRegistrySource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Theme id: a built-in (`light` / `dark` / `system`) or a file stem.
+    /// Theme id: a built-in (`light` / `dark` / `system`), or `custom` to use
+    /// a variant of an installed `Tier::Theme` extension named by
+    /// `theme_extension` / `theme_variant`.
     pub theme: String,
+    /// The installed theme extension id to use when `theme == "custom"`.
+    #[serde(default)]
+    pub theme_extension: Option<String>,
+    /// The variant id (within `theme_extension`) to use when
+    /// `theme == "custom"`.
+    #[serde(default)]
+    pub theme_variant: Option<String>,
     /// Hours of usage history to retain (PLAN §5.3).
     pub stats_retention_hours: u32,
     /// Max concurrent stats streams before LRU eviction (PLAN §5.3).
@@ -86,6 +95,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "system".to_string(),
+            theme_extension: None,
+            theme_variant: None,
             stats_retention_hours: 24,
             max_stats_streams: 12,
             minimize_to_tray: true,

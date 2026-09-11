@@ -1,0 +1,44 @@
+# Catppuccin Frappé — https://catppuccin.com/palette/
+#
+# Colors are the official, published Frappé hex values, used as-is. `accent`
+# is mauve, the palette's own signature color. The terminal ramp is
+# Catppuccin's own published ANSI mapping, so a shell run inside Rocker
+# matches the same terminal every other Catppuccin port draws.
+schema_version = 1
+id = "catppuccin-frappe"
+name = "Catppuccin Frappé"
+author = "Catppuccin"
+mode = "dark"
+
+[tokens]
+surface = "#303446"         # base
+surface_raised = "#414559"  # surface0
+text = "#c6d0f5"            # text
+text_muted = "#a5adce"      # subtext0
+border = "#51576d"          # surface1
+accent = "#ca9ee6"          # mauve
+terminal_palette = [
+  "#51576d", # black   (surface1)
+  "#e78284", # red
+  "#a6d189", # green
+  "#e5c890", # yellow
+  "#8caaee", # blue
+  "#f4b8e4", # magenta (pink)
+  "#81c8be", # cyan    (teal)
+  "#b5bfe2", # white   (subtext1)
+  "#626880", # bright black   (surface2)
+  "#e78284", # bright red
+  "#a6d189", # bright green
+  "#e5c890", # bright yellow
+  "#8caaee", # bright blue
+  "#f4b8e4", # bright magenta
+  "#81c8be", # bright cyan
+  "#a5adce", # bright white   (subtext0)
+]
+radius = 8.0
+
+[tokens.status]
+running = "#a6d189"   # green
+paused = "#e5c890"    # yellow
+exited = "#737994"    # overlay0
+unhealthy = "#e78284" # red

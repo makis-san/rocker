@@ -1,11 +1,9 @@
 //! The Extensions view (PLAN §5.5: two tiers, both Rust-native).
 //!
-//! One centered column, same shape as [`crate::groups`]: a list of installed
-//! extensions, each an always-editable card — enabled / dev-mode toggles and a
-//! checklist of exactly the capabilities its manifest requests, nothing more.
-//! Grants are persisted straight through `ExtensionRegistry::set_settings` as
-//! they're edited (unlike Groups/Settings, which hand an edit back for the
-//! caller to save — there is no separate app-level config these belong in).
+//! One centered column, same shape as [`crate::groups`]: a compact list of
+//! installed extensions with identity, source, and the few actions needed to
+//! manage them. Enablement is persisted straight through
+//! `ExtensionRegistry::set_settings` as it is edited.
 //! Broken extension folders are listed, not hidden, so a bad install stays
 //! visible instead of silently vanishing from the list.
 //!
@@ -18,17 +16,23 @@
 //! still being extended (PLAN §10, Phase 5) — so it's exercised here by tests
 //! against hand-built trees rather than a live panel on screen.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use egui::{vec2, Align, Layout, RichText, Sense, Stroke};
 
-use rocker_ext_api::{Capability, Tier, UiEvent, UiNode};
+use rocker_ext_api::{Tier, UiEvent, UiNode};
 use rocker_ext_host::{
-    Discovery, ExtensionRegistry, HostError, InstalledExtension, TrustedRegistry,
+    compare_versions, Discovery, ExtensionRegistry, HostError, HttpTransport, InstalledExtension,
+    RegistryClient, RegistryIndex, RegistryRelease, TrustedRegistry,
 };
 use rocker_store::{AppPaths, ExtensionRegistrySource};
+use rocker_theme::Theme;
 
 use crate::icons::{self, Icon};
 use crate::style::{self, Palette};
-use crate::widgets::segmented;
+use crate::widgets::confirm_dialog;
 
 const COLUMN_W: f32 = 560.0;
 
@@ -46,6 +50,45 @@ pub struct ExtensionsScreen {
     discovery: Discovery,
     registry_draft: RegistryDraft,
     tab: ExtensionsTab,
+    /// An installed extension waiting for confirmation before removal.
+    pending_delete: Option<String>,
+    /// One catalog fetch per trusted registry, keyed by the registry's own
+    /// id. A background thread owns the `Arc<Mutex<_>>` while it fetches;
+    /// the UI thread only ever holds the lock briefly to read or replace it.
+    catalogs: HashMap<String, Arc<Mutex<CatalogState>>>,
+    /// One install in flight (or finished) per `registry-id::release-id@version`.
+    installs: HashMap<String, Arc<Mutex<InstallState>>>,
+}
+
+/// Where one registry's catalog fetch currently stands.
+enum CatalogState {
+    Idle,
+    Fetching,
+    Loaded(RegistryIndex),
+    Failed(String),
+}
+
+/// Where one release's install currently stands. A background thread only
+/// ever downloads and verifies the package (network + crypto, both safe off
+/// the UI thread); the final `Downloaded -> Installed` step runs on the UI
+/// thread each frame in [`finish_pending_installs`], since that's the one
+/// place holding the on-disk `ExtensionRegistry`.
+enum InstallState {
+    Idle,
+    Installing,
+    Downloaded(Box<DownloadedRelease>),
+    Installed,
+    Failed(String),
+}
+
+/// The verified bytes of one release, waiting for
+/// [`ExtensionsScreen::finish_pending_installs`] to write them to disk.
+/// Boxed inside [`InstallState::Downloaded`] so the common, tiny variants
+/// (`Idle`, `Installing`) don't all pay for this one's size.
+struct DownloadedRelease {
+    source: ExtensionRegistrySource,
+    release: RegistryRelease,
+    package: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -91,6 +134,9 @@ impl ExtensionsScreen {
                     discovery,
                     registry_draft: RegistryDraft::default(),
                     tab: ExtensionsTab::Installed,
+                    pending_delete: None,
+                    catalogs: HashMap::new(),
+                    installs: HashMap::new(),
                 }
             }
             Err(err) => {
@@ -100,6 +146,9 @@ impl ExtensionsScreen {
                     discovery: Discovery::default(),
                     registry_draft: RegistryDraft::default(),
                     tab: ExtensionsTab::Installed,
+                    pending_delete: None,
+                    catalogs: HashMap::new(),
+                    installs: HashMap::new(),
                 }
             }
         }
@@ -117,6 +166,209 @@ impl ExtensionsScreen {
             Discovery::default()
         });
     }
+
+    /// The last discovery pass, for callers (the Settings screen's theme
+    /// picker) that only need to read installed extensions rather than draw
+    /// this whole screen.
+    pub fn discovery(&self) -> &Discovery {
+        &self.discovery
+    }
+
+    /// Finish any install whose background download completed since the last
+    /// frame: verify-and-extract onto disk through the real `ExtensionRegistry`
+    /// (the one part of an install that isn't safe to background, since it's
+    /// the only place holding that on-disk state), then re-discover so a
+    /// freshly installed extension appears in the Installed tab immediately.
+    /// Cheap to call every frame — it's a no-op unless a download just landed.
+    fn finish_pending_installs(&mut self) {
+        let pending: Vec<(String, ExtensionRegistrySource, RegistryRelease, Vec<u8>)> = self
+            .installs
+            .iter()
+            .filter_map(|(key, state)| {
+                let mut guard = state.lock().unwrap();
+                if !matches!(&*guard, InstallState::Downloaded { .. }) {
+                    return None;
+                }
+                match std::mem::replace(&mut *guard, InstallState::Installing) {
+                    InstallState::Downloaded(downloaded) => {
+                        let DownloadedRelease {
+                            source,
+                            release,
+                            package,
+                        } = *downloaded;
+                        Some((key.clone(), source, release, package))
+                    }
+                    _ => unreachable!("just matched Downloaded above"),
+                }
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut results = Vec::with_capacity(pending.len());
+        let mut any_installed = false;
+        match &mut self.registry {
+            Ok(registry) => {
+                for (key, source, release, package) in &pending {
+                    let outcome = trusted_registry(source).and_then(|trusted| {
+                        registry.install_registry_package(&trusted, release, package)
+                    });
+                    any_installed |= outcome.is_ok();
+                    results.push((key.clone(), outcome.map(|_| ()).map_err(|e| e.to_string())));
+                }
+                if any_installed {
+                    self.discovery = registry.discover().unwrap_or_else(|err| {
+                        tracing::warn!(%err, "extension discovery failed");
+                        Discovery::default()
+                    });
+                }
+            }
+            Err(message) => {
+                for (key, ..) in &pending {
+                    results.push((key.clone(), Err(message.clone())));
+                }
+            }
+        }
+
+        for (key, result) in results {
+            if let Some(state) = self.installs.get(&key) {
+                *state.lock().unwrap() = match result {
+                    Ok(()) => InstallState::Installed,
+                    Err(err) => InstallState::Failed(err),
+                };
+            }
+        }
+    }
+}
+
+/// Build the pinned trust root for one configured registry source, the same
+/// way the "Add registry" form validates a draft before saving it.
+fn trusted_registry(source: &ExtensionRegistrySource) -> Result<TrustedRegistry, HostError> {
+    let key = decode_public_key(&source.public_key).map_err(HostError::Registry)?;
+    TrustedRegistry::new(&source.id, &source.index_url, &source.signature_url, key)
+}
+
+/// Kick off a background fetch of one registry's signed catalog. The thread
+/// only ever writes into `state` and wakes the UI to re-check it — no
+/// `egui::Ui` access off the UI thread, mirroring the tray heartbeat thread
+/// in `app.rs`.
+fn spawn_catalog_fetch(
+    ctx: &egui::Context,
+    source: ExtensionRegistrySource,
+    state: Arc<Mutex<CatalogState>>,
+) {
+    *state.lock().unwrap() = CatalogState::Fetching;
+    let ctx = ctx.clone();
+    let worker_state = state.clone();
+    let spawned = std::thread::Builder::new()
+        .name("rocker-registry-fetch".into())
+        .spawn(move || {
+            let outcome = trusted_registry(&source)
+                .and_then(|trusted| RegistryClient::new(trusted, HttpTransport).fetch_index());
+            *worker_state.lock().unwrap() = match outcome {
+                Ok(index) => CatalogState::Loaded(index),
+                Err(err) => CatalogState::Failed(err.to_string()),
+            };
+            ctx.request_repaint();
+        });
+    if spawned.is_err() {
+        // Could not even start the thread (exhausted OS resources) — leave a
+        // clear failure rather than a "Fetching…" label that never resolves.
+        *state.lock().unwrap() =
+            CatalogState::Failed("couldn't start a background fetch".to_string());
+    }
+}
+
+/// Kick off a background download-and-verify of one release. Only the
+/// network fetch and cryptographic verification happen here; the actual
+/// install onto disk happens on the UI thread in
+/// [`ExtensionsScreen::finish_pending_installs`].
+fn spawn_install(
+    ctx: &egui::Context,
+    source: ExtensionRegistrySource,
+    release: RegistryRelease,
+    state: Arc<Mutex<InstallState>>,
+) {
+    *state.lock().unwrap() = InstallState::Installing;
+    let ctx = ctx.clone();
+    let worker_state = state.clone();
+    let spawned = std::thread::Builder::new()
+        .name("rocker-registry-install".into())
+        .spawn(move || {
+            let outcome = trusted_registry(&source).and_then(|trusted| {
+                RegistryClient::new(trusted, HttpTransport).download_package(&release)
+            });
+            *worker_state.lock().unwrap() = match outcome {
+                Ok(package) => InstallState::Downloaded(Box::new(DownloadedRelease {
+                    source,
+                    release,
+                    package,
+                })),
+                Err(err) => InstallState::Failed(err.to_string()),
+            };
+            ctx.request_repaint();
+        });
+    if spawned.is_err() {
+        *state.lock().unwrap() =
+            InstallState::Failed("couldn't start a background download".to_string());
+    }
+}
+
+/// One installed, enabled `Tier::Theme` extension, shaped for the Settings
+/// screen's theme picker — a name to show and the variants it ships, without
+/// pulling in the rest of [`InstalledExtension`]'s bookkeeping.
+pub struct ThemeExtensionOption {
+    pub id: String,
+    pub name: String,
+    /// `(variant id, variant name)`, in manifest order.
+    pub variants: Vec<(String, String)>,
+}
+
+/// Every installed, enabled theme extension, sorted by name — installed but
+/// disabled ones are left out, the same gate the Extensions screen uses for
+/// running an extension's code (PLAN §5.5), even though a theme has none.
+pub fn theme_extension_options(discovery: &Discovery) -> Vec<ThemeExtensionOption> {
+    let mut options: Vec<ThemeExtensionOption> = discovery
+        .extensions
+        .iter()
+        .filter(|ext| ext.manifest.tier == Tier::Theme && ext.settings.enabled)
+        .map(|ext| ThemeExtensionOption {
+            id: ext.manifest.id.clone(),
+            name: ext.manifest.name.clone(),
+            variants: ext
+                .manifest
+                .theme_variants
+                .iter()
+                .map(|v| (v.id.clone(), v.name.clone()))
+                .collect(),
+        })
+        .collect();
+    options.sort_by(|a, b| a.name.cmp(&b.name));
+    options
+}
+
+/// Resolve one variant of one installed theme extension into a concrete
+/// [`Theme`], or `None` if the extension was uninstalled, disabled, or the
+/// variant no longer exists — the caller falls back to a built-in theme
+/// rather than erroring, the same way [`ExtensionRegistry::discover`] reports
+/// a broken extension without taking down the rest of the app.
+pub fn resolve_custom_theme(
+    discovery: &Discovery,
+    extension_id: &str,
+    variant_id: &str,
+) -> Option<Theme> {
+    let ext = discovery.extensions.iter().find(|ext| {
+        ext.manifest.id == extension_id && ext.manifest.tier == Tier::Theme && ext.settings.enabled
+    })?;
+    let variant = ext
+        .manifest
+        .theme_variants
+        .iter()
+        .find(|v| v.id == variant_id)
+        .or_else(|| ext.manifest.theme_variants.first())?;
+    let text = std::fs::read_to_string(ext.directory.join(&variant.file)).ok()?;
+    Theme::from_toml(&text).ok()
 }
 
 /// What happened this frame. `None` from [`extensions_screen`] means nothing
@@ -139,6 +391,10 @@ pub fn extensions_screen(
     let mut changed = false;
     let mut registries_changed = false;
     let mut error = None;
+
+    // Independent of which tab is showing, so an install kicked off from
+    // Browse still lands even if the user has since switched to Installed.
+    screen.finish_pending_installs();
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -164,10 +420,17 @@ pub fn extensions_screen(
                     ui.add_space(16.0);
 
                     match screen.tab {
-                        ExtensionsTab::Installed => {
-                            installed_extensions_section(ui, pal, screen, &mut changed, &mut error)
+                        ExtensionsTab::Installed => installed_extensions_section(
+                            ui,
+                            pal,
+                            screen,
+                            registries,
+                            &mut changed,
+                            &mut error,
+                        ),
+                        ExtensionsTab::Browse => {
+                            browse_extensions_section(ui, pal, screen, registries)
                         }
-                        ExtensionsTab::Browse => browse_extensions_section(ui, pal, registries),
                         ExtensionsTab::Registries => {
                             if registry_sources_section(
                                 ui,
@@ -185,6 +448,45 @@ pub fn extensions_screen(
                 });
             });
         });
+
+    if let Some(extension_id) = screen.pending_delete.clone() {
+        let name = screen
+            .discovery
+            .extensions
+            .iter()
+            .find(|ext| ext.manifest.id == extension_id)
+            .map(|ext| ext.manifest.name.as_str())
+            .unwrap_or(extension_id.as_str());
+        let title = format!("Delete {name}?");
+        match confirm_dialog(
+            ui.ctx(),
+            pal,
+            &title,
+            "This removes the installed extension and its saved settings.",
+            "Delete",
+        ) {
+            Some(true) => {
+                let result = match &mut screen.registry {
+                    Ok(registry) => registry.delete_extension(&extension_id),
+                    Err(message) => Err(HostError::Runtime(message.clone())),
+                };
+                screen.pending_delete = None;
+                match result {
+                    Ok(()) => {
+                        let key_fragment = format!("::{extension_id}@");
+                        screen
+                            .installs
+                            .retain(|key, _| !key.contains(&key_fragment));
+                        screen.refresh();
+                        changed = true;
+                    }
+                    Err(err) => error = Some(err.to_string()),
+                }
+            }
+            Some(false) => screen.pending_delete = None,
+            None => {}
+        }
+    }
 
     (changed || registries_changed || error.is_some()).then_some(Edit {
         error,
@@ -208,9 +510,11 @@ fn installed_extensions_section(
     ui: &mut egui::Ui,
     pal: &Palette,
     screen: &mut ExtensionsScreen,
+    registries: &[ExtensionRegistrySource],
     changed: &mut bool,
     error: &mut Option<String>,
 ) {
+    let mut delete_requested = None;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
@@ -220,7 +524,7 @@ fn installed_extensions_section(
                     .color(pal.text),
             );
             ui.label(
-                RichText::new("Installed on this computer. Permissions reflect each manifest.")
+                RichText::new("Installed on this computer.")
                     .small()
                     .color(pal.text_muted),
             );
@@ -248,18 +552,33 @@ fn installed_extensions_section(
             } else {
                 for ext in &mut screen.discovery.extensions {
                     ui.add_space(10.0);
-                    if extension_card(ui, pal, registry, ext, error) {
-                        *changed = true;
+                    let origin = extension_origin(registry, &ext.manifest.id, registries);
+                    match extension_card(
+                        ui,
+                        pal,
+                        registry,
+                        ext,
+                        origin.0.as_str(),
+                        origin.1.as_deref(),
+                        &mut delete_requested,
+                    ) {
+                        Ok(dirty) => *changed |= dirty,
+                        Err(message) => *error = Some(message),
                     }
                 }
             }
         }
+    }
+
+    if delete_requested.is_some() {
+        screen.pending_delete = delete_requested;
     }
 }
 
 fn browse_extensions_section(
     ui: &mut egui::Ui,
     pal: &Palette,
+    screen: &mut ExtensionsScreen,
     registries: &[ExtensionRegistrySource],
 ) {
     ui.label(RichText::new("Browse extensions").strong().color(pal.text));
@@ -271,7 +590,255 @@ fn browse_extensions_section(
     for source in registries {
         registry_catalog_card(ui, pal, source, false);
         ui.add_space(6.0);
+        catalog_section(ui, pal, screen, source);
+        ui.add_space(14.0);
     }
+}
+
+/// One trusted registry's fetched catalog: a fetch/refresh control and
+/// status line, then every release it advertises with an Install button.
+/// Nothing is fetched until the user asks — a signed catalog still means a
+/// network call, and this app doesn't make one without the user's say-so.
+fn catalog_section(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    screen: &mut ExtensionsScreen,
+    source: &ExtensionRegistrySource,
+) {
+    let cat_state = screen
+        .catalogs
+        .entry(source.id.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(CatalogState::Idle)))
+        .clone();
+
+    let (status_text, fetching, failure, releases): (
+        String,
+        bool,
+        Option<String>,
+        Vec<RegistryRelease>,
+    ) = {
+        let guard = cat_state.lock().unwrap();
+        match &*guard {
+            CatalogState::Idle => ("Not fetched yet.".to_string(), false, None, Vec::new()),
+            CatalogState::Fetching => ("Fetching…".to_string(), true, None, Vec::new()),
+            CatalogState::Loaded(index) if index.releases.is_empty() => (
+                "No extensions published yet.".to_string(),
+                false,
+                None,
+                Vec::new(),
+            ),
+            CatalogState::Loaded(index) => (
+                String::new(),
+                false,
+                None,
+                // One card per extension ID — its newest available version —
+                // rather than one per release, so a catalog with a long
+                // version history doesn't repeat the same extension.
+                index
+                    .latest_releases()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            CatalogState::Failed(message) => {
+                (String::new(), false, Some(message.clone()), Vec::new())
+            }
+        }
+    };
+
+    ui.horizontal(|ui| {
+        if !status_text.is_empty() {
+            ui.label(RichText::new(status_text).small().color(pal.text_faint));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let label = if fetching {
+                "Fetching…"
+            } else {
+                "Fetch catalog"
+            };
+            if icons::icon_button_enabled(ui, pal, Icon::Refresh, None, label, !fetching).clicked()
+            {
+                spawn_catalog_fetch(ui.ctx(), source.clone(), cat_state.clone());
+            }
+        });
+    });
+
+    if let Some(message) = failure {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("Couldn't fetch this catalog: {message}"))
+                .small()
+                .color(pal.unhealthy),
+        );
+    }
+
+    for release in &releases {
+        ui.add_space(8.0);
+        release_card(ui, pal, screen, source, release);
+    }
+}
+
+/// What a release card offers, relative to the version already on disk (if
+/// any). Never a downgrade: an installed extension only ever moves forward.
+enum ReleaseAction {
+    /// Not installed at all yet.
+    Install,
+    /// Installed, and this catalog version is strictly newer.
+    Update,
+    /// Installed, and this is the version on disk.
+    UpToDate,
+    /// Installed with a version newer than the catalog's (a local/dev
+    /// override), or a version that can't be compared as semver — either way,
+    /// nothing here is offered to overwrite it.
+    Newer,
+}
+
+fn release_action(installed_version: Option<&str>, release_version: &str) -> ReleaseAction {
+    match installed_version {
+        None => ReleaseAction::Install,
+        Some(installed) => match compare_versions(release_version, installed) {
+            Some(Ordering::Greater) => ReleaseAction::Update,
+            Some(Ordering::Equal) => ReleaseAction::UpToDate,
+            Some(Ordering::Less) | None => ReleaseAction::Newer,
+        },
+    }
+}
+
+/// One release from a fetched catalog: its id, version, and either an
+/// Install/Update button, an in-progress/finished status, or an inline
+/// install error — never a button that looks live but can't respond
+/// (anti-slop: dead controls). The catalog only ever hands this the newest
+/// release per extension ID (see [`RegistryIndex::latest_releases`]), so this
+/// card's only job is comparing that one version against what's installed.
+fn release_card(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    screen: &mut ExtensionsScreen,
+    source: &ExtensionRegistrySource,
+    release: &RegistryRelease,
+) {
+    let installed_version = screen
+        .discovery
+        .extensions
+        .iter()
+        .find(|ext| ext.manifest.id == release.id)
+        .map(|ext| ext.manifest.version.clone());
+    let action = release_action(installed_version.as_deref(), &release.version);
+    let key = format!("{}::{}@{}", source.id, release.id, release.version);
+    let state = screen
+        .installs
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(InstallState::Idle)))
+        .clone();
+
+    let (status, failure): (Option<&'static str>, Option<String>) = {
+        let guard = state.lock().unwrap();
+        match &*guard {
+            InstallState::Idle => (None, None),
+            InstallState::Installing | InstallState::Downloaded { .. } => {
+                let verb = if matches!(action, ReleaseAction::Update) {
+                    "Updating…"
+                } else {
+                    "Installing…"
+                };
+                (Some(verb), None)
+            }
+            InstallState::Installed => (Some("Installed"), None),
+            InstallState::Failed(message) => (None, Some(message.clone())),
+        }
+    };
+
+    egui::Frame::new()
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.0_f32, pal.border))
+        .corner_radius(style::radius(pal.corner))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&release.id).strong().color(pal.text));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("v{}", release.version))
+                                .small()
+                                .color(pal.text_faint),
+                        );
+                    });
+                    if let Some(installed) = &installed_version {
+                        if matches!(action, ReleaseAction::Update | ReleaseAction::Newer) {
+                            ui.label(
+                                RichText::new(format!("Installed: v{installed}"))
+                                    .small()
+                                    .color(pal.text_muted),
+                            );
+                        }
+                    }
+                    if let Some(min) = &release.min_rocker_version {
+                        ui.label(
+                            RichText::new(format!("Requires Rocker {min}+"))
+                                .small()
+                                .color(pal.text_muted),
+                        );
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(label) = status {
+                        ui.label(RichText::new(label).small().color(pal.text_faint));
+                    } else {
+                        match action {
+                            ReleaseAction::UpToDate => {
+                                ui.label(RichText::new("Installed").small().color(pal.text_faint));
+                            }
+                            ReleaseAction::Newer => {
+                                ui.label(
+                                    RichText::new("Installed (newer)")
+                                        .small()
+                                        .color(pal.text_faint),
+                                );
+                            }
+                            ReleaseAction::Install => {
+                                if icons::text_button(ui, pal, "Install").clicked() {
+                                    spawn_install(
+                                        ui.ctx(),
+                                        source.clone(),
+                                        release.clone(),
+                                        state.clone(),
+                                    );
+                                }
+                            }
+                            ReleaseAction::Update => {
+                                if icons::text_button(ui, pal, "Update").clicked() {
+                                    spawn_install(
+                                        ui.ctx(),
+                                        source.clone(),
+                                        release.clone(),
+                                        state.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+            if matches!(action, ReleaseAction::Install | ReleaseAction::Update) {
+                if let Some(message) = &failure {
+                    ui.add_space(4.0);
+                    let verb = if matches!(action, ReleaseAction::Update) {
+                        "Update"
+                    } else {
+                        "Install"
+                    };
+                    ui.label(
+                        RichText::new(format!("{verb} failed: {message}"))
+                            .small()
+                            .color(pal.unhealthy),
+                    );
+                }
+            }
+        });
 }
 
 /// Render and edit the trusted catalog list. A registry can be removed even
@@ -379,7 +946,7 @@ fn registry_catalog_card(
     let mut remove = false;
     egui::Frame::new()
         .fill(pal.surface)
-        .stroke(Stroke::new(1.0, pal.border))
+        .stroke(Stroke::new(1.0_f32, pal.border))
         .corner_radius(style::radius(pal.corner))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
@@ -536,19 +1103,36 @@ fn failures_section(
     }
 }
 
-/// One installed extension's editable card: identity + enabled toggle up
-/// top, a dev-mode toggle, then a checklist of exactly the capabilities its
-/// manifest requests. Every edit is persisted immediately through
-/// `ExtensionRegistry::set_settings`; a save failure is written into `error`
-/// rather than returned, mirroring how `Discovery::failures` is surfaced
-/// rather than silently dropped. Returns `true` if any setting changed.
+/// Return the compact source details shown on an installed extension card.
+/// Local installs have no registry provenance, while registry installs can
+/// link back to the configured GitHub repository when the source is GitHub.
+fn extension_origin(
+    registry: &ExtensionRegistry,
+    extension_id: &str,
+    registries: &[ExtensionRegistrySource],
+) -> (String, Option<String>) {
+    let Some(provenance) = registry.provenance(extension_id) else {
+        return ("Local".to_owned(), None);
+    };
+    let github_url = registries
+        .iter()
+        .find(|source| source.id == provenance.registry_id)
+        .and_then(|source| github_repository(&source.index_url).map(|(_, url)| url));
+    (provenance.registry_id.clone(), github_url)
+}
+
+/// One compact installed-extension card. Enablement is persisted immediately
+/// through `ExtensionRegistry::set_settings`; deletion is handed to the
+/// screen's confirmation flow. Returns whether the setting changed.
 fn extension_card(
     ui: &mut egui::Ui,
     pal: &Palette,
     registry: &mut ExtensionRegistry,
     ext: &mut InstalledExtension,
-    error: &mut Option<String>,
-) -> bool {
+    registry_label: &str,
+    github_url: Option<&str>,
+    delete_requested: &mut Option<String>,
+) -> Result<bool, String> {
     let mut dirty = false;
 
     egui::Frame::new()
@@ -571,212 +1155,67 @@ fn extension_card(
                                 .color(pal.text_faint),
                         );
                     });
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(
-                            RichText::new(&ext.manifest.id)
-                                .small()
-                                .monospace()
-                                .color(pal.text_muted),
-                        );
-                        ui.label(
-                            RichText::new(tier_label(ext.manifest.tier))
-                                .small()
-                                .color(pal.text_faint),
-                        );
-                    });
                 });
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let salt = format!("ext-{}-enabled", ext.manifest.id);
-                    if let Some(next) = toggle(ui, pal, &salt, ext.settings.enabled) {
-                        ext.settings.enabled = next;
+                    let action = if ext.settings.enabled {
+                        "Disable"
+                    } else {
+                        "Enable"
+                    };
+                    if icons::toggle_text_button(ui, pal, action, ext.settings.enabled, action)
+                        .clicked()
+                    {
+                        ext.settings.enabled = !ext.settings.enabled;
                         dirty = true;
                     }
                     ui.add_space(4.0);
-                    if icons::icon_button(ui, pal, Icon::Folder, None, "Open extension folder")
-                        .clicked()
+                    if icons::icon_button(ui, pal, Icon::Trash, None, "Delete extension").clicked()
                     {
-                        open_in_file_manager(&ext.directory);
+                        *delete_requested = Some(ext.manifest.id.clone());
                     }
                 });
             });
 
-            if ext.manifest.tier == Tier::Component {
-                ui.add_space(4.0);
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 ui.label(
-                    RichText::new(
-                        "Component runtime isn't wired into the supervisor yet — this \
-                         extension won't launch until it is.",
-                    )
-                    .small()
-                    .color(pal.text_faint),
-                );
-            }
-
-            ui.add_space(8.0);
-            let dev_salt = format!("ext-{}-dev", ext.manifest.id);
-            if let Some(next) =
-                labeled_toggle(ui, pal, "Dev mode", &dev_salt, ext.settings.dev_mode)
-            {
-                ext.settings.dev_mode = next;
-                dirty = true;
-            }
-
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new("Capabilities")
-                    .small()
-                    .strong()
-                    .color(pal.text_muted),
-            );
-            ui.add_space(4.0);
-            if ext.manifest.capabilities.is_empty() {
-                ui.label(
-                    RichText::new("This extension requests no capabilities.")
+                    RichText::new(format!("Type · {}", tier_label(ext.manifest.tier)))
                         .small()
-                        .color(pal.text_faint),
+                        .color(pal.text_muted),
                 );
-            } else {
-                for cap in ext.manifest.capabilities.clone() {
-                    let granted = ext.settings.granted_capabilities.contains(&cap);
-                    if let Some(next) =
-                        check(ui, pal, &ext.manifest.id, capability_label(cap), granted)
-                    {
-                        if next {
-                            if !granted {
-                                ext.settings.granted_capabilities.push(cap);
-                            }
-                        } else {
-                            ext.settings.granted_capabilities.retain(|c| *c != cap);
-                        }
-                        dirty = true;
-                    }
+                ui.label(
+                    RichText::new(format!("Registry · {registry_label}"))
+                        .small()
+                        .color(pal.text_muted),
+                );
+                if let Some(url) = github_url {
+                    let display = url.strip_prefix("https://").unwrap_or(url);
+                    ui.hyperlink_to(
+                        RichText::new(format!("GitHub · {display}"))
+                            .small()
+                            .color(pal.accent),
+                        url,
+                    );
                 }
-            }
+            });
         });
 
     if dirty {
         if let Err(err) = registry.set_settings(ext.manifest.id.clone(), ext.settings.clone()) {
-            *error = Some(err.to_string());
+            return Err(err.to_string());
         }
     }
-    dirty
-}
-
-/// Ask the OS to open `path` in its file manager. Best-effort: a folder that
-/// won't open is a minor inconvenience, not something that should interrupt
-/// the rest of the screen, so a failure is only logged.
-fn open_in_file_manager(path: &std::path::Path) {
-    let result = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(path).spawn()
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg(path).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(path).spawn()
-    };
-    if let Err(err) = result {
-        tracing::warn!(%err, path = %path.display(), "failed to open extension folder");
-    }
+    Ok(dirty)
 }
 
 fn tier_label(tier: Tier) -> &'static str {
     match tier {
         Tier::Script => "script",
         Tier::Component => "component",
+        Tier::Theme => "theme",
     }
-}
-
-/// A short, human description of what granting `cap` actually lets an
-/// extension do — shown beside its checkbox instead of the bare enum name.
-fn capability_label(cap: Capability) -> &'static str {
-    match cap {
-        Capability::ContainersRead => "Read containers",
-        Capability::ContainersLifecycle => "Start, stop, and restart containers",
-        Capability::ContainersExec => "Run commands inside containers",
-        Capability::LogsRead => "Read container logs",
-        Capability::StatsRead => "Read resource stats",
-        Capability::ImagesRead => "Read images",
-        Capability::RegistriesRead => "Read registries",
-        Capability::Network => "Make network requests",
-        Capability::Storage => "Store its own local data",
-        Capability::Notifications => "Show notifications",
-    }
-}
-
-/// An Off/On segmented control for a boolean row, salted per-card (mirrors
-/// `settings::toggle`). Returns the new value only when it actually flips.
-fn toggle(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, value: bool) -> Option<bool> {
-    segmented(ui, pal, id_salt, &["Off", "On"], value as usize).map(|i| i == 1)
-}
-
-/// A quiet muted label to the left of a right-aligned [`toggle`] — used for
-/// the card's "Dev mode" row, which (unlike "Enabled") has no trailing
-/// identity text to sit beside on the same line.
-fn labeled_toggle(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    label: &str,
-    id_salt: &str,
-    value: bool,
-) -> Option<bool> {
-    let mut next = None;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).small().color(pal.text_muted));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if let Some(v) = toggle(ui, pal, id_salt, value) {
-                next = Some(v);
-            }
-        });
-    });
-    next
-}
-
-/// A drawn checkbox row for one capability grant — same tonal language as
-/// `groups::check`, duplicated locally rather than shared because the two
-/// screens' rows differ (a container name there, a capability sentence
-/// here). `id_salt` scopes the persistent id to one extension's card, so two
-/// cards requesting the same capability never collide. Returns the new value
-/// only when it flips.
-fn check(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, label: &str, on: bool) -> Option<bool> {
-    let resp = ui
-        .horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let (b, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
-            let t = ui
-                .ctx()
-                .animate_bool(ui.make_persistent_id((id_salt, "chk", label)), on);
-            ui.painter().rect(
-                b.shrink(1.0),
-                style::radius((pal.corner - 3.0).max(1.0)),
-                pal.surface.lerp_to_gamma(pal.accent, 0.9 * t),
-                Stroke::new(1.0_f32, pal.border_strong.lerp_to_gamma(pal.accent, t)),
-                egui::StrokeKind::Inside,
-            );
-            if t > 0.0 {
-                let c = b.center();
-                ui.painter().add(egui::Shape::line(
-                    vec![
-                        egui::pos2(c.x - 3.0, c.y),
-                        egui::pos2(c.x - 0.8, c.y + 2.4),
-                        egui::pos2(c.x + 3.4, c.y - 2.8),
-                    ],
-                    Stroke::new(1.6_f32 * t, pal.on_accent),
-                ));
-            }
-            ui.label(RichText::new(label).color(pal.text));
-        })
-        .response;
-
-    let row = ui.interact(
-        resp.rect,
-        ui.make_persistent_id((id_salt, "chk-hit", label)),
-        Sense::click(),
-    );
-    if row.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    row.clicked().then_some(!on)
 }
 
 // ---- Declarative panel renderer ------------------------------------------
@@ -892,7 +1331,7 @@ fn render_table(ui: &mut egui::Ui, pal: &Palette, headers: &[String], rows: &[Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocker_ext_api::Manifest;
+    use rocker_ext_api::{Capability, Manifest};
     use rocker_ext_host::ExtensionSettings;
 
     fn manifest(id: &str, capabilities: Vec<Capability>) -> Manifest {
@@ -902,8 +1341,9 @@ mod tests {
             version: "0.1.0".into(),
             tier: Tier::Script,
             capabilities,
-            entry: "main.rhai".into(),
+            entry: Some("main.rhai".into()),
             schedule_seconds: None,
+            theme_variants: Vec::new(),
         }
     }
 
@@ -926,6 +1366,9 @@ mod tests {
             },
             registry_draft: RegistryDraft::default(),
             tab: ExtensionsTab::Installed,
+            pending_delete: None,
+            catalogs: HashMap::new(),
+            installs: HashMap::new(),
         }
     }
 
@@ -996,6 +1439,9 @@ mod tests {
             discovery: Discovery::default(),
             registry_draft: RegistryDraft::default(),
             tab: ExtensionsTab::Installed,
+            pending_delete: None,
+            catalogs: HashMap::new(),
+            installs: HashMap::new(),
         };
 
         for screen in [&mut empty, &mut broken] {
@@ -1015,22 +1461,182 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capability_label_covers_every_variant() {
-        for cap in [
-            Capability::ContainersRead,
-            Capability::ContainersLifecycle,
-            Capability::ContainersExec,
-            Capability::LogsRead,
-            Capability::StatsRead,
-            Capability::ImagesRead,
-            Capability::RegistriesRead,
-            Capability::Network,
-            Capability::Storage,
-            Capability::Notifications,
-        ] {
-            assert!(!capability_label(cap).is_empty());
+    fn release(id: &str, version: &str, min_rocker_version: Option<&str>) -> RegistryRelease {
+        RegistryRelease {
+            id: id.to_string(),
+            version: version.to_string(),
+            package_url: format!("https://example.com/{id}-{version}.rockerext"),
+            sha256: "0".repeat(64),
+            signature: "sig".into(),
+            min_rocker_version: min_rocker_version.map(str::to_string),
         }
+    }
+
+    /// The Browse tab, with one registry's catalog already fetched: a release
+    /// already installed locally, one that isn't yet, and one installed at
+    /// an older version with two releases in the catalog — the dedupe-to-
+    /// latest-version and Update-button code paths this exercises that the
+    /// other tests never touch. Lays out at a few widths with no pointer
+    /// input, the same no-panic convention as every other screen test here.
+    #[test]
+    fn browse_tab_with_a_loaded_catalog_lays_out_without_panic() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+
+        let mut screen = screen_with(
+            vec![
+                InstalledExtension {
+                    manifest: manifest("already.installed", vec![]),
+                    directory: std::path::PathBuf::from("/nonexistent/already.installed"),
+                    settings: ExtensionSettings::default(),
+                },
+                InstalledExtension {
+                    manifest: {
+                        let mut m = manifest("updatable.extension", vec![]);
+                        m.version = "1.0.0".into();
+                        m
+                    },
+                    directory: std::path::PathBuf::from("/nonexistent/updatable.extension"),
+                    settings: ExtensionSettings::default(),
+                },
+            ],
+            vec![],
+        );
+        screen.tab = ExtensionsTab::Browse;
+        let source = ExtensionRegistrySource::official();
+        screen.catalogs.insert(
+            source.id.clone(),
+            Arc::new(Mutex::new(CatalogState::Loaded(RegistryIndex {
+                format: 1,
+                releases: vec![
+                    release("already.installed", "1.0.0", None),
+                    release("not.installed", "2.0.0", Some("0.2.0")),
+                    release("updatable.extension", "1.0.0", None),
+                    release("updatable.extension", "2.0.0", None),
+                ],
+            }))),
+        );
+
+        for width in [420.0_f32, 700.0, 1200.0] {
+            let mut registries = vec![source.clone()];
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(width, 640.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    extensions_screen(ui, &pal, &mut screen, &mut registries);
+                });
+            });
+        }
+    }
+
+    /// The Browse tab before anything has been fetched, and after a fetch
+    /// failed — both must render their status text rather than an empty or
+    /// panicking screen.
+    #[test]
+    fn browse_tab_idle_and_failed_catalog_lay_out_without_panic() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let source = ExtensionRegistrySource::official();
+
+        for initial in [
+            None,
+            Some(CatalogState::Failed("network unreachable".into())),
+        ] {
+            let mut screen = screen_with(vec![], vec![]);
+            screen.tab = ExtensionsTab::Browse;
+            if let Some(state) = initial {
+                screen
+                    .catalogs
+                    .insert(source.id.clone(), Arc::new(Mutex::new(state)));
+            }
+            let mut registries = vec![source.clone()];
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(600.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    extensions_screen(ui, &pal, &mut screen, &mut registries);
+                });
+            });
+        }
+    }
+
+    /// A downloaded release that can't actually be trusted or installed
+    /// (garbage public key, garbage package bytes) must resolve to `Failed`
+    /// rather than crashing or staying stuck at "Installing…" forever —
+    /// exactly the fake-interactivity failure the anti-slop rules call out.
+    /// The real, successful `Downloaded -> Installed` path (real signature,
+    /// real package) is covered by `rocker-ext-host`'s own registry tests and
+    /// by `install_registry_package`, which this method calls unchanged.
+    #[test]
+    fn finish_pending_installs_resolves_a_bad_download_to_failed() {
+        let mut screen = screen_with(vec![], vec![]);
+        let source = ExtensionRegistrySource {
+            id: "test".into(),
+            index_url: "https://example.com/index-v1.json".into(),
+            signature_url: "https://example.com/index-v1.sig".into(),
+            public_key: "0".repeat(64),
+        };
+        let key = "test::example.bad@1.0.0".to_string();
+        let state = Arc::new(Mutex::new(InstallState::Downloaded(Box::new(
+            DownloadedRelease {
+                source,
+                release: release("example.bad", "1.0.0", None),
+                package: b"not a real zip".to_vec(),
+            },
+        ))));
+        screen.installs.insert(key, state.clone());
+
+        screen.finish_pending_installs();
+
+        let resolved = state.lock().unwrap();
+        assert!(
+            matches!(&*resolved, InstallState::Failed(_)),
+            "a bad download must resolve to Failed, not stay stuck as Installing"
+        );
+    }
+
+    /// With nothing pending, a call must be a cheap no-op rather than
+    /// touching the registry or discovery state.
+    #[test]
+    fn finish_pending_installs_is_a_noop_with_nothing_pending() {
+        let mut screen = screen_with(vec![], vec![]);
+        screen.finish_pending_installs();
+        assert!(screen.discovery.extensions.is_empty());
+    }
+
+    #[test]
+    fn release_action_never_offers_a_downgrade() {
+        assert!(matches!(
+            release_action(None, "1.0.0"),
+            ReleaseAction::Install
+        ));
+        assert!(matches!(
+            release_action(Some("1.0.0"), "2.0.0"),
+            ReleaseAction::Update
+        ));
+        assert!(matches!(
+            release_action(Some("1.0.0"), "1.0.0"),
+            ReleaseAction::UpToDate
+        ));
+        assert!(matches!(
+            release_action(Some("2.0.0"), "1.0.0"),
+            ReleaseAction::Newer
+        ));
+        // Versions that don't parse as semver are never assumed newer.
+        assert!(matches!(
+            release_action(Some("weird"), "1.0.0"),
+            ReleaseAction::Newer
+        ));
     }
 
     #[test]
@@ -1181,5 +1787,78 @@ mod tests {
                 });
             },
         );
+    }
+
+    /// The bundled reference Catppuccin theme extension end to end: its
+    /// manifest discovers as an enabled `Tier::Theme` extension, shows up in
+    /// [`theme_extension_options`], and its Mocha variant parses into a real
+    /// [`Theme`] through [`resolve_custom_theme`] — the same path Settings
+    /// and the app's theme resolution use, exercised here against the actual
+    /// file on disk rather than a hand-built fixture, so a schema drift
+    /// between `rocker_theme::Theme` and this shipped example would fail a
+    /// test instead of only surfacing as a broken theme at runtime.
+    #[test]
+    fn reference_catppuccin_theme_resolves_through_the_real_pipeline() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../extensions/examples/catppuccin");
+        let manifest =
+            rocker_ext_host::extension_manifest(&directory).expect("theme manifest is valid");
+        assert_eq!(manifest.tier, Tier::Theme);
+
+        let discovery = Discovery {
+            extensions: vec![InstalledExtension {
+                manifest,
+                directory,
+                settings: ExtensionSettings {
+                    enabled: true,
+                    ..ExtensionSettings::default()
+                },
+            }],
+            failures: Vec::new(),
+        };
+
+        let options = theme_extension_options(&discovery);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, "catppuccin.theme");
+        assert_eq!(
+            options[0].variants,
+            vec![
+                ("latte".to_string(), "Latte".to_string()),
+                ("frappe".to_string(), "Frappé".to_string()),
+                ("macchiato".to_string(), "Macchiato".to_string()),
+                ("mocha".to_string(), "Mocha".to_string()),
+            ]
+        );
+
+        let theme = resolve_custom_theme(&discovery, "catppuccin.theme", "mocha")
+            .expect("the Mocha variant parses into a real Theme");
+        assert_eq!(theme.id, "catppuccin-mocha");
+        assert_eq!(theme.mode, rocker_theme::Mode::Dark);
+        assert_eq!(theme.tokens.accent.0, "#cba6f7");
+        assert_eq!(theme.tokens.terminal_palette.len(), 16);
+
+        let latte = resolve_custom_theme(&discovery, "catppuccin.theme", "latte")
+            .expect("the Latte variant parses into a real Theme");
+        assert_eq!(latte.id, "catppuccin-latte");
+        assert_eq!(latte.mode, rocker_theme::Mode::Light);
+        assert_eq!(latte.tokens.accent.0, "#8839ef");
+
+        let frappe = resolve_custom_theme(&discovery, "catppuccin.theme", "frappe")
+            .expect("the Frappé variant parses into a real Theme");
+        assert_eq!(frappe.id, "catppuccin-frappe");
+        assert_eq!(frappe.mode, rocker_theme::Mode::Dark);
+
+        let macchiato = resolve_custom_theme(&discovery, "catppuccin.theme", "macchiato")
+            .expect("the Macchiato variant parses into a real Theme");
+        assert_eq!(macchiato.id, "catppuccin-macchiato");
+        assert_eq!(macchiato.mode, rocker_theme::Mode::Dark);
+
+        // A disabled extension (the install default) must not surface as a
+        // pickable custom theme, mirroring how a disabled extension's code
+        // never runs.
+        let mut disabled = discovery;
+        disabled.extensions[0].settings.enabled = false;
+        assert!(theme_extension_options(&disabled).is_empty());
+        assert!(resolve_custom_theme(&disabled, "catppuccin.theme", "mocha").is_none());
     }
 }

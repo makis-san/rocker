@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[package.metadata.wix]
+upgrade-guid = "B7927A75-88CB-4A31-BF8A-F03C4371697D"
+path-guid = "A11693DD-3BC4-49AC-BCEF-8A87AF69F15B"
+license = false
+eula = false
 
 [dependencies]
 rhai = { version = "1.20", default-features = false, features = ["std"] }
@@ -19,7 +27,9 @@ wasmtime = { version = "41.0.0", default-features = false, features = ["componen
 base64 = "0.23.1"
 ed25519-dalek = "3.0.0"
 sha2 = "0.11.0"
+semver = "1.0.28"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+ureq = "3"
 
 [dev-dependencies]
 tempfile = "3.27.0"

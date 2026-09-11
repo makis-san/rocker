@@ -53,6 +53,9 @@ fn run() -> Result<(), String> {
     match manifest.tier {
         Tier::Script => run_script(extension_dir, grants),
         Tier::Component => run_component(extension_dir, grants),
+        Tier::Theme => {
+            Err("theme extensions are pure data and have no host process to run".to_owned())
+        }
     }
 }
 

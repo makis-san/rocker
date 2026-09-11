@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use rocker_core::{Connection, Container, ContainerId, ContainerState, StatSample};
 use rocker_engine::{start, Command, EngineHandle, Event, LifecycleAction};
-use rocker_store::{AppPaths, Config};
+use rocker_ext_host::Discovery;
+use rocker_store::{AppPaths, Config, Settings};
 use rocker_theme::Theme;
 
 use crate::detail::DetailScreen;
@@ -110,11 +111,26 @@ pub struct RockerApp {
     quitting: bool,
 }
 
-/// Resolve a stored theme id (`system` / `light` / `dark`, or a future file
-/// stem) into a concrete [`Theme`]. `system` follows the OS light/dark setting,
-/// falling back to dark when the platform doesn't report one.
-fn resolve_theme(ctx: &egui::Context, id: &str) -> Theme {
-    match id {
+/// Resolve stored theme settings (`system` / `light` / `dark` / `custom`)
+/// into a concrete [`Theme`]. `system` follows the OS light/dark setting,
+/// falling back to dark when the platform doesn't report one. `custom` looks
+/// up the chosen variant of an installed theme extension in `discovery`,
+/// falling back to the same system resolution when the extension or variant
+/// isn't there any more (uninstalled, disabled, or never chosen yet) — a
+/// missing custom theme degrades gracefully rather than leaving the app
+/// unstyled.
+fn resolve_theme(ctx: &egui::Context, settings: &Settings, discovery: &Discovery) -> Theme {
+    if settings.theme == "custom" {
+        if let (Some(ext_id), Some(variant_id)) =
+            (&settings.theme_extension, &settings.theme_variant)
+        {
+            if let Some(theme) = extensions::resolve_custom_theme(discovery, ext_id, variant_id) {
+                return theme;
+            }
+        }
+    }
+
+    match settings.theme.as_str() {
         "light" => Theme::light(),
         "dark" => Theme::dark(),
         _ => match ctx.input(|i| i.raw.system_theme) {
@@ -156,7 +172,12 @@ impl RockerApp {
             Config::default()
         });
 
-        let theme = resolve_theme(&cc.egui_ctx, &config.settings.theme);
+        // Built before the initial theme resolves, so a `custom` theme setting
+        // can be looked up against real discovery on the very first frame
+        // instead of falling back to the built-in default for one launch.
+        let extensions = ExtensionsScreen::new(&paths);
+
+        let theme = resolve_theme(&cc.egui_ctx, &config.settings, extensions.discovery());
         let pal = style::install(&cc.egui_ctx, &theme);
 
         // Open the history store; if it can't open, the app still runs — stats
@@ -185,7 +206,6 @@ impl RockerApp {
         // no tray icon at all and the window close button just quits.
         let want_tray = config.settings.minimize_to_tray || config.settings.start_minimized;
         let hidden = Arc::new(AtomicBool::new(false));
-        let extensions = ExtensionsScreen::new(&paths);
 
         let mut app = Self {
             engine,
@@ -524,7 +544,7 @@ impl RockerApp {
     /// Rebuild the palette from the current `settings.theme` and re-install the
     /// `egui` style (Phase 4 hot-reload uses the same path).
     fn apply_theme(&mut self, ctx: &egui::Context) {
-        let theme = resolve_theme(ctx, &self.config.settings.theme);
+        let theme = resolve_theme(ctx, &self.config.settings, self.extensions.discovery());
         self.pal = style::install(ctx, &theme);
     }
 
@@ -988,10 +1008,15 @@ impl RockerApp {
 
         let tray_wanted_before =
             self.config.settings.minimize_to_tray || self.config.settings.start_minimized;
+        let custom_themes = extensions::theme_extension_options(self.extensions.discovery());
 
-        if let Some(edit) =
-            settings::settings_screen(ui, &self.pal, &mut self.config.settings, about)
-        {
+        if let Some(edit) = settings::settings_screen(
+            ui,
+            &self.pal,
+            &mut self.config.settings,
+            &custom_themes,
+            about,
+        ) {
             self.engine.send(Command::SetMaxStatsStreams(
                 self.config.settings.max_stats_streams,
             ));

@@ -42,7 +42,7 @@ gtk = { version = "0.18", optional = true }
 # Drives the real engine while the `screenshot` example captures a frame.
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread"] }
 
-# Opt-in: the tray stack needs GTK 3 + libappindicator dev libraries on Linux,
-# which a bare dev box often lacks. CI and the Linux packaging jobs turn it on.
+# The `rocker` binary enables this feature by default. Keeping the UI crate's
+# default feature set empty lets library users opt out on GTK-less systems.
 [features]
 tray = ["dep:tray-icon", "dep:image", "dep:gtk"]
