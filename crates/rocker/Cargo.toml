@@ -63,6 +63,7 @@ tokio = "1.53.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
-# System-tray icon + "minimize to tray". Opt-in: on Linux it pulls GTK 3 and
-# libappindicator dev libraries. Build with `cargo run --features tray`.
+# System-tray icon + "minimize to tray". This is enabled for the shipped app;
+# use `--no-default-features` for a headless or GTK-less build.
+default = ["tray"]
 tray = ["rocker-ui/tray"]

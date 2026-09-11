@@ -39,7 +39,14 @@ uninstall options:
 /// Inspect `std::env::args()` and, if the first argument is a management verb,
 /// run it. Otherwise return [`Outcome::LaunchGui`].
 pub fn run() -> anyhow::Result<Outcome> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    run_args(std::env::args().skip(1))
+}
+
+fn run_args<I>(args: I) -> anyhow::Result<Outcome>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args.into_iter().collect();
     let Some(verb) = args.first().map(String::as_str) else {
         return Ok(Outcome::LaunchGui);
     };
@@ -198,5 +205,31 @@ fn print_diagnosis(d: &Diagnosis) {
         Some((tag, true)) => println!("\nupdate available: {} -> {tag}", d.version),
         Some((_, false)) => println!("\nup to date."),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run_args, Outcome};
+
+    #[test]
+    fn no_arguments_launches_the_gui() {
+        assert_eq!(run_args(Vec::<String>::new()).unwrap(), Outcome::LaunchGui);
+    }
+
+    #[test]
+    fn management_help_is_handled_before_the_gui() {
+        assert_eq!(
+            run_args([String::from("--help")]).unwrap(),
+            Outcome::Handled(0)
+        );
+    }
+
+    #[test]
+    fn management_version_is_handled_before_the_gui() {
+        assert_eq!(
+            run_args([String::from("--version")]).unwrap(),
+            Outcome::Handled(0)
+        );
     }
 }
