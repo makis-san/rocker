@@ -16,7 +16,7 @@ use std::{
 };
 
 use rhai::{Engine, EvalAltResult, Position, Scope, AST};
-use rocker_ext_api::{Capability, Manifest, ManifestError, Tier};
+use rocker_ext_api::{Capability, ContainerAction, Manifest, ManifestError, Tier};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -97,6 +97,9 @@ pub trait ExtensionRuntime {
 pub trait ScriptHostApi: Send + Sync + 'static {
     /// Ask the application to perform a read-only container operation.
     fn containers_read(&self) -> Result<()>;
+
+    /// Ask the application to execute one container lifecycle action.
+    fn containers_lifecycle(&self, container: &str, action: ContainerAction) -> Result<()>;
 
     /// Display a notification owned and rendered by the application.
     fn notify(&self, message: &str) -> Result<()>;
@@ -228,6 +231,23 @@ fn register_api(engine: &mut Engine, gate: CapabilityGate, host_api: Arc<dyn Scr
             .and_then(|()| containers_api.containers_read())
             .map_err(runtime_error)
     });
+
+    let lifecycle_gate = gate.clone();
+    let lifecycle_api = Arc::clone(&host_api);
+    engine.register_fn(
+        "containers_lifecycle",
+        move |container: String, action: String| {
+            let Some(action) = ContainerAction::parse(&action) else {
+                return Err(runtime_error(HostError::Runtime(format!(
+                    "unsupported container lifecycle action `{action}`"
+                ))));
+            };
+            lifecycle_gate
+                .require(Capability::ContainersLifecycle)
+                .and_then(|()| lifecycle_api.containers_lifecycle(&container, action))
+                .map_err(runtime_error)
+        },
+    );
 
     engine.register_fn("notify", move |message: String| {
         gate.require(Capability::Notifications)
@@ -445,6 +465,13 @@ pub enum HostRequest {
 pub enum HostMessage {
     /// Request a read-only Docker container operation from the application.
     ContainersRead,
+    /// Request a lifecycle action for one container.
+    ContainersLifecycle {
+        /// Docker container identifier.
+        container: String,
+        /// Requested lifecycle action.
+        action: ContainerAction,
+    },
     /// Request an application-owned notification.
     Notify { text: String },
     /// Report the result of a host command.
@@ -671,6 +698,13 @@ where
         self.emit(&HostMessage::ContainersRead)
     }
 
+    fn containers_lifecycle(&self, container: &str, action: ContainerAction) -> Result<()> {
+        self.emit(&HostMessage::ContainersLifecycle {
+            container: container.to_owned(),
+            action,
+        })
+    }
+
     fn notify(&self, message: &str) -> Result<()> {
         self.emit(&HostMessage::Notify {
             text: message.to_owned(),
@@ -707,6 +741,14 @@ mod tests {
                 .lock()
                 .map_err(|error| HostError::Runtime(error.to_string()))?
                 .push("containers_read".into());
+            Ok(())
+        }
+
+        fn containers_lifecycle(&self, container: &str, action: ContainerAction) -> Result<()> {
+            self.calls
+                .lock()
+                .map_err(|error| HostError::Runtime(error.to_string()))?
+                .push(format!("lifecycle:{container}:{action:?}"));
             Ok(())
         }
 
@@ -782,6 +824,27 @@ mod tests {
             .lock()
             .expect("recording API lock is available")
             .is_empty());
+    }
+
+    #[test]
+    fn script_runtime_routes_granted_lifecycle_actions() {
+        let host = Arc::new(RecordingApi::default());
+        let api: Arc<dyn ScriptHostApi> = host.clone();
+        let mut runtime = ScriptRuntime::compile(
+            &manifest(vec![Capability::ContainersLifecycle]),
+            "fn activate() { containers_lifecycle(\"abc123\", \"restart\"); }",
+            [Capability::ContainersLifecycle],
+            api,
+            ScriptLimits::default(),
+        )
+        .expect("script compiles");
+
+        runtime.activate().expect("script activates");
+
+        assert_eq!(
+            *host.calls.lock().expect("recording API lock is available"),
+            ["lifecycle:abc123:Restart"]
+        );
     }
 
     #[test]

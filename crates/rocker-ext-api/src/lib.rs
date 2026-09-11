@@ -27,6 +27,36 @@ pub enum Capability {
     Notifications,
 }
 
+/// The container lifecycle operations an extension may request from Rocker.
+///
+/// This is an intent only: the application checks
+/// [`Capability::ContainersLifecycle`] and executes the Docker API call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerAction {
+    Start,
+    Stop,
+    Restart,
+    Pause,
+    Unpause,
+    Kill,
+}
+
+impl ContainerAction {
+    /// Parse the stable lowercase spellings used by the scripting API.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "start" => Some(Self::Start),
+            "stop" => Some(Self::Stop),
+            "restart" => Some(Self::Restart),
+            "pause" => Some(Self::Pause),
+            "unpause" => Some(Self::Unpause),
+            "kill" => Some(Self::Kill),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {

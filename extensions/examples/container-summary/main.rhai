@@ -8,3 +8,7 @@ fn on_event(event) {
         containers_read();
     }
 }
+
+fn restart_container(container_id) {
+    containers_lifecycle(container_id, "restart");
+}
