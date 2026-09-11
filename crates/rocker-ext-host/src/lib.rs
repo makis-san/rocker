@@ -6,10 +6,18 @@
 //! `wasmtime` + Component Model runtime (Phase 5b) attach behind
 //! [`ExtensionRuntime`].
 
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{Arc, Mutex},
+};
 
 use rhai::{Engine, EvalAltResult, Position, Scope, AST};
 use rocker_ext_api::{Capability, Manifest, ManifestError, Tier};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -30,6 +38,14 @@ pub enum HostError {
     EntryOutsideInstall,
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
+    #[error("extension `{0}` is already installed")]
+    AlreadyInstalled(String),
+    #[error("extension source contains a symbolic link: {0}")]
+    SymbolicLink(PathBuf),
+    #[error("extension state TOML: {0}")]
+    StateToml(String),
+    #[error("host protocol: {0}")]
+    Protocol(String),
 }
 
 pub type Result<T> = std::result::Result<T, HostError>;
@@ -224,11 +240,356 @@ fn runtime_error(error: HostError) -> Box<EvalAltResult> {
     EvalAltResult::ErrorRuntime(error.to_string().into(), Position::NONE).into()
 }
 
+/// A persisted permission decision for one locally installed extension.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionSettings {
+    /// Whether Rocker activates the extension.
+    pub enabled: bool,
+    /// Enables reload-oriented developer tooling for this local extension.
+    pub dev_mode: bool,
+    /// Capabilities explicitly approved by the user at installation time.
+    pub granted_capabilities: Vec<Capability>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ExtensionStateFile {
+    extensions: BTreeMap<String, ExtensionSettings>,
+}
+
+/// An extension discovered in the local installation directory.
+#[derive(Debug, Clone)]
+pub struct InstalledExtension {
+    /// Validated extension manifest.
+    pub manifest: Manifest,
+    /// Canonical extension installation directory.
+    pub directory: PathBuf,
+    /// Persisted enablement and grant state.
+    pub settings: ExtensionSettings,
+}
+
+/// The result of discovering local extension folders.
+#[derive(Debug, Default)]
+pub struct Discovery {
+    /// Extensions whose manifests parsed and validated successfully.
+    pub extensions: Vec<InstalledExtension>,
+    /// Broken folders are reported without hiding healthy extensions.
+    pub failures: Vec<(PathBuf, HostError)>,
+}
+
+/// Local extension installer and persistent permission registry.
+///
+/// Each extension lives below `root/<extension-id>`. The registry state remains
+/// adjacent to those folders instead of mixing executable extension metadata
+/// into Rocker's general application config.
+#[derive(Debug)]
+pub struct ExtensionRegistry {
+    root: PathBuf,
+    state: ExtensionStateFile,
+}
+
+impl ExtensionRegistry {
+    const STATE_FILE: &'static str = "extensions-state.toml";
+
+    /// Open a local registry, returning an empty state before the first install.
+    pub fn load(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let state_path = root.join(Self::STATE_FILE);
+        let state = match fs::read_to_string(state_path) {
+            Ok(contents) => toml::from_str(&contents)
+                .map_err(|error| HostError::StateToml(error.to_string()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ExtensionStateFile::default()
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(Self { root, state })
+    }
+
+    /// Copy a folder into the local registry. Symlinks are rejected so the
+    /// installed script and manifest cannot escape their own directory later.
+    pub fn install_from_dir(&mut self, source: impl AsRef<Path>) -> Result<InstalledExtension> {
+        let source = fs::canonicalize(source)?;
+        let manifest = read_manifest(&source)?;
+        let destination = self.root.join(&manifest.id);
+        if destination.exists() {
+            return Err(HostError::AlreadyInstalled(manifest.id));
+        }
+
+        copy_extension_dir(&source, &destination)?;
+        let settings = self
+            .state
+            .extensions
+            .entry(manifest.id.clone())
+            .or_default()
+            .clone();
+        self.save()?;
+
+        Ok(InstalledExtension {
+            manifest,
+            directory: destination,
+            settings,
+        })
+    }
+
+    /// Update a local extension's enablement, developer mode, and user grants.
+    pub fn set_settings(
+        &mut self,
+        extension_id: String,
+        settings: ExtensionSettings,
+    ) -> Result<()> {
+        self.state.extensions.insert(extension_id, settings);
+        self.save()
+    }
+
+    /// Discover every direct child extension directory, retaining errors for a
+    /// settings UI to surface while still activating healthy extensions.
+    pub fn discover(&self) -> Result<Discovery> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Discovery::default())
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut discovery = Discovery::default();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            match read_manifest(&path) {
+                Ok(manifest) => {
+                    let settings = self
+                        .state
+                        .extensions
+                        .get(&manifest.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    discovery.extensions.push(InstalledExtension {
+                        manifest,
+                        directory: fs::canonicalize(path)?,
+                        settings,
+                    });
+                }
+                Err(error) => discovery.failures.push((path, error)),
+            }
+        }
+        discovery
+            .extensions
+            .sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
+        Ok(discovery)
+    }
+
+    fn save(&self) -> Result<()> {
+        fs::create_dir_all(&self.root)?;
+        let contents = toml::to_string_pretty(&self.state)
+            .map_err(|error| HostError::StateToml(error.to_string()))?;
+        fs::write(self.root.join(Self::STATE_FILE), contents)?;
+        Ok(())
+    }
+}
+
+fn read_manifest(extension_dir: &Path) -> Result<Manifest> {
+    let contents = fs::read_to_string(extension_dir.join("extension.toml"))?;
+    let manifest: Manifest =
+        toml::from_str(&contents).map_err(|error| HostError::ManifestToml(error.to_string()))?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+fn copy_extension_dir(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        return Err(HostError::SymbolicLink(source.to_path_buf()));
+    }
+    fs::create_dir_all(destination)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(HostError::SymbolicLink(source_path));
+        }
+        if file_type.is_dir() {
+            copy_extension_dir(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(source_path, destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A command sent from Rocker to the isolated extension-host process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "command")]
+pub enum HostRequest {
+    /// Call the extension's `activate` function.
+    Activate,
+    /// Route a Docker lifecycle or health event to `on_event`.
+    Event { event: String },
+    /// Shut down the host process cleanly.
+    Shutdown,
+}
+
+/// An intent or completion emitted by the isolated extension-host process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "message")]
+pub enum HostMessage {
+    /// Request a read-only Docker container operation from the application.
+    ContainersRead,
+    /// Request an application-owned notification.
+    Notify { text: String },
+    /// Report the result of a host command.
+    Completed { ok: bool, error: Option<String> },
+}
+
+/// A [`ScriptHostApi`] that forwards script intents over the line-delimited
+/// JSON host protocol. The application remains the only Docker client.
+pub struct ProtocolApi<W> {
+    writer: Mutex<W>,
+}
+
+/// A supervised, separate process hosting one extension runtime.
+///
+/// Requests and intents use [`HostRequest`] and [`HostMessage`] over the
+/// process's line-delimited JSON standard streams. The UI process can therefore
+/// terminate a misbehaving extension without taking down Docker management.
+pub struct HostProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl HostProcess {
+    /// Spawn the `rocker-ext-host` binary for an installed extension.
+    pub fn spawn(
+        host_program: impl AsRef<Path>,
+        extension_dir: impl AsRef<Path>,
+        granted: &[Capability],
+    ) -> Result<Self> {
+        let grants = serde_json::to_string(granted)
+            .map_err(|error| HostError::Protocol(error.to_string()))?;
+        let mut child = Command::new(host_program.as_ref())
+            .arg(extension_dir.as_ref())
+            .arg(grants)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            HostError::Runtime("extension host did not expose standard input".into())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            HostError::Runtime("extension host did not expose standard output".into())
+        })?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// Send one command and collect its API intents through the completion
+    /// message. The caller executes those intents against its own Docker API.
+    pub fn request(&mut self, request: &HostRequest) -> Result<Vec<HostMessage>> {
+        serde_json::to_writer(&mut self.stdin, request)
+            .map_err(|error| HostError::Protocol(error.to_string()))?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+
+        let mut messages = Vec::new();
+        loop {
+            let mut line = String::new();
+            if self.stdout.read_line(&mut line)? == 0 {
+                return Err(HostError::Crashed(
+                    "extension host closed its protocol stream".into(),
+                ));
+            }
+            let message: HostMessage = serde_json::from_str(&line)
+                .map_err(|error| HostError::Protocol(error.to_string()))?;
+            let completed = matches!(message, HostMessage::Completed { .. });
+            messages.push(message);
+            if completed {
+                return Ok(messages);
+            }
+        }
+    }
+
+    /// Request a clean shutdown, then wait for the child to exit.
+    pub fn shutdown(mut self) -> Result<()> {
+        self.request(&HostRequest::Shutdown)?;
+        let status = self.child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(HostError::Crashed(format!(
+                "extension host exited with {status}"
+            )))
+        }
+    }
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl<W> ProtocolApi<W>
+where
+    W: Write,
+{
+    /// Create a protocol API over a write stream owned by the host process.
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+        }
+    }
+
+    /// Emit a protocol message as one newline-delimited JSON object.
+    pub fn emit(&self, message: &HostMessage) -> Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|error| HostError::Protocol(error.to_string()))?;
+        serde_json::to_writer(&mut *writer, message)
+            .map_err(|error| HostError::Protocol(error.to_string()))?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+impl<W> ScriptHostApi for ProtocolApi<W>
+where
+    W: Write + Send + 'static,
+{
+    fn containers_read(&self) -> Result<()> {
+        self.emit(&HostMessage::ContainersRead)
+    }
+
+    fn notify(&self, message: &str) -> Result<()> {
+        self.emit(&HostMessage::Notify {
+            text: message.to_owned(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rocker_ext_api::Tier;
     use std::sync::Mutex;
+    use tempfile::tempdir;
 
     fn manifest(caps: Vec<Capability>) -> Manifest {
         Manifest {
@@ -345,5 +706,98 @@ mod tests {
         .expect("script compiles");
 
         assert!(runtime.activate().is_err());
+    }
+
+    #[test]
+    fn registry_install_persists_explicit_grants() {
+        let source = tempdir().expect("source directory is created");
+        let install = tempdir().expect("installation directory is created");
+        fs::write(
+            source.path().join("extension.toml"),
+            r#"
+                id = "example.extension"
+                name = "Example"
+                version = "0.1.0"
+                tier = "script"
+                capabilities = ["notifications"]
+                entry = "main.rhai"
+            "#,
+        )
+        .expect("manifest is written");
+        fs::write(source.path().join("main.rhai"), "fn activate() {}").expect("script is written");
+
+        let mut registry =
+            ExtensionRegistry::load(install.path().join("extensions")).expect("registry loads");
+        registry
+            .install_from_dir(source.path())
+            .expect("extension installs");
+        registry
+            .set_settings(
+                "example.extension".into(),
+                ExtensionSettings {
+                    enabled: true,
+                    dev_mode: true,
+                    granted_capabilities: vec![Capability::Notifications],
+                },
+            )
+            .expect("settings save");
+
+        let reloaded =
+            ExtensionRegistry::load(install.path().join("extensions")).expect("registry reloads");
+        let discovery = reloaded.discover().expect("extension discovery succeeds");
+
+        assert_eq!(discovery.extensions.len(), 1);
+        assert!(discovery.extensions[0].settings.enabled);
+        assert!(discovery.extensions[0].settings.dev_mode);
+        assert_eq!(
+            discovery.extensions[0].settings.granted_capabilities,
+            [Capability::Notifications]
+        );
+    }
+
+    #[test]
+    fn protocol_messages_round_trip_as_json() {
+        let request = HostRequest::Event {
+            event: "health_status".into(),
+        };
+        let message = HostMessage::Notify {
+            text: "healthy".into(),
+        };
+
+        assert_eq!(
+            serde_json::from_str::<HostRequest>(
+                &serde_json::to_string(&request).expect("serializes")
+            )
+            .expect("deserializes"),
+            request
+        );
+        assert_eq!(
+            serde_json::from_str::<HostMessage>(
+                &serde_json::to_string(&message).expect("serializes")
+            )
+            .expect("deserializes"),
+            message
+        );
+    }
+
+    #[test]
+    fn reference_extensions_compile_with_their_requested_grants() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/examples");
+        let host: Arc<dyn ScriptHostApi> = Arc::new(RecordingApi::default());
+
+        for extension in ["container-notifier", "container-summary"] {
+            let directory = root.join(extension);
+            let manifest = read_manifest(&directory).expect("reference manifest is valid");
+            let source = fs::read_to_string(directory.join(&manifest.entry))
+                .expect("reference script is readable");
+            ScriptRuntime::compile(
+                &manifest,
+                &source,
+                manifest.capabilities.clone(),
+                Arc::clone(&host),
+                ScriptLimits::default(),
+            )
+            .expect("reference script compiles");
+        }
     }
 }

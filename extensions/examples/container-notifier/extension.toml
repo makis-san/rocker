@@ -1,0 +1,6 @@
+id = "rocker.container-notifier"
+name = "Container notifier"
+version = "0.1.0"
+tier = "script"
+capabilities = ["notifications"]
+entry = "main.rhai"

@@ -1,0 +1,6 @@
+id = "rocker.container-summary"
+name = "Container summary"
+version = "0.1.0"
+tier = "script"
+capabilities = ["containers-read", "notifications"]
+entry = "main.rhai"

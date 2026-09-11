@@ -28,6 +28,13 @@ impl AppPaths {
         self.config_dir.join("themes")
     }
 
+    /// Where locally installed extension folders and their permission state
+    /// live. Scripts are copied here before activation rather than executed
+    /// from an arbitrary source folder.
+    pub fn extensions_dir(&self) -> PathBuf {
+        self.data_dir.join("extensions")
+    }
+
     pub fn history_db(&self) -> PathBuf {
         self.data_dir.join("history.redb")
     }

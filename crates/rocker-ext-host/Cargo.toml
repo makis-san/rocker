@@ -10,6 +10,11 @@ repository.workspace = true
 [dependencies]
 rhai = { version = "1.20", default-features = false, features = ["std"] }
 rocker-ext-api = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0.151"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 toml = "1.1.5"
+
+[dev-dependencies]
+tempfile = "3.27.0"
