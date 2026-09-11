@@ -590,6 +590,137 @@ pub fn segmented(
     out
 }
 
+/// A dropdown for picking one of several named options (a `segmented` doesn't
+/// scale past 3-4 cells, and this list's length isn't bounded — it grows with
+/// how many matching extensions or variants are installed). Closed, it's a
+/// track the same shape and height as [`segmented`], showing the current
+/// selection and a chevron. Open, a floating list appears below it — same
+/// surface and hairline as the rest of the design system, each row a quiet
+/// tonal hover, the selected one held at a resting tint — and a click
+/// anywhere outside it closes the list without changing the selection.
+/// Returns the new index only when a different row is picked.
+pub fn dropdown(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    id_salt: &str,
+    options: &[&str],
+    selected: usize,
+) -> Option<usize> {
+    if options.is_empty() {
+        return None;
+    }
+    let selected = selected.min(options.len() - 1);
+    let id = ui.make_persistent_id((id_salt, "dropdown"));
+    let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+
+    let h = 28.0;
+    let w = ui.available_width().min(232.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let hot = ui.ctx().animate_bool(resp.id, resp.hovered() || open);
+
+    ui.painter().rect(
+        rect,
+        style::radius(pal.corner),
+        pal.surface.lerp_to_gamma(pal.text, 0.03 * hot),
+        egui::Stroke::new(1.0_f32, pal.border.lerp_to_gamma(pal.border_strong, hot)),
+        egui::StrokeKind::Inside,
+    );
+
+    let pad = 10.0;
+    ui.painter().text(
+        egui::pos2(rect.left() + pad, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        options[selected],
+        egui::FontId::proportional(12.5),
+        pal.text,
+    );
+    let chev = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - pad - 4.5, rect.center().y),
+        egui::vec2(9.0, 9.0),
+    );
+    let open_t = ui.ctx().animate_bool(id.with("chevron"), open);
+    icons::chevron(ui.painter(), chev, pal.text_muted, open_t);
+
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        open = !open;
+    }
+
+    let mut picked = None;
+    if open {
+        // A transparent full-screen catcher below the list closes it on any
+        // outside click, the same scrim-plus-foreground-card split
+        // `confirm_dialog` uses for its own click-outside behaviour.
+        let screen = ui.ctx().content_rect();
+        let scrim = egui::Area::new(id.with("scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ui.ctx(), |ui| {
+                ui.allocate_exact_size(screen.size(), egui::Sense::click())
+            })
+            .inner;
+        if scrim.1.clicked() {
+            open = false;
+        }
+
+        let row_h = 26.0;
+        let list_top = rect.bottom() + 4.0;
+        egui::Area::new(id.with("list"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(rect.left(), list_top))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(pal.surface)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border_strong))
+                    .corner_radius(style::radius(pal.corner))
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        ui.set_width(w - 8.0);
+                        for (i, opt) in options.iter().enumerate() {
+                            let row_id = id.with(("row", i));
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                egui::vec2(w - 8.0, row_h),
+                                egui::Sense::click(),
+                            );
+                            let rt = ui.ctx().animate_bool(row_id, row_resp.hovered());
+                            if i == selected || rt > 0.0 {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    style::radius((pal.corner - 2.0).max(1.0)),
+                                    pal.tint(if i == selected { 0.08 } else { 0.05 * rt }),
+                                );
+                            }
+                            ui.painter().text(
+                                egui::pos2(row_rect.left() + 8.0, row_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                *opt,
+                                egui::FontId::proportional(12.5),
+                                if i == selected {
+                                    pal.text
+                                } else {
+                                    pal.text_muted.lerp_to_gamma(pal.text, 0.4 * rt)
+                                },
+                            );
+                            if row_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if row_resp.clicked() {
+                                if i != selected {
+                                    picked = Some(i);
+                                }
+                                open = false;
+                            }
+                        }
+                    });
+            });
+    }
+
+    ui.data_mut(|d| d.insert_temp(id, open));
+    picked
+}
+
 /// A clamped numeric stepper: `[−]  value unit  [+]` on one rounded track. The
 /// button at a reached bound is drawn dimmed and stops responding, so there is
 /// no dead control. Returns the new value when it changes.

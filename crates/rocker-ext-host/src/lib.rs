@@ -185,7 +185,11 @@ impl ScriptRuntime {
             });
         }
 
-        let entry_path = std::fs::canonicalize(extension_dir.join(&manifest.entry))?;
+        let entry = manifest
+            .entry
+            .as_deref()
+            .expect("validated above: script tier always has an entry");
+        let entry_path = std::fs::canonicalize(extension_dir.join(entry))?;
         if !entry_path.starts_with(&extension_dir) {
             return Err(HostError::EntryOutsideInstall);
         }
@@ -1104,8 +1108,9 @@ mod tests {
             version: "0.1.0".into(),
             tier: Tier::Script,
             capabilities: caps,
-            entry: "main.rhai".into(),
+            entry: Some("main.rhai".into()),
             schedule_seconds: None,
+            theme_variants: Vec::new(),
         }
     }
 
@@ -1365,8 +1370,9 @@ mod tests {
         for extension in ["container-notifier", "container-summary"] {
             let directory = root.join(extension);
             let manifest = read_manifest(&directory).expect("reference manifest is valid");
-            let source = fs::read_to_string(directory.join(&manifest.entry))
-                .expect("reference script is readable");
+            let entry = manifest.entry.as_deref().expect("script tier has an entry");
+            let source =
+                fs::read_to_string(directory.join(entry)).expect("reference script is readable");
             ScriptRuntime::compile(
                 &manifest,
                 &source,
@@ -1376,6 +1382,21 @@ mod tests {
             )
             .expect("reference script compiles");
         }
+    }
+
+    /// The reference theme extension has nothing to compile (it's pure data),
+    /// but its manifest must still discover and validate as a well-formed
+    /// `Tier::Theme` extension. The theme TOML itself is parsed against
+    /// `rocker_theme::Theme` by `rocker-ui`, which owns that schema.
+    #[test]
+    fn reference_theme_extension_manifest_is_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/examples");
+        let manifest = read_manifest(&root.join("catppuccin")).expect("theme manifest is valid");
+
+        assert_eq!(manifest.tier, Tier::Theme);
+        assert!(manifest.entry.is_none());
+        assert!(manifest.capabilities.is_empty());
+        assert!(!manifest.theme_variants.is_empty());
     }
 
     // The isolated process's query/answer exchange (`drive_request` on the

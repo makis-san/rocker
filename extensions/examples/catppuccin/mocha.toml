@@ -1,0 +1,45 @@
+# Catppuccin Mocha — https://catppuccin.com/palette/
+#
+# Colors are the official, published Mocha hex values, used as-is. `accent`
+# is mauve, the palette's own signature color (not the default blue every
+# other dark theme reaches for). The terminal ramp is Catppuccin's own
+# published ANSI mapping, so a shell run inside Rocker matches the same
+# terminal every other Catppuccin port draws.
+schema_version = 1
+id = "catppuccin-mocha"
+name = "Catppuccin Mocha"
+author = "Catppuccin"
+mode = "dark"
+
+[tokens]
+surface = "#1e1e2e"         # base
+surface_raised = "#313244"  # surface0
+text = "#cdd6f4"            # text
+text_muted = "#a6adc8"      # subtext0
+border = "#45475a"          # surface1
+accent = "#cba6f7"          # mauve
+terminal_palette = [
+  "#45475a", # black   (surface1)
+  "#f38ba8", # red
+  "#a6e3a1", # green
+  "#f9e2af", # yellow
+  "#89b4fa", # blue
+  "#f5c2e7", # magenta (pink)
+  "#94e2d5", # cyan    (teal)
+  "#bac2de", # white   (subtext1)
+  "#585b70", # bright black   (surface2)
+  "#f38ba8", # bright red
+  "#a6e3a1", # bright green
+  "#f9e2af", # bright yellow
+  "#89b4fa", # bright blue
+  "#f5c2e7", # bright magenta
+  "#94e2d5", # bright cyan
+  "#a6adc8", # bright white   (subtext0)
+]
+radius = 8.0
+
+[tokens.status]
+running = "#a6e3a1"   # green
+paused = "#f9e2af"    # yellow
+exited = "#6c7086"    # overlay0
+unhealthy = "#f38ba8" # red

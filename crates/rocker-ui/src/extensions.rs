@@ -25,6 +25,7 @@ use rocker_ext_host::{
     Discovery, ExtensionRegistry, HostError, InstalledExtension, TrustedRegistry,
 };
 use rocker_store::{AppPaths, ExtensionRegistrySource};
+use rocker_theme::Theme;
 
 use crate::icons::{self, Icon};
 use crate::style::{self, Palette};
@@ -117,6 +118,69 @@ impl ExtensionsScreen {
             Discovery::default()
         });
     }
+
+    /// The last discovery pass, for callers (the Settings screen's theme
+    /// picker) that only need to read installed extensions rather than draw
+    /// this whole screen.
+    pub fn discovery(&self) -> &Discovery {
+        &self.discovery
+    }
+}
+
+/// One installed, enabled `Tier::Theme` extension, shaped for the Settings
+/// screen's theme picker — a name to show and the variants it ships, without
+/// pulling in the rest of [`InstalledExtension`]'s bookkeeping.
+pub struct ThemeExtensionOption {
+    pub id: String,
+    pub name: String,
+    /// `(variant id, variant name)`, in manifest order.
+    pub variants: Vec<(String, String)>,
+}
+
+/// Every installed, enabled theme extension, sorted by name — installed but
+/// disabled ones are left out, the same gate the Extensions screen uses for
+/// running an extension's code (PLAN §5.5), even though a theme has none.
+pub fn theme_extension_options(discovery: &Discovery) -> Vec<ThemeExtensionOption> {
+    let mut options: Vec<ThemeExtensionOption> = discovery
+        .extensions
+        .iter()
+        .filter(|ext| ext.manifest.tier == Tier::Theme && ext.settings.enabled)
+        .map(|ext| ThemeExtensionOption {
+            id: ext.manifest.id.clone(),
+            name: ext.manifest.name.clone(),
+            variants: ext
+                .manifest
+                .theme_variants
+                .iter()
+                .map(|v| (v.id.clone(), v.name.clone()))
+                .collect(),
+        })
+        .collect();
+    options.sort_by(|a, b| a.name.cmp(&b.name));
+    options
+}
+
+/// Resolve one variant of one installed theme extension into a concrete
+/// [`Theme`], or `None` if the extension was uninstalled, disabled, or the
+/// variant no longer exists — the caller falls back to a built-in theme
+/// rather than erroring, the same way [`ExtensionRegistry::discover`] reports
+/// a broken extension without taking down the rest of the app.
+pub fn resolve_custom_theme(
+    discovery: &Discovery,
+    extension_id: &str,
+    variant_id: &str,
+) -> Option<Theme> {
+    let ext = discovery.extensions.iter().find(|ext| {
+        ext.manifest.id == extension_id && ext.manifest.tier == Tier::Theme && ext.settings.enabled
+    })?;
+    let variant = ext
+        .manifest
+        .theme_variants
+        .iter()
+        .find(|v| v.id == variant_id)
+        .or_else(|| ext.manifest.theme_variants.first())?;
+    let text = std::fs::read_to_string(ext.directory.join(&variant.file)).ok()?;
+    Theme::from_toml(&text).ok()
 }
 
 /// What happened this frame. `None` from [`extensions_screen`] means nothing
@@ -614,43 +678,70 @@ fn extension_card(
                 );
             }
 
-            ui.add_space(8.0);
-            let dev_salt = format!("ext-{}-dev", ext.manifest.id);
-            if let Some(next) =
-                labeled_toggle(ui, pal, "Dev mode", &dev_salt, ext.settings.dev_mode)
-            {
-                ext.settings.dev_mode = next;
-                dirty = true;
-            }
-
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new("Capabilities")
-                    .small()
-                    .strong()
-                    .color(pal.text_muted),
-            );
-            ui.add_space(4.0);
-            if ext.manifest.capabilities.is_empty() {
+            if ext.manifest.tier == Tier::Theme {
+                // A theme has no runtime to put in dev mode and no
+                // capabilities to grant — it's just data, picked in Settings.
+                ui.add_space(10.0);
                 ui.label(
-                    RichText::new("This extension requests no capabilities.")
+                    RichText::new("Variants")
+                        .small()
+                        .strong()
+                        .color(pal.text_muted),
+                );
+                ui.add_space(4.0);
+                let names = ext
+                    .manifest
+                    .theme_variants
+                    .iter()
+                    .map(|v| v.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(RichText::new(names).small().color(pal.text_faint));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Pick this theme and a variant from Settings → Theme.")
                         .small()
                         .color(pal.text_faint),
                 );
             } else {
-                for cap in ext.manifest.capabilities.clone() {
-                    let granted = ext.settings.granted_capabilities.contains(&cap);
-                    if let Some(next) =
-                        check(ui, pal, &ext.manifest.id, capability_label(cap), granted)
-                    {
-                        if next {
-                            if !granted {
-                                ext.settings.granted_capabilities.push(cap);
+                ui.add_space(8.0);
+                let dev_salt = format!("ext-{}-dev", ext.manifest.id);
+                if let Some(next) =
+                    labeled_toggle(ui, pal, "Dev mode", &dev_salt, ext.settings.dev_mode)
+                {
+                    ext.settings.dev_mode = next;
+                    dirty = true;
+                }
+
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("Capabilities")
+                        .small()
+                        .strong()
+                        .color(pal.text_muted),
+                );
+                ui.add_space(4.0);
+                if ext.manifest.capabilities.is_empty() {
+                    ui.label(
+                        RichText::new("This extension requests no capabilities.")
+                            .small()
+                            .color(pal.text_faint),
+                    );
+                } else {
+                    for cap in ext.manifest.capabilities.clone() {
+                        let granted = ext.settings.granted_capabilities.contains(&cap);
+                        if let Some(next) =
+                            check(ui, pal, &ext.manifest.id, capability_label(cap), granted)
+                        {
+                            if next {
+                                if !granted {
+                                    ext.settings.granted_capabilities.push(cap);
+                                }
+                            } else {
+                                ext.settings.granted_capabilities.retain(|c| *c != cap);
                             }
-                        } else {
-                            ext.settings.granted_capabilities.retain(|c| *c != cap);
+                            dirty = true;
                         }
-                        dirty = true;
                     }
                 }
             }
@@ -684,6 +775,7 @@ fn tier_label(tier: Tier) -> &'static str {
     match tier {
         Tier::Script => "script",
         Tier::Component => "component",
+        Tier::Theme => "theme",
     }
 }
 
@@ -902,8 +994,9 @@ mod tests {
             version: "0.1.0".into(),
             tier: Tier::Script,
             capabilities,
-            entry: "main.rhai".into(),
+            entry: Some("main.rhai".into()),
             schedule_seconds: None,
+            theme_variants: Vec::new(),
         }
     }
 
@@ -1181,5 +1274,57 @@ mod tests {
                 });
             },
         );
+    }
+
+    /// The bundled reference Catppuccin theme extension end to end: its
+    /// manifest discovers as an enabled `Tier::Theme` extension, shows up in
+    /// [`theme_extension_options`], and its Mocha variant parses into a real
+    /// [`Theme`] through [`resolve_custom_theme`] — the same path Settings
+    /// and the app's theme resolution use, exercised here against the actual
+    /// file on disk rather than a hand-built fixture, so a schema drift
+    /// between `rocker_theme::Theme` and this shipped example would fail a
+    /// test instead of only surfacing as a broken theme at runtime.
+    #[test]
+    fn reference_catppuccin_theme_resolves_through_the_real_pipeline() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../extensions/examples/catppuccin");
+        let manifest =
+            rocker_ext_host::extension_manifest(&directory).expect("theme manifest is valid");
+        assert_eq!(manifest.tier, Tier::Theme);
+
+        let discovery = Discovery {
+            extensions: vec![InstalledExtension {
+                manifest,
+                directory,
+                settings: ExtensionSettings {
+                    enabled: true,
+                    ..ExtensionSettings::default()
+                },
+            }],
+            failures: Vec::new(),
+        };
+
+        let options = theme_extension_options(&discovery);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, "catppuccin.theme");
+        assert_eq!(
+            options[0].variants,
+            vec![("mocha".to_string(), "Mocha".to_string())]
+        );
+
+        let theme = resolve_custom_theme(&discovery, "catppuccin.theme", "mocha")
+            .expect("the Mocha variant parses into a real Theme");
+        assert_eq!(theme.id, "catppuccin-mocha");
+        assert_eq!(theme.mode, rocker_theme::Mode::Dark);
+        assert_eq!(theme.tokens.accent.0, "#cba6f7");
+        assert_eq!(theme.tokens.terminal_palette.len(), 16);
+
+        // A disabled extension (the install default) must not surface as a
+        // pickable custom theme, mirroring how a disabled extension's code
+        // never runs.
+        let mut disabled = discovery;
+        disabled.extensions[0].settings.enabled = false;
+        assert!(theme_extension_options(&disabled).is_empty());
+        assert!(resolve_custom_theme(&disabled, "catppuccin.theme", "mocha").is_none());
     }
 }

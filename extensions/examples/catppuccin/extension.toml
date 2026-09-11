@@ -1,0 +1,12 @@
+id = "catppuccin.theme"
+name = "Catppuccin"
+version = "0.1.0"
+tier = "theme"
+
+# Ships one variant today; the other three official Catppuccin flavors
+# (Latte, Frappé, Macchiato) are additional `[[theme_variants]]` entries away
+# — each just another token file dropped beside this one.
+[[theme_variants]]
+id = "mocha"
+name = "Mocha"
+file = "mocha.toml"
