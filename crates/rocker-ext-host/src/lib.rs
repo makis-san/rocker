@@ -511,6 +511,38 @@ impl ExtensionRegistry {
         self.save()
     }
 
+    /// Remove an installed extension and its persisted settings.
+    ///
+    /// The extension ID is also the direct child directory name under the
+    /// registry root. It is validated before constructing that path so a UI
+    /// action can never turn this into an arbitrary filesystem removal.
+    pub fn delete_extension(&mut self, extension_id: &str) -> Result<()> {
+        if extension_id.is_empty()
+            || !extension_id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+            })
+        {
+            return Err(HostError::Manifest(ManifestError::InvalidId {
+                id: extension_id.to_owned(),
+            }));
+        }
+
+        let destination = self.root.join(extension_id);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(HostError::SymbolicLink(destination));
+            }
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&destination)?,
+            Ok(_) => fs::remove_file(&destination)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        self.state.extensions.remove(extension_id);
+        self.state.provenance.remove(extension_id);
+        self.save()
+    }
+
     /// Discover every direct child extension directory, retaining errors for a
     /// settings UI to surface while still activating healthy extensions.
     pub fn discover(&self) -> Result<Discovery> {
@@ -1393,6 +1425,55 @@ mod tests {
             discovery.extensions[0].settings.granted_capabilities,
             [Capability::Notifications]
         );
+    }
+
+    #[test]
+    fn delete_extension_removes_files_and_persisted_state() {
+        let source = tempdir().expect("source directory is created");
+        let install = tempdir().expect("installation directory is created");
+        fs::write(
+            source.path().join("extension.toml"),
+            r#"
+                id = "example.extension"
+                name = "Example"
+                version = "0.1.0"
+                tier = "theme"
+
+                [[theme_variants]]
+                id = "dark"
+                name = "Dark"
+                file = "dark.toml"
+            "#,
+        )
+        .expect("manifest is written");
+        fs::write(source.path().join("dark.toml"), "{}").expect("theme is written");
+
+        let root = install.path().join("extensions");
+        let mut registry = ExtensionRegistry::load(root.clone()).expect("registry loads");
+        registry
+            .install_from_dir(source.path())
+            .expect("extension installs");
+        registry
+            .set_settings(
+                "example.extension".into(),
+                ExtensionSettings {
+                    enabled: true,
+                    ..ExtensionSettings::default()
+                },
+            )
+            .expect("settings save");
+
+        registry
+            .delete_extension("example.extension")
+            .expect("extension deletes");
+
+        assert!(!root.join("example.extension").exists());
+        let reloaded = ExtensionRegistry::load(root).expect("registry reloads");
+        assert!(reloaded
+            .discover()
+            .expect("discovery succeeds")
+            .extensions
+            .is_empty());
     }
 
     #[test]

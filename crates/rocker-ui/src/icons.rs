@@ -65,9 +65,6 @@ pub enum Icon {
     /// outward tab and one inward notch, built from the same straight-edge
     /// lines as `Cube` and `Stack` rather than a curved pack glyph.
     Puzzle,
-    /// Open in file manager — a folder silhouette (body + top tab), traced as
-    /// one closed straight-edge outline like the rest of the set.
-    Folder,
 }
 
 /// Maps 0..16 grid coordinates into a centered square inside `rect`.
@@ -283,20 +280,6 @@ pub fn draw(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
                     (13.0, 9.5),
                     (13.0, 13.0),
                     (3.0, 13.0),
-                ],
-                true,
-            );
-        }
-        Icon::Folder => {
-            line(
-                &[
-                    (2.0, 5.0),
-                    (2.0, 3.5),
-                    (6.5, 3.5),
-                    (7.5, 5.0),
-                    (14.0, 5.0),
-                    (14.0, 13.0),
-                    (2.0, 13.0),
                 ],
                 true,
             );

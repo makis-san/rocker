@@ -1,11 +1,9 @@
 //! The Extensions view (PLAN §5.5: two tiers, both Rust-native).
 //!
-//! One centered column, same shape as [`crate::groups`]: a list of installed
-//! extensions, each an always-editable card — enabled / dev-mode toggles and a
-//! checklist of exactly the capabilities its manifest requests, nothing more.
-//! Grants are persisted straight through `ExtensionRegistry::set_settings` as
-//! they're edited (unlike Groups/Settings, which hand an edit back for the
-//! caller to save — there is no separate app-level config these belong in).
+//! One centered column, same shape as [`crate::groups`]: a compact list of
+//! installed extensions with identity, source, and the few actions needed to
+//! manage them. Enablement is persisted straight through
+//! `ExtensionRegistry::set_settings` as it is edited.
 //! Broken extension folders are listed, not hidden, so a bad install stays
 //! visible instead of silently vanishing from the list.
 //!
@@ -24,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use egui::{vec2, Align, Layout, RichText, Sense, Stroke};
 
-use rocker_ext_api::{Capability, Tier, UiEvent, UiNode};
+use rocker_ext_api::{Tier, UiEvent, UiNode};
 use rocker_ext_host::{
     compare_versions, Discovery, ExtensionRegistry, HostError, HttpTransport, InstalledExtension,
     RegistryClient, RegistryIndex, RegistryRelease, TrustedRegistry,
@@ -34,7 +32,7 @@ use rocker_theme::Theme;
 
 use crate::icons::{self, Icon};
 use crate::style::{self, Palette};
-use crate::widgets::segmented;
+use crate::widgets::confirm_dialog;
 
 const COLUMN_W: f32 = 560.0;
 
@@ -52,6 +50,8 @@ pub struct ExtensionsScreen {
     discovery: Discovery,
     registry_draft: RegistryDraft,
     tab: ExtensionsTab,
+    /// An installed extension waiting for confirmation before removal.
+    pending_delete: Option<String>,
     /// One catalog fetch per trusted registry, keyed by the registry's own
     /// id. A background thread owns the `Arc<Mutex<_>>` while it fetches;
     /// the UI thread only ever holds the lock briefly to read or replace it.
@@ -134,6 +134,7 @@ impl ExtensionsScreen {
                     discovery,
                     registry_draft: RegistryDraft::default(),
                     tab: ExtensionsTab::Installed,
+                    pending_delete: None,
                     catalogs: HashMap::new(),
                     installs: HashMap::new(),
                 }
@@ -145,6 +146,7 @@ impl ExtensionsScreen {
                     discovery: Discovery::default(),
                     registry_draft: RegistryDraft::default(),
                     tab: ExtensionsTab::Installed,
+                    pending_delete: None,
                     catalogs: HashMap::new(),
                     installs: HashMap::new(),
                 }
@@ -418,9 +420,14 @@ pub fn extensions_screen(
                     ui.add_space(16.0);
 
                     match screen.tab {
-                        ExtensionsTab::Installed => {
-                            installed_extensions_section(ui, pal, screen, &mut changed, &mut error)
-                        }
+                        ExtensionsTab::Installed => installed_extensions_section(
+                            ui,
+                            pal,
+                            screen,
+                            registries,
+                            &mut changed,
+                            &mut error,
+                        ),
                         ExtensionsTab::Browse => {
                             browse_extensions_section(ui, pal, screen, registries)
                         }
@@ -441,6 +448,45 @@ pub fn extensions_screen(
                 });
             });
         });
+
+    if let Some(extension_id) = screen.pending_delete.clone() {
+        let name = screen
+            .discovery
+            .extensions
+            .iter()
+            .find(|ext| ext.manifest.id == extension_id)
+            .map(|ext| ext.manifest.name.as_str())
+            .unwrap_or(extension_id.as_str());
+        let title = format!("Delete {name}?");
+        match confirm_dialog(
+            ui.ctx(),
+            pal,
+            &title,
+            "This removes the installed extension and its saved settings.",
+            "Delete",
+        ) {
+            Some(true) => {
+                let result = match &mut screen.registry {
+                    Ok(registry) => registry.delete_extension(&extension_id),
+                    Err(message) => Err(HostError::Runtime(message.clone())),
+                };
+                screen.pending_delete = None;
+                match result {
+                    Ok(()) => {
+                        let key_fragment = format!("::{extension_id}@");
+                        screen
+                            .installs
+                            .retain(|key, _| !key.contains(&key_fragment));
+                        screen.refresh();
+                        changed = true;
+                    }
+                    Err(err) => error = Some(err.to_string()),
+                }
+            }
+            Some(false) => screen.pending_delete = None,
+            None => {}
+        }
+    }
 
     (changed || registries_changed || error.is_some()).then_some(Edit {
         error,
@@ -464,9 +510,11 @@ fn installed_extensions_section(
     ui: &mut egui::Ui,
     pal: &Palette,
     screen: &mut ExtensionsScreen,
+    registries: &[ExtensionRegistrySource],
     changed: &mut bool,
     error: &mut Option<String>,
 ) {
+    let mut delete_requested = None;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
@@ -476,7 +524,7 @@ fn installed_extensions_section(
                     .color(pal.text),
             );
             ui.label(
-                RichText::new("Installed on this computer. Permissions reflect each manifest.")
+                RichText::new("Installed on this computer.")
                     .small()
                     .color(pal.text_muted),
             );
@@ -504,12 +552,26 @@ fn installed_extensions_section(
             } else {
                 for ext in &mut screen.discovery.extensions {
                     ui.add_space(10.0);
-                    if extension_card(ui, pal, registry, ext, error) {
-                        *changed = true;
+                    let origin = extension_origin(registry, &ext.manifest.id, registries);
+                    match extension_card(
+                        ui,
+                        pal,
+                        registry,
+                        ext,
+                        origin.0.as_str(),
+                        origin.1.as_deref(),
+                        &mut delete_requested,
+                    ) {
+                        Ok(dirty) => *changed |= dirty,
+                        Err(message) => *error = Some(message),
                     }
                 }
             }
         }
+    }
+
+    if delete_requested.is_some() {
+        screen.pending_delete = delete_requested;
     }
 }
 
@@ -1041,19 +1103,36 @@ fn failures_section(
     }
 }
 
-/// One installed extension's editable card: identity + enabled toggle up
-/// top, a dev-mode toggle, then a checklist of exactly the capabilities its
-/// manifest requests. Every edit is persisted immediately through
-/// `ExtensionRegistry::set_settings`; a save failure is written into `error`
-/// rather than returned, mirroring how `Discovery::failures` is surfaced
-/// rather than silently dropped. Returns `true` if any setting changed.
+/// Return the compact source details shown on an installed extension card.
+/// Local installs have no registry provenance, while registry installs can
+/// link back to the configured GitHub repository when the source is GitHub.
+fn extension_origin(
+    registry: &ExtensionRegistry,
+    extension_id: &str,
+    registries: &[ExtensionRegistrySource],
+) -> (String, Option<String>) {
+    let Some(provenance) = registry.provenance(extension_id) else {
+        return ("Local".to_owned(), None);
+    };
+    let github_url = registries
+        .iter()
+        .find(|source| source.id == provenance.registry_id)
+        .and_then(|source| github_repository(&source.index_url).map(|(_, url)| url));
+    (provenance.registry_id.clone(), github_url)
+}
+
+/// One compact installed-extension card. Enablement is persisted immediately
+/// through `ExtensionRegistry::set_settings`; deletion is handed to the
+/// screen's confirmation flow. Returns whether the setting changed.
 fn extension_card(
     ui: &mut egui::Ui,
     pal: &Palette,
     registry: &mut ExtensionRegistry,
     ext: &mut InstalledExtension,
-    error: &mut Option<String>,
-) -> bool {
+    registry_label: &str,
+    github_url: Option<&str>,
+    delete_requested: &mut Option<String>,
+) -> Result<bool, String> {
     let mut dirty = false;
 
     egui::Frame::new()
@@ -1076,140 +1155,59 @@ fn extension_card(
                                 .color(pal.text_faint),
                         );
                     });
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(
-                            RichText::new(&ext.manifest.id)
-                                .small()
-                                .monospace()
-                                .color(pal.text_muted),
-                        );
-                        ui.label(
-                            RichText::new(tier_label(ext.manifest.tier))
-                                .small()
-                                .color(pal.text_faint),
-                        );
-                    });
                 });
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let salt = format!("ext-{}-enabled", ext.manifest.id);
-                    if let Some(next) = toggle(ui, pal, &salt, ext.settings.enabled) {
-                        ext.settings.enabled = next;
+                    let action = if ext.settings.enabled {
+                        "Disable"
+                    } else {
+                        "Enable"
+                    };
+                    if icons::toggle_text_button(ui, pal, action, ext.settings.enabled, action)
+                        .clicked()
+                    {
+                        ext.settings.enabled = !ext.settings.enabled;
                         dirty = true;
                     }
                     ui.add_space(4.0);
-                    if icons::icon_button(ui, pal, Icon::Folder, None, "Open extension folder")
-                        .clicked()
+                    if icons::icon_button(ui, pal, Icon::Trash, None, "Delete extension").clicked()
                     {
-                        open_in_file_manager(&ext.directory);
+                        *delete_requested = Some(ext.manifest.id.clone());
                     }
                 });
             });
 
-            if ext.manifest.tier == Tier::Component {
-                ui.add_space(4.0);
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 ui.label(
-                    RichText::new(
-                        "Component runtime isn't wired into the supervisor yet — this \
-                         extension won't launch until it is.",
-                    )
-                    .small()
-                    .color(pal.text_faint),
-                );
-            }
-
-            if ext.manifest.tier == Tier::Theme {
-                // A theme has no runtime to put in dev mode and no
-                // capabilities to grant — it's just data, picked in Settings.
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("Variants")
+                    RichText::new(format!("Type · {}", tier_label(ext.manifest.tier)))
                         .small()
-                        .strong()
                         .color(pal.text_muted),
                 );
-                ui.add_space(4.0);
-                let names = ext
-                    .manifest
-                    .theme_variants
-                    .iter()
-                    .map(|v| v.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ui.label(RichText::new(names).small().color(pal.text_faint));
-                ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Pick this theme and a variant from Settings → Theme.")
+                    RichText::new(format!("Registry · {registry_label}"))
                         .small()
-                        .color(pal.text_faint),
-                );
-            } else {
-                ui.add_space(8.0);
-                let dev_salt = format!("ext-{}-dev", ext.manifest.id);
-                if let Some(next) =
-                    labeled_toggle(ui, pal, "Dev mode", &dev_salt, ext.settings.dev_mode)
-                {
-                    ext.settings.dev_mode = next;
-                    dirty = true;
-                }
-
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("Capabilities")
-                        .small()
-                        .strong()
                         .color(pal.text_muted),
                 );
-                ui.add_space(4.0);
-                if ext.manifest.capabilities.is_empty() {
-                    ui.label(
-                        RichText::new("This extension requests no capabilities.")
+                if let Some(url) = github_url {
+                    let display = url.strip_prefix("https://").unwrap_or(url);
+                    ui.hyperlink_to(
+                        RichText::new(format!("GitHub · {display}"))
                             .small()
-                            .color(pal.text_faint),
+                            .color(pal.accent),
+                        url,
                     );
-                } else {
-                    for cap in ext.manifest.capabilities.clone() {
-                        let granted = ext.settings.granted_capabilities.contains(&cap);
-                        if let Some(next) =
-                            check(ui, pal, &ext.manifest.id, capability_label(cap), granted)
-                        {
-                            if next {
-                                if !granted {
-                                    ext.settings.granted_capabilities.push(cap);
-                                }
-                            } else {
-                                ext.settings.granted_capabilities.retain(|c| *c != cap);
-                            }
-                            dirty = true;
-                        }
-                    }
                 }
-            }
+            });
         });
 
     if dirty {
         if let Err(err) = registry.set_settings(ext.manifest.id.clone(), ext.settings.clone()) {
-            *error = Some(err.to_string());
+            return Err(err.to_string());
         }
     }
-    dirty
-}
-
-/// Ask the OS to open `path` in its file manager. Best-effort: a folder that
-/// won't open is a minor inconvenience, not something that should interrupt
-/// the rest of the screen, so a failure is only logged.
-fn open_in_file_manager(path: &std::path::Path) {
-    let result = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(path).spawn()
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg(path).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(path).spawn()
-    };
-    if let Err(err) = result {
-        tracing::warn!(%err, path = %path.display(), "failed to open extension folder");
-    }
+    Ok(dirty)
 }
 
 fn tier_label(tier: Tier) -> &'static str {
@@ -1218,98 +1216,6 @@ fn tier_label(tier: Tier) -> &'static str {
         Tier::Component => "component",
         Tier::Theme => "theme",
     }
-}
-
-/// A short, human description of what granting `cap` actually lets an
-/// extension do — shown beside its checkbox instead of the bare enum name.
-fn capability_label(cap: Capability) -> &'static str {
-    match cap {
-        Capability::ContainersRead => "Read containers",
-        Capability::ContainersLifecycle => "Start, stop, and restart containers",
-        Capability::ContainersExec => "Run commands inside containers",
-        Capability::LogsRead => "Read container logs",
-        Capability::StatsRead => "Read resource stats",
-        Capability::ImagesRead => "Read images",
-        Capability::RegistriesRead => "Read registries",
-        Capability::Network => "Make network requests",
-        Capability::Storage => "Store its own local data",
-        Capability::Notifications => "Show notifications",
-    }
-}
-
-/// An Off/On segmented control for a boolean row, salted per-card (mirrors
-/// `settings::toggle`). Returns the new value only when it actually flips.
-fn toggle(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, value: bool) -> Option<bool> {
-    segmented(ui, pal, id_salt, &["Off", "On"], value as usize).map(|i| i == 1)
-}
-
-/// A quiet muted label to the left of a right-aligned [`toggle`] — used for
-/// the card's "Dev mode" row, which (unlike "Enabled") has no trailing
-/// identity text to sit beside on the same line.
-fn labeled_toggle(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    label: &str,
-    id_salt: &str,
-    value: bool,
-) -> Option<bool> {
-    let mut next = None;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).small().color(pal.text_muted));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if let Some(v) = toggle(ui, pal, id_salt, value) {
-                next = Some(v);
-            }
-        });
-    });
-    next
-}
-
-/// A drawn checkbox row for one capability grant — same tonal language as
-/// `groups::check`, duplicated locally rather than shared because the two
-/// screens' rows differ (a container name there, a capability sentence
-/// here). `id_salt` scopes the persistent id to one extension's card, so two
-/// cards requesting the same capability never collide. Returns the new value
-/// only when it flips.
-fn check(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, label: &str, on: bool) -> Option<bool> {
-    let resp = ui
-        .horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let (b, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
-            let t = ui
-                .ctx()
-                .animate_bool(ui.make_persistent_id((id_salt, "chk", label)), on);
-            ui.painter().rect(
-                b.shrink(1.0),
-                style::radius((pal.corner - 3.0).max(1.0)),
-                pal.surface.lerp_to_gamma(pal.accent, 0.9 * t),
-                Stroke::new(1.0_f32, pal.border_strong.lerp_to_gamma(pal.accent, t)),
-                egui::StrokeKind::Inside,
-            );
-            if t > 0.0 {
-                let c = b.center();
-                ui.painter().add(egui::Shape::line(
-                    vec![
-                        egui::pos2(c.x - 3.0, c.y),
-                        egui::pos2(c.x - 0.8, c.y + 2.4),
-                        egui::pos2(c.x + 3.4, c.y - 2.8),
-                    ],
-                    Stroke::new(1.6_f32 * t, pal.on_accent),
-                ));
-            }
-            ui.label(RichText::new(label).color(pal.text));
-        })
-        .response;
-
-    let row = ui.interact(
-        resp.rect,
-        ui.make_persistent_id((id_salt, "chk-hit", label)),
-        Sense::click(),
-    );
-    if row.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    row.clicked().then_some(!on)
 }
 
 // ---- Declarative panel renderer ------------------------------------------
@@ -1425,7 +1331,7 @@ fn render_table(ui: &mut egui::Ui, pal: &Palette, headers: &[String], rows: &[Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocker_ext_api::Manifest;
+    use rocker_ext_api::{Capability, Manifest};
     use rocker_ext_host::ExtensionSettings;
 
     fn manifest(id: &str, capabilities: Vec<Capability>) -> Manifest {
@@ -1460,6 +1366,7 @@ mod tests {
             },
             registry_draft: RegistryDraft::default(),
             tab: ExtensionsTab::Installed,
+            pending_delete: None,
             catalogs: HashMap::new(),
             installs: HashMap::new(),
         }
@@ -1532,6 +1439,7 @@ mod tests {
             discovery: Discovery::default(),
             registry_draft: RegistryDraft::default(),
             tab: ExtensionsTab::Installed,
+            pending_delete: None,
             catalogs: HashMap::new(),
             installs: HashMap::new(),
         };
@@ -1729,24 +1637,6 @@ mod tests {
             release_action(Some("weird"), "1.0.0"),
             ReleaseAction::Newer
         ));
-    }
-
-    #[test]
-    fn capability_label_covers_every_variant() {
-        for cap in [
-            Capability::ContainersRead,
-            Capability::ContainersLifecycle,
-            Capability::ContainersExec,
-            Capability::LogsRead,
-            Capability::StatsRead,
-            Capability::ImagesRead,
-            Capability::RegistriesRead,
-            Capability::Network,
-            Capability::Storage,
-            Capability::Notifications,
-        ] {
-            assert!(!capability_label(cap).is_empty());
-        }
     }
 
     #[test]
