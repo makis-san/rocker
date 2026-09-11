@@ -7,6 +7,9 @@
 //! # The settings screen instead of the container list:
 //! DOCKMAN_VIEW=settings cargo run -p rocker-ui --example screenshot -- /tmp/settings.bmp
 //!
+//! # The registries screen, seeded with a verified and an unverified entry:
+//! DOCKMAN_VIEW=registries cargo run -p rocker-ui --example screenshot -- /tmp/registries.bmp
+//!
 //! # A container screen. DOCKMAN_CONTAINER filters by name substring (first
 //! # match wins, empty = any); DOCKMAN_TAB picks the tab (overview / logs /
 //! # stats / terminal, default overview).
@@ -25,6 +28,7 @@ use rocker_ui::RockerApp;
 enum Target {
     List,
     Settings,
+    Registries,
     Container { needle: String, tab: String },
 }
 
@@ -56,6 +60,13 @@ impl eframe::App for Capture {
             match &self.target {
                 Target::Settings => {
                     self.inner.open_settings();
+                    self.opened = true;
+                }
+                Target::Registries => {
+                    self.inner.debug_seed_registry("ghcr.io", "octo", true);
+                    self.inner
+                        .debug_seed_registry("registry.gitlab.com", "octo", false);
+                    self.inner.open_registries();
                     self.opened = true;
                 }
                 // The container list may not have landed on the very first
@@ -162,6 +173,7 @@ fn main() {
     );
     let target = match std::env::var("DOCKMAN_VIEW").as_deref() {
         Ok("settings") => Target::Settings,
+        Ok("registries") => Target::Registries,
         Ok("container") => Target::Container {
             needle: std::env::var("DOCKMAN_CONTAINER").unwrap_or_default(),
             tab: std::env::var("DOCKMAN_TAB").unwrap_or_else(|_| "overview".into()),

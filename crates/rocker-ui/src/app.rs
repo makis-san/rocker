@@ -11,6 +11,7 @@ use crate::detail::DetailScreen;
 use crate::extensions::{self, ExtensionsScreen};
 use crate::groups;
 use crate::icons::{self, Icon};
+use crate::registries::{self, RegistriesScreen};
 use crate::settings::{self, About};
 use crate::style::{self, Palette};
 use crate::tray::{Tray, TrayAction, TraySummary};
@@ -30,6 +31,7 @@ enum View {
     Containers,
     Groups,
     Extensions,
+    Registries,
     Settings,
 }
 
@@ -39,6 +41,7 @@ enum HeaderAction {
     Refresh,
     ToggleGroups,
     ToggleExtensions,
+    ToggleRegistries,
     ToggleSettings,
 }
 
@@ -90,6 +93,10 @@ pub struct RockerApp {
     /// alongside `view` rather than inside it, same as `detail`, so a
     /// discovery re-scan survives navigating away and back.
     extensions: ExtensionsScreen,
+    /// The Registries screen's form state, in-flight test-connection probes,
+    /// and the keychain handle they run against (PLAN §5.2). Lives alongside
+    /// `view` like `extensions`, so a probe survives navigating away and back.
+    registries: RegistriesScreen,
     /// Docker's total on-disk usage (bytes) from `/system/df`, polled on a
     /// timer for the tray summary. `None` until the first answer, or when the
     /// daemon doesn't report it.
@@ -151,7 +158,7 @@ fn bulk_action_applies(state: ContainerState, action: LifecycleAction) -> bool {
 impl RockerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         let paths = AppPaths::resolve();
-        let config = Config::load(&paths).unwrap_or_else(|err| {
+        let mut config = Config::load(&paths).unwrap_or_else(|err| {
             tracing::warn!(%err, "config load failed; starting from defaults");
             Config::default()
         });
@@ -186,6 +193,25 @@ impl RockerApp {
         let want_tray = config.settings.minimize_to_tray || config.settings.start_minimized;
         let hidden = Arc::new(AtomicBool::new(false));
         let extensions = ExtensionsScreen::new(&paths);
+        let secret_store: Arc<dyn rocker_secrets::SecretStore> =
+            Arc::new(rocker_secrets::KeyringSecretStore::new());
+        let registries = RegistriesScreen::new(secret_store.clone());
+
+        // Pull in Docker CLI credentials on every launch, not just when the
+        // user finds the button — a `docker login` run outside Rocker should
+        // just show up (PLAN §5.2). Registries screen state isn't built yet
+        // at this point, so the summary is surfaced as a startup notice
+        // instead of the screen's own `import_summary` line.
+        let mut startup_import_notice = None;
+        match rocker_secrets::docker_config::import_from_default_location(&*secret_store) {
+            Ok(report) => {
+                let added = registries::apply_import(&report, &mut config.registries);
+                if added > 0 {
+                    startup_import_notice = Some(registries::import_summary_text(&report, added));
+                }
+            }
+            Err(err) => tracing::warn!(%err, "startup Docker-config import failed"),
+        }
 
         let mut app = Self {
             engine,
@@ -202,6 +228,7 @@ impl RockerApp {
             detail: None,
             pending_delete: None,
             extensions,
+            registries,
             disk_usage: None,
             last_disk_poll: f64::NEG_INFINITY,
             tray: None,
@@ -209,6 +236,11 @@ impl RockerApp {
             hidden,
             quitting: false,
         };
+
+        if let Some(notice) = startup_import_notice {
+            app.last_notice = Some(notice);
+            app.persist();
+        }
 
         if want_tray {
             app.set_tray_enabled(true, &cc.egui_ctx);
@@ -280,6 +312,28 @@ impl RockerApp {
     /// toggles the view from the header instead.
     pub fn open_settings(&mut self) {
         self.view = View::Settings;
+    }
+
+    /// Open the registries view. Used by the `screenshot` example; the running
+    /// app toggles the view from the header instead.
+    pub fn open_registries(&mut self) {
+        self.view = View::Registries;
+    }
+
+    /// Debug/test hook: seed a registry entry (no keychain write) so the
+    /// `screenshot` example can capture a populated card, not just the empty
+    /// state.
+    pub fn debug_seed_registry(&mut self, host: &str, username: &str, verified: bool) {
+        let mut r = rocker_core::Registry::basic(host, username);
+        if verified {
+            r.verified_at_ms = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            );
+        }
+        self.config.registries.push(r);
     }
 
     /// Open the container screen for the first container whose name contains
@@ -668,6 +722,19 @@ impl RockerApp {
                         .clicked()
                         {
                             action = Some(HeaderAction::ToggleExtensions);
+                        }
+                        ui.add_space(2.0);
+                        let registries_open = self.view == View::Registries;
+                        if icons::toggle_icon_button(
+                            ui,
+                            pal,
+                            Icon::Key,
+                            registries_open,
+                            "Registries",
+                        )
+                        .clicked()
+                        {
+                            action = Some(HeaderAction::ToggleRegistries);
                         }
                         ui.add_space(style::SM);
                         self.conn_status(ui);
@@ -1063,6 +1130,22 @@ impl RockerApp {
         }
     }
 
+    /// Render the Registries screen. A change here is either an edit (add,
+    /// remove, import) or a background probe landing — either way it's
+    /// config-shaped (PLAN §5.2's `Registry` metadata; the secret itself
+    /// already went straight to the keychain) and gets persisted the same
+    /// way `groups_view` does.
+    fn registries_view(&mut self, ui: &mut egui::Ui) {
+        if registries::registries_screen(
+            ui,
+            &self.pal,
+            &mut self.registries,
+            &mut self.config.registries,
+        ) {
+            self.persist();
+        }
+    }
+
     /// Render the Extensions screen. Extension grants persist through the
     /// local installer; registry sources are app configuration and are saved
     /// here with the rest of that configuration.
@@ -1177,6 +1260,16 @@ impl eframe::App for RockerApp {
                         View::Extensions
                     };
                 }
+                HeaderAction::ToggleRegistries => {
+                    if self.view == View::Containers {
+                        self.close_detail();
+                    }
+                    self.view = if self.view == View::Registries {
+                        View::Containers
+                    } else {
+                        View::Registries
+                    };
+                }
             }
         }
 
@@ -1194,6 +1287,7 @@ impl eframe::App for RockerApp {
                     View::Settings => self.settings_view(ui, ctx),
                     View::Groups => self.groups_view(ui),
                     View::Extensions => self.extensions_view(ui),
+                    View::Registries => self.registries_view(ui),
                     View::Containers if self.detail.is_some() => self.detail_view(ui),
                     View::Containers => self.containers_view(ui),
                 }

@@ -10,6 +10,7 @@ mod extensions;
 mod format;
 mod groups;
 mod icons;
+mod registries;
 mod settings;
 mod style;
 mod terminal;

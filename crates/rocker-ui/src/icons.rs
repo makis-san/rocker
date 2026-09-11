@@ -68,6 +68,11 @@ pub enum Icon {
     /// Open in file manager — a folder silhouette (body + top tab), traced as
     /// one closed straight-edge outline like the rest of the set.
     Folder,
+    /// Registries — a key: the hollow-ring motif as a bow, a horizontal
+    /// shaft, and two teeth hanging off it near the tip. Horizontal (not
+    /// diagonal) so it reads as a key and not, at a glance, a magnifying
+    /// glass — the two share the "ring plus stroke" construction otherwise.
+    Key,
 }
 
 /// Maps 0..16 grid coordinates into a centered square inside `rect`.
@@ -300,6 +305,12 @@ pub fn draw(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
                 ],
                 true,
             );
+        }
+        Icon::Key => {
+            painter.circle_stroke(g.at(4.6, 8.0), 3.0 * g.unit, stroke);
+            line(&[(7.4, 8.0), (13.3, 8.0)], false);
+            line(&[(10.5, 8.0), (10.5, 10.3)], false);
+            line(&[(13.0, 8.0), (13.0, 11.3)], false);
         }
     }
 }

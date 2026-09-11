@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use rocker_core::{Connection, Group};
+use rocker_core::{Connection, Group, Registry};
 
 use crate::paths::AppPaths;
 use crate::{Result, StoreError};
@@ -13,6 +13,9 @@ pub struct Config {
     pub settings: Settings,
     pub connections: Vec<Connection>,
     pub groups: Vec<Group>,
+    /// Configured registries (PLAN §5.2). Never holds a secret — only the
+    /// [`Registry::keychain_ref`] the real credential lives behind.
+    pub registries: Vec<Registry>,
     /// Signed extension catalogs the user has chosen to browse.
     pub extension_registries: Vec<ExtensionRegistrySource>,
 }
@@ -23,6 +26,7 @@ impl Default for Config {
             settings: Settings::default(),
             connections: vec![Connection::local_default()],
             groups: Vec::new(),
+            registries: Vec::new(),
             extension_registries: vec![ExtensionRegistrySource::official()],
         }
     }
@@ -139,5 +143,28 @@ mod tests {
             cfg.extension_registries,
             vec![ExtensionRegistrySource::official()]
         );
+    }
+
+    /// A config written before registries existed still loads, with an empty
+    /// registries list rather than a parse error.
+    #[test]
+    fn pre_registries_config_loads_with_an_empty_list() {
+        let text = r#"
+            [settings]
+            theme = "dark"
+        "#;
+        let cfg: Config = toml::from_str(text).expect("legacy config parses");
+        assert!(cfg.registries.is_empty());
+    }
+
+    #[test]
+    fn registries_round_trip_through_toml() {
+        let mut cfg = Config::default();
+        cfg.registries
+            .push(rocker_core::Registry::basic("ghcr.io", "octo"));
+
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.registries, cfg.registries);
     }
 }
