@@ -8,6 +8,22 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-11
+
+### Added
+
+- Extension support with a sandboxed script runtime, isolated extension host,
+  lifecycle hooks, declarative panels, and an Extensions settings screen.
+- Signed extension registry installation and Browse-tab discovery.
+- Catppuccin theme extensions in all four flavors: Latte, Frappé, Macchiato,
+  and Mocha.
+
+### Changed
+
+- Installed extensions can be managed and updated without downgrading them.
+- Management commands are routed through the application and the system tray
+  feature is enabled for release builds.
+
 ## [0.1.5] - 2026-09-10
 
 ### Added

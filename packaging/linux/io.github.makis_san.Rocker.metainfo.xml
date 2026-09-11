@@ -45,6 +45,13 @@
   </screenshots>
 
   <releases>
+    <release version="0.2.0" date="2026-09-11">
+      <description>
+        <p>Extension support with a sandboxed runtime, signed registry
+        installation, extension management, and Catppuccin themes in all four
+        flavors.</p>
+      </description>
+    </release>
     <release version="0.1.5" date="2026-09-10">
       <description>
         <p>Command-line install with real desktop integration (icon, menu
