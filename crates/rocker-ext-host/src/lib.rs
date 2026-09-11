@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use rhai::{Engine, EvalAltResult, Position, Scope, AST};
@@ -222,6 +223,14 @@ impl ScriptRuntime {
             .call_fn::<String>(&mut scope, &self.ast, "render_panel", (context.to_owned(),))
             .map_err(|error| HostError::Runtime(error.to_string()))?;
         serde_json::from_str(&json).map_err(|error| HostError::Runtime(error.to_string()))
+    }
+
+    /// Invoke the script's optional recurring-work hook.
+    pub fn run_schedule(&self) -> Result<()> {
+        let mut scope = Scope::new();
+        self.engine
+            .call_fn::<()>(&mut scope, &self.ast, "on_schedule", ())
+            .map_err(|error| HostError::Runtime(error.to_string()))
     }
 }
 
@@ -469,6 +478,8 @@ pub enum HostRequest {
     Event { event: String },
     /// Request a declarative panel for the supplied host context JSON.
     RenderPanel { context: String },
+    /// Invoke the script's recurring-work hook.
+    Schedule,
     /// Shut down the host process cleanly.
     Shutdown,
 }
@@ -604,6 +615,12 @@ pub struct ExtensionIntent {
 pub struct ExtensionSupervisor {
     host_program: PathBuf,
     hosts: BTreeMap<String, HostProcess>,
+    schedules: BTreeMap<String, ScheduledExtension>,
+}
+
+struct ScheduledExtension {
+    every: Duration,
+    due: Instant,
 }
 
 impl ExtensionSupervisor {
@@ -612,6 +629,7 @@ impl ExtensionSupervisor {
         Self {
             host_program: host_program.into(),
             hosts: BTreeMap::new(),
+            schedules: BTreeMap::new(),
         }
     }
 
@@ -627,7 +645,18 @@ impl ExtensionSupervisor {
                     &extension.directory,
                     &extension.settings.granted_capabilities,
                 )?;
-                self.hosts.insert(extension.manifest.id, host);
+                let schedule = extension.manifest.schedule_interval();
+                let extension_id = extension.manifest.id;
+                if let Some(every) = schedule {
+                    self.schedules.insert(
+                        extension_id.clone(),
+                        ScheduledExtension {
+                            every,
+                            due: Instant::now() + every,
+                        },
+                    );
+                }
+                self.hosts.insert(extension_id, host);
             }
         }
         Ok(())
@@ -652,10 +681,28 @@ impl ExtensionSupervisor {
         })
     }
 
+    /// Run every scheduled extension whose interval has elapsed.
+    pub fn tick_schedules(&mut self, now: Instant) -> Result<Vec<ExtensionIntent>> {
+        let due = self
+            .schedules
+            .iter_mut()
+            .filter_map(|(extension_id, schedule)| {
+                if now >= schedule.due {
+                    schedule.due = now + schedule.every;
+                    Some(extension_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        self.request_selected(&due, &HostRequest::Schedule)
+    }
+
     /// Stop every child process. The first shutdown failure is returned after
     /// all remaining children have still been given a shutdown request.
     pub fn shutdown_all(&mut self) -> Result<()> {
         let hosts = std::mem::take(&mut self.hosts);
+        self.schedules.clear();
         let mut first_error = None;
         for (_, host) in hosts {
             if let Err(error) = host.shutdown() {
@@ -666,9 +713,21 @@ impl ExtensionSupervisor {
     }
 
     fn request_all(&mut self, request: HostRequest) -> Result<Vec<ExtensionIntent>> {
+        let extension_ids = self.hosts.keys().cloned().collect::<Vec<_>>();
+        self.request_selected(&extension_ids, &request)
+    }
+
+    fn request_selected(
+        &mut self,
+        extension_ids: &[String],
+        request: &HostRequest,
+    ) -> Result<Vec<ExtensionIntent>> {
         let mut intents = Vec::new();
-        for (extension_id, host) in &mut self.hosts {
-            let messages = host.request(&request)?;
+        for extension_id in extension_ids {
+            let Some(host) = self.hosts.get_mut(extension_id) else {
+                continue;
+            };
+            let messages = host.request(request)?;
             for message in messages {
                 if !matches!(message, HostMessage::Completed { .. }) {
                     intents.push(ExtensionIntent {
@@ -750,6 +809,7 @@ mod tests {
             tier: Tier::Script,
             capabilities: caps,
             entry: "main.rhai".into(),
+            schedule_seconds: None,
         }
     }
 
@@ -887,6 +947,27 @@ mod tests {
             UiNode::Label {
                 text: "Hello".into()
             }
+        );
+    }
+
+    #[test]
+    fn script_runtime_runs_a_schedule_hook() {
+        let host = Arc::new(RecordingApi::default());
+        let api: Arc<dyn ScriptHostApi> = host.clone();
+        let runtime = ScriptRuntime::compile(
+            &manifest(vec![Capability::Notifications]),
+            "fn on_schedule() { notify(\"scheduled\"); }",
+            [Capability::Notifications],
+            api,
+            ScriptLimits::default(),
+        )
+        .expect("script compiles");
+
+        runtime.run_schedule().expect("schedule hook runs");
+
+        assert_eq!(
+            *host.calls.lock().expect("recording API lock is available"),
+            ["notify:scheduled"]
         );
     }
 

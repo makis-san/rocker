@@ -62,6 +62,7 @@ fn run() -> Result<(), String> {
             HostRequest::RenderPanel { context } => runtime
                 .render_panel(&context)
                 .and_then(|node| protocol.emit(&HostMessage::Ui { node })),
+            HostRequest::Schedule => runtime.run_schedule(),
             HostRequest::Shutdown => Ok(()),
         };
         protocol

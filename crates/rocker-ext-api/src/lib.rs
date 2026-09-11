@@ -7,6 +7,7 @@
 //! the WIT world in `wit/world.wit`.
 
 use std::path::{Component, Path};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -76,6 +77,9 @@ pub struct Manifest {
     pub capabilities: Vec<Capability>,
     /// Extension entry point, relative to the extension folder.
     pub entry: String,
+    /// Optional interval for invoking the script's `on_schedule` hook.
+    #[serde(default)]
+    pub schedule_seconds: Option<u64>,
 }
 
 /// A manifest that would let an extension escape its installation directory or
@@ -93,6 +97,9 @@ pub enum ManifestError {
     /// comparisons ambiguous.
     #[error("extension `{id}` declares capability {cap:?} more than once")]
     DuplicateCapability { id: String, cap: Capability },
+    /// Scheduled scripts must wait at least one second between evaluations.
+    #[error("extension `{id}` must use a schedule of at least one second")]
+    InvalidSchedule { id: String },
 }
 
 impl Manifest {
@@ -136,7 +143,18 @@ impl Manifest {
             }
         }
 
+        if self.schedule_seconds == Some(0) {
+            return Err(ManifestError::InvalidSchedule {
+                id: self.id.clone(),
+            });
+        }
+
         Ok(())
+    }
+
+    /// Return the optional recurring script interval.
+    pub fn schedule_interval(&self) -> Option<Duration> {
+        self.schedule_seconds.map(Duration::from_secs)
     }
 }
 
@@ -188,6 +206,7 @@ mod tests {
             tier: Tier::Script,
             capabilities: vec![Capability::ContainersRead],
             entry: "main.rhai".into(),
+            schedule_seconds: None,
         }
     }
 
