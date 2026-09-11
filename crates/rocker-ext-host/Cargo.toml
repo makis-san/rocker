@@ -19,6 +19,7 @@ wasmtime = { version = "41.0.0", default-features = false, features = ["componen
 base64 = "0.23.1"
 ed25519-dalek = "3.0.0"
 sha2 = "0.11.0"
+semver = "1.0.28"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ureq = "3"
 

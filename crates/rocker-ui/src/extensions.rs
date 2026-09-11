@@ -18,6 +18,7 @@
 //! still being extended (PLAN §10, Phase 5) — so it's exercised here by tests
 //! against hand-built trees rather than a live panel on screen.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +26,8 @@ use egui::{vec2, Align, Layout, RichText, Sense, Stroke};
 
 use rocker_ext_api::{Capability, Tier, UiEvent, UiNode};
 use rocker_ext_host::{
-    Discovery, ExtensionRegistry, HostError, HttpTransport, InstalledExtension, RegistryClient,
-    RegistryIndex, RegistryRelease, TrustedRegistry,
+    compare_versions, Discovery, ExtensionRegistry, HostError, HttpTransport, InstalledExtension,
+    RegistryClient, RegistryIndex, RegistryRelease, TrustedRegistry,
 };
 use rocker_store::{AppPaths, ExtensionRegistrySource};
 use rocker_theme::Theme;
@@ -564,7 +565,19 @@ fn catalog_section(
                 None,
                 Vec::new(),
             ),
-            CatalogState::Loaded(index) => (String::new(), false, None, index.releases.clone()),
+            CatalogState::Loaded(index) => (
+                String::new(),
+                false,
+                None,
+                // One card per extension ID — its newest available version —
+                // rather than one per release, so a catalog with a long
+                // version history doesn't repeat the same extension.
+                index
+                    .latest_releases()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
             CatalogState::Failed(message) => {
                 (String::new(), false, Some(message.clone()), Vec::new())
             }
@@ -603,10 +616,38 @@ fn catalog_section(
     }
 }
 
+/// What a release card offers, relative to the version already on disk (if
+/// any). Never a downgrade: an installed extension only ever moves forward.
+enum ReleaseAction {
+    /// Not installed at all yet.
+    Install,
+    /// Installed, and this catalog version is strictly newer.
+    Update,
+    /// Installed, and this is the version on disk.
+    UpToDate,
+    /// Installed with a version newer than the catalog's (a local/dev
+    /// override), or a version that can't be compared as semver — either way,
+    /// nothing here is offered to overwrite it.
+    Newer,
+}
+
+fn release_action(installed_version: Option<&str>, release_version: &str) -> ReleaseAction {
+    match installed_version {
+        None => ReleaseAction::Install,
+        Some(installed) => match compare_versions(release_version, installed) {
+            Some(Ordering::Greater) => ReleaseAction::Update,
+            Some(Ordering::Equal) => ReleaseAction::UpToDate,
+            Some(Ordering::Less) | None => ReleaseAction::Newer,
+        },
+    }
+}
+
 /// One release from a fetched catalog: its id, version, and either an
-/// Install button, an in-progress/finished status, or an inline install
-/// error — never a button that looks live but can't respond (anti-slop:
-/// dead controls).
+/// Install/Update button, an in-progress/finished status, or an inline
+/// install error — never a button that looks live but can't respond
+/// (anti-slop: dead controls). The catalog only ever hands this the newest
+/// release per extension ID (see [`RegistryIndex::latest_releases`]), so this
+/// card's only job is comparing that one version against what's installed.
 fn release_card(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -614,11 +655,13 @@ fn release_card(
     source: &ExtensionRegistrySource,
     release: &RegistryRelease,
 ) {
-    let already_installed = screen
+    let installed_version = screen
         .discovery
         .extensions
         .iter()
-        .any(|ext| ext.manifest.id == release.id);
+        .find(|ext| ext.manifest.id == release.id)
+        .map(|ext| ext.manifest.version.clone());
+    let action = release_action(installed_version.as_deref(), &release.version);
     let key = format!("{}::{}@{}", source.id, release.id, release.version);
     let state = screen
         .installs
@@ -631,7 +674,12 @@ fn release_card(
         match &*guard {
             InstallState::Idle => (None, None),
             InstallState::Installing | InstallState::Downloaded { .. } => {
-                (Some("Installing…"), None)
+                let verb = if matches!(action, ReleaseAction::Update) {
+                    "Updating…"
+                } else {
+                    "Installing…"
+                };
+                (Some(verb), None)
             }
             InstallState::Installed => (Some("Installed"), None),
             InstallState::Failed(message) => (None, Some(message.clone())),
@@ -657,6 +705,15 @@ fn release_card(
                                 .color(pal.text_faint),
                         );
                     });
+                    if let Some(installed) = &installed_version {
+                        if matches!(action, ReleaseAction::Update | ReleaseAction::Newer) {
+                            ui.label(
+                                RichText::new(format!("Installed: v{installed}"))
+                                    .small()
+                                    .color(pal.text_muted),
+                            );
+                        }
+                    }
                     if let Some(min) = &release.min_rocker_version {
                         ui.label(
                             RichText::new(format!("Requires Rocker {min}+"))
@@ -666,20 +723,54 @@ fn release_card(
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if already_installed {
-                        ui.label(RichText::new("Installed").small().color(pal.text_faint));
-                    } else if let Some(label) = status {
+                    if let Some(label) = status {
                         ui.label(RichText::new(label).small().color(pal.text_faint));
-                    } else if icons::text_button(ui, pal, "Install").clicked() {
-                        spawn_install(ui.ctx(), source.clone(), release.clone(), state.clone());
+                    } else {
+                        match action {
+                            ReleaseAction::UpToDate => {
+                                ui.label(RichText::new("Installed").small().color(pal.text_faint));
+                            }
+                            ReleaseAction::Newer => {
+                                ui.label(
+                                    RichText::new("Installed (newer)")
+                                        .small()
+                                        .color(pal.text_faint),
+                                );
+                            }
+                            ReleaseAction::Install => {
+                                if icons::text_button(ui, pal, "Install").clicked() {
+                                    spawn_install(
+                                        ui.ctx(),
+                                        source.clone(),
+                                        release.clone(),
+                                        state.clone(),
+                                    );
+                                }
+                            }
+                            ReleaseAction::Update => {
+                                if icons::text_button(ui, pal, "Update").clicked() {
+                                    spawn_install(
+                                        ui.ctx(),
+                                        source.clone(),
+                                        release.clone(),
+                                        state.clone(),
+                                    );
+                                }
+                            }
+                        }
                     }
                 });
             });
-            if !already_installed {
+            if matches!(action, ReleaseAction::Install | ReleaseAction::Update) {
                 if let Some(message) = &failure {
                     ui.add_space(4.0);
+                    let verb = if matches!(action, ReleaseAction::Update) {
+                        "Update"
+                    } else {
+                        "Install"
+                    };
                     ui.label(
-                        RichText::new(format!("Install failed: {message}"))
+                        RichText::new(format!("{verb} failed: {message}"))
                             .small()
                             .color(pal.unhealthy),
                     );
@@ -1474,21 +1565,33 @@ mod tests {
     }
 
     /// The Browse tab, with one registry's catalog already fetched: a release
-    /// already installed locally, and one that isn't yet. Lays out at a few
-    /// widths with no pointer input, the same no-panic convention as every
-    /// other screen test here — the release list and Install buttons are new
-    /// code this exercises that the other tests never touch.
+    /// already installed locally, one that isn't yet, and one installed at
+    /// an older version with two releases in the catalog — the dedupe-to-
+    /// latest-version and Update-button code paths this exercises that the
+    /// other tests never touch. Lays out at a few widths with no pointer
+    /// input, the same no-panic convention as every other screen test here.
     #[test]
     fn browse_tab_with_a_loaded_catalog_lays_out_without_panic() {
         let ctx = egui::Context::default();
         let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
 
         let mut screen = screen_with(
-            vec![InstalledExtension {
-                manifest: manifest("already.installed", vec![]),
-                directory: std::path::PathBuf::from("/nonexistent/already.installed"),
-                settings: ExtensionSettings::default(),
-            }],
+            vec![
+                InstalledExtension {
+                    manifest: manifest("already.installed", vec![]),
+                    directory: std::path::PathBuf::from("/nonexistent/already.installed"),
+                    settings: ExtensionSettings::default(),
+                },
+                InstalledExtension {
+                    manifest: {
+                        let mut m = manifest("updatable.extension", vec![]);
+                        m.version = "1.0.0".into();
+                        m
+                    },
+                    directory: std::path::PathBuf::from("/nonexistent/updatable.extension"),
+                    settings: ExtensionSettings::default(),
+                },
+            ],
             vec![],
         );
         screen.tab = ExtensionsTab::Browse;
@@ -1500,6 +1603,8 @@ mod tests {
                 releases: vec![
                     release("already.installed", "1.0.0", None),
                     release("not.installed", "2.0.0", Some("0.2.0")),
+                    release("updatable.extension", "1.0.0", None),
+                    release("updatable.extension", "2.0.0", None),
                 ],
             }))),
         );
@@ -1599,6 +1704,31 @@ mod tests {
         let mut screen = screen_with(vec![], vec![]);
         screen.finish_pending_installs();
         assert!(screen.discovery.extensions.is_empty());
+    }
+
+    #[test]
+    fn release_action_never_offers_a_downgrade() {
+        assert!(matches!(
+            release_action(None, "1.0.0"),
+            ReleaseAction::Install
+        ));
+        assert!(matches!(
+            release_action(Some("1.0.0"), "2.0.0"),
+            ReleaseAction::Update
+        ));
+        assert!(matches!(
+            release_action(Some("1.0.0"), "1.0.0"),
+            ReleaseAction::UpToDate
+        ));
+        assert!(matches!(
+            release_action(Some("2.0.0"), "1.0.0"),
+            ReleaseAction::Newer
+        ));
+        // Versions that don't parse as semver are never assumed newer.
+        assert!(matches!(
+            release_action(Some("weird"), "1.0.0"),
+            ReleaseAction::Newer
+        ));
     }
 
     #[test]

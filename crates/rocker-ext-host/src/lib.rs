@@ -13,9 +13,9 @@ pub use component::{
     ComponentContainer, ComponentHostApi, ComponentLimits, ComponentRuntime, ToastLevel,
 };
 pub use registry::{
-    official_registry, HttpTransport, RegistryClient, RegistryIndex, RegistryRelease,
-    RegistryTransport, TrustedRegistry, OFFICIAL_REGISTRY_ID, OFFICIAL_REGISTRY_INDEX_URL,
-    OFFICIAL_REGISTRY_PUBLIC_KEY, OFFICIAL_REGISTRY_SIGNATURE_URL,
+    compare_versions, official_registry, HttpTransport, RegistryClient, RegistryIndex,
+    RegistryRelease, RegistryTransport, TrustedRegistry, OFFICIAL_REGISTRY_ID,
+    OFFICIAL_REGISTRY_INDEX_URL, OFFICIAL_REGISTRY_PUBLIC_KEY, OFFICIAL_REGISTRY_SIGNATURE_URL,
 };
 
 use std::{
@@ -53,6 +53,14 @@ pub enum HostError {
     Io(#[from] std::io::Error),
     #[error("extension `{0}` is already installed")]
     AlreadyInstalled(String),
+    #[error(
+        "extension `{id}` v{installed} is already installed; `{requested}` is not a newer version"
+    )]
+    Downgrade {
+        id: String,
+        installed: String,
+        requested: String,
+    },
     #[error("extension source contains a symbolic link: {0}")]
     SymbolicLink(PathBuf),
     #[error("registry metadata is invalid: {0}")]
@@ -402,7 +410,7 @@ impl ExtensionRegistry {
         let cleanup_path = staging.clone();
         let install = (|| {
             copy_extension_dir(&source, &staging)?;
-            self.activate_staged_install(manifest, staging)
+            self.activate_staged_install(manifest, staging, false)
         })();
         if install.is_err() {
             let _ = fs::remove_dir_all(cleanup_path);
@@ -414,7 +422,14 @@ impl ExtensionRegistry {
     ///
     /// The archive is verified and extracted into a new directory before an
     /// atomic rename makes it discoverable. Registry packages never inherit
-    /// local permissions; the new extension starts disabled with no grants.
+    /// local permissions; a fresh install starts disabled with no grants.
+    ///
+    /// If the extension is already installed, this is an *update*: the
+    /// release's version must be strictly newer (by semver) than what's on
+    /// disk, or the install is refused rather than silently overwriting an
+    /// equal or older version. An update replaces the extension's files in
+    /// place but leaves its enabled/dev-mode/capability settings untouched,
+    /// since those are the user's decisions, not the package's.
     pub fn install_registry_package(
         &mut self,
         registry: &TrustedRegistry,
@@ -422,6 +437,25 @@ impl ExtensionRegistry {
         package: &[u8],
     ) -> Result<InstalledExtension> {
         release.verify_package(package, registry.verifying_key())?;
+        if let Some(installed) = self.installed_version(&release.id)? {
+            match registry::compare_versions(&release.version, &installed) {
+                Some(std::cmp::Ordering::Greater) => {}
+                Some(_) => {
+                    return Err(HostError::Downgrade {
+                        id: release.id.clone(),
+                        installed,
+                        requested: release.version.clone(),
+                    })
+                }
+                None => {
+                    return Err(HostError::Registry(format!(
+                        "cannot compare installed version {installed} to {} for `{}`; refusing to overwrite",
+                        release.version, release.id
+                    )))
+                }
+            }
+        }
+
         let staging = self.create_staging_dir(&release.id)?;
         let cleanup_path = staging.clone();
         let install = (|| {
@@ -433,7 +467,7 @@ impl ExtensionRegistry {
                     version: release.version.clone(),
                 });
             }
-            let installed = self.activate_staged_install(manifest, staging)?;
+            let installed = self.activate_staged_install(manifest, staging, true)?;
             self.state.provenance.insert(
                 release.id.clone(),
                 RegistryProvenance {
@@ -448,6 +482,18 @@ impl ExtensionRegistry {
             let _ = fs::remove_dir_all(cleanup_path);
         }
         install
+    }
+
+    /// The version currently installed under `id`, or `None` if it isn't
+    /// installed at all. Reads the on-disk manifest directly rather than the
+    /// last `discover()` pass, since an update decision must never be made
+    /// against a stale snapshot.
+    fn installed_version(&self, id: &str) -> Result<Option<String>> {
+        let destination = self.root.join(id);
+        if !destination.exists() {
+            return Ok(None);
+        }
+        Ok(Some(read_manifest(&destination)?.version))
     }
 
     /// Return the verified registry origin recorded for an installed extension.
@@ -538,14 +584,26 @@ impl ExtensionRegistry {
         self.root.join(".staging")
     }
 
+    /// Rename a staged extension into place. When `replace` is `false` (a
+    /// local `install_from_dir`), an existing directory is left untouched and
+    /// reported as [`HostError::AlreadyInstalled`]. When `true` (a registry
+    /// update, already version-checked by the caller), the previous files are
+    /// removed first so the rename lands cleanly — settings survive because
+    /// they live in `self.state`, keyed by ID, never inside the extension's
+    /// own directory.
     fn activate_staged_install(
         &mut self,
         manifest: Manifest,
         staging: PathBuf,
+        replace: bool,
     ) -> Result<InstalledExtension> {
         let destination = self.root.join(&manifest.id);
         if destination.exists() {
-            return Err(HostError::AlreadyInstalled(manifest.id));
+            if replace {
+                fs::remove_dir_all(&destination)?;
+            } else {
+                return Err(HostError::AlreadyInstalled(manifest.id));
+            }
         }
         fs::rename(staging, &destination)?;
         let settings = self

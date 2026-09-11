@@ -3954,6 +3954,7 @@ dependencies = [
  "ed25519-dalek",
  "rhai",
  "rocker-ext-api",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

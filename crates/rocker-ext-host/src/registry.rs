@@ -5,7 +5,8 @@
 //! registry's pinned Ed25519 key before `ExtensionRegistry` extracts anything.
 
 use std::{
-    collections::BTreeSet,
+    cmp::Ordering,
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
     fs,
     io::{Cursor, Read as _},
     path::{Component, Path, PathBuf},
@@ -149,6 +150,34 @@ impl RegistryIndex {
         id: &'a str,
     ) -> impl Iterator<Item = &'a RegistryRelease> + 'a {
         self.releases.iter().filter(move |release| release.id == id)
+    }
+
+    /// One release per extension ID: the newest available version. A browse
+    /// UI lists these instead of every version in the index, so a catalog
+    /// with a long release history doesn't show the same extension five
+    /// times over. Sorted by ID for a stable render order.
+    ///
+    /// When two releases for the same ID can't be compared (either version
+    /// isn't valid semver), the one already recorded wins — the catalog
+    /// author's own index order, the same tie-break `releases_for` already
+    /// promises as "newest-first".
+    pub fn latest_releases(&self) -> Vec<&RegistryRelease> {
+        let mut latest: BTreeMap<&str, &RegistryRelease> = BTreeMap::new();
+        for release in &self.releases {
+            match latest.entry(release.id.as_str()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(release);
+                }
+                Entry::Occupied(mut slot) => {
+                    if compare_versions(&release.version, &slot.get().version)
+                        == Some(Ordering::Greater)
+                    {
+                        slot.insert(release);
+                    }
+                }
+            }
+        }
+        latest.into_values().collect()
     }
 
     fn validate(&self) -> Result<()> {
@@ -362,6 +391,18 @@ pub(crate) fn extract_package(package: &[u8], destination: &Path) -> Result<()> 
     Ok(())
 }
 
+/// Order two version strings by semantic-versioning rules.
+///
+/// Returns `None` when either side isn't valid semver rather than falling
+/// back to a lexicographic guess — a comparison that decides whether an
+/// install proceeds or is refused as a downgrade must never be a plausible
+/// guess dressed up as an answer.
+pub fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
+    let a = semver::Version::parse(a).ok()?;
+    let b = semver::Version::parse(b).ok()?;
+    Some(a.cmp(&b))
+}
+
 fn verify_signature(
     bytes: &[u8],
     signature_base64: &str,
@@ -471,6 +512,50 @@ mod tests {
         }
     }
 
+    /// Same shape as [`release`], but at an explicit version, for exercising
+    /// the update/downgrade path across two different packages of the same
+    /// extension ID.
+    fn release_version(package: &[u8], version: &str) -> RegistryRelease {
+        let mut release = release(package);
+        release.version = version.to_string();
+        release
+    }
+
+    /// A minimal `example.summary` script package at `version`, so update
+    /// tests can install two different, independently-signed versions of the
+    /// same extension ID.
+    fn versioned_package(version: &str) -> Vec<u8> {
+        archive(&[
+            (
+                "extension.toml",
+                &format!(
+                    r#"
+                        id = "example.summary"
+                        name = "Summary"
+                        version = "{version}"
+                        tier = "script"
+                        entry = "main.rhai"
+                    "#
+                ),
+            ),
+            ("main.rhai", "fn activate() {}"),
+        ])
+    }
+
+    /// A [`RegistryRelease`] with no real signature — only valid for tests
+    /// exercising [`RegistryIndex::latest_releases`], which groups and orders
+    /// releases without touching cryptographic verification.
+    fn unsigned_release(id: &str, version: &str) -> RegistryRelease {
+        RegistryRelease {
+            id: id.into(),
+            version: version.into(),
+            package_url: format!("https://registry.example/{id}.rockerext"),
+            sha256: "0".repeat(64),
+            signature: "unused".into(),
+            min_rocker_version: None,
+        }
+    }
+
     fn archive(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
         {
@@ -525,6 +610,115 @@ mod tests {
             extract_package(&package, destination.path()).expect_err("traversal is rejected");
 
         assert!(matches!(error, HostError::UnsafeArchiveEntry(_)));
+    }
+
+    fn trusted_test_registry() -> TrustedRegistry {
+        TrustedRegistry::new(
+            "official",
+            "https://registry.example/index-v1.json",
+            "https://registry.example/index-v1.sig",
+            signing_key().verifying_key().to_bytes(),
+        )
+        .expect("trusted registry is valid")
+    }
+
+    #[test]
+    fn registry_update_installs_a_strictly_newer_version_and_keeps_settings() {
+        let trusted = trusted_test_registry();
+        let mut registry =
+            crate::ExtensionRegistry::load(tempdir().expect("install root exists").keep())
+                .expect("extension registry loads");
+
+        let v1 = versioned_package("1.0.0");
+        registry
+            .install_registry_package(&trusted, &release_version(&v1, "1.0.0"), &v1)
+            .expect("first install succeeds");
+        registry
+            .set_settings(
+                "example.summary".into(),
+                crate::ExtensionSettings {
+                    enabled: true,
+                    dev_mode: false,
+                    granted_capabilities: Vec::new(),
+                },
+            )
+            .expect("settings save");
+
+        let v2 = versioned_package("2.0.0");
+        let installed = registry
+            .install_registry_package(&trusted, &release_version(&v2, "2.0.0"), &v2)
+            .expect("a strictly newer version installs over the old one");
+
+        assert_eq!(installed.manifest.version, "2.0.0");
+        assert!(
+            installed.settings.enabled,
+            "an update must not reset the user's enabled setting"
+        );
+        assert_eq!(
+            registry
+                .provenance("example.summary")
+                .map(|origin| origin.package_sha256.clone()),
+            Some(sha256_hex(&v2))
+        );
+    }
+
+    #[test]
+    fn registry_update_refuses_a_downgrade_or_repeated_version() {
+        let trusted = trusted_test_registry();
+        let mut registry =
+            crate::ExtensionRegistry::load(tempdir().expect("install root exists").keep())
+                .expect("extension registry loads");
+
+        let v2 = versioned_package("2.0.0");
+        registry
+            .install_registry_package(&trusted, &release_version(&v2, "2.0.0"), &v2)
+            .expect("initial install succeeds");
+
+        let same_version =
+            registry.install_registry_package(&trusted, &release_version(&v2, "2.0.0"), &v2);
+        assert!(matches!(same_version, Err(HostError::Downgrade { .. })));
+
+        let v1 = versioned_package("1.0.0");
+        let older_version =
+            registry.install_registry_package(&trusted, &release_version(&v1, "1.0.0"), &v1);
+        assert!(matches!(older_version, Err(HostError::Downgrade { .. })));
+
+        // The refused installs must not have touched the extension on disk.
+        let discovery = registry.discover().expect("discovery succeeds");
+        assert_eq!(discovery.extensions.len(), 1);
+        assert_eq!(discovery.extensions[0].manifest.version, "2.0.0");
+    }
+
+    #[test]
+    fn compare_versions_orders_semver_and_refuses_to_guess_at_the_rest() {
+        assert_eq!(compare_versions("1.0.0", "2.0.0"), Some(Ordering::Less));
+        assert_eq!(compare_versions("2.0.0", "2.0.0"), Some(Ordering::Equal));
+        assert_eq!(compare_versions("2.1.0", "2.0.9"), Some(Ordering::Greater));
+        assert_eq!(compare_versions("not-a-version", "1.0.0"), None);
+    }
+
+    #[test]
+    fn latest_releases_keeps_only_the_newest_version_per_id() {
+        let index = RegistryIndex {
+            format: 1,
+            releases: vec![
+                unsigned_release("a.ext", "1.0.0"),
+                unsigned_release("a.ext", "2.0.0"),
+                unsigned_release("b.ext", "0.5.0"),
+            ],
+        };
+
+        let latest = index.latest_releases();
+
+        assert_eq!(latest.len(), 2);
+        assert_eq!(
+            (latest[0].id.as_str(), latest[0].version.as_str()),
+            ("a.ext", "2.0.0")
+        );
+        assert_eq!(
+            (latest[1].id.as_str(), latest[1].version.as_str()),
+            ("b.ext", "0.5.0")
+        );
     }
 
     #[test]
