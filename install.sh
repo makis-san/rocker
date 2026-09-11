@@ -1,7 +1,7 @@
 #!/bin/sh
 # Rocker installer — downloads the latest release, verifies it, and runs
 # `rocker install` so you get the binary on PATH plus a real app-menu entry,
-# icon, and docker:// URL handler. Works on Linux, any distro/desktop.
+# icon, and docker:// URL handler. Works on Linux and macOS.
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/makis-san/rocker/main/install.sh | sh
 #
@@ -47,7 +47,7 @@ fi
 os="$(uname -s)"; arch="$(uname -m)"
 case "$os" in
 	Linux)  vendor_os="unknown-linux-gnu"; ext="tar.xz" ;;
-	Darwin) die "macOS isn't packaged yet — build from source (see the README) or use Homebrew" ;;
+	Darwin) vendor_os="apple-darwin"; ext="tar.xz" ;;
 	*) die "unsupported OS: $os (Windows: use install.ps1)" ;;
 esac
 case "$arch" in

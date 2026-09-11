@@ -17,6 +17,8 @@ and this project adheres to
 - Signed extension registry installation and Browse-tab discovery.
 - Catppuccin theme extensions in all four flavors: Latte, Frappé, Macchiato,
   and Mocha.
+- macOS release archives for Intel and Apple Silicon, with the shell installer
+  creating the native `Rocker.app` bundle and Launchpad integration.
 
 ### Changed
 
