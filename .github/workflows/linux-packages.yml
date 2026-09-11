@@ -43,8 +43,8 @@ jobs:
         shell: bash
         run: |
           tag="$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/tags" \
-            --jq '.[].name' \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" \
+            --jq '.[] | select(.object.sha == env.RELEASE_SHA) | .ref | sub("^refs/tags/"; "")' \
             | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$' \
             | head -1)"
           test -n "$tag"
