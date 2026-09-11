@@ -27,3 +27,9 @@ install-updater = false
 tap = "makis-san/homebrew-tap"
 # Push the Homebrew formula on every stable release
 publish-jobs = ["homebrew"]
+# GTK/libappindicator are required by the default tray feature on Linux.
+[dist.dependencies.apt]
+libxkbcommon-dev = "*"
+libwayland-dev = "*"
+libgtk-3-dev = "*"
+libayatana-appindicator3-dev = "*"
