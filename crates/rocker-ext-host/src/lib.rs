@@ -6,6 +6,12 @@
 //! `wasmtime` + Component Model runtime (Phase 5b) attach behind
 //! [`ExtensionRuntime`].
 
+mod component;
+
+pub use component::{
+    ComponentContainer, ComponentHostApi, ComponentLimits, ComponentRuntime, ToastLevel,
+};
+
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
