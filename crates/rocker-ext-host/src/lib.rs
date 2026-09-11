@@ -13,8 +13,8 @@ pub use component::{
     ComponentContainer, ComponentHostApi, ComponentLimits, ComponentRuntime, ToastLevel,
 };
 pub use registry::{
-    official_registry, RegistryClient, RegistryIndex, RegistryRelease, RegistryTransport,
-    TrustedRegistry, OFFICIAL_REGISTRY_ID, OFFICIAL_REGISTRY_INDEX_URL,
+    official_registry, HttpTransport, RegistryClient, RegistryIndex, RegistryRelease,
+    RegistryTransport, TrustedRegistry, OFFICIAL_REGISTRY_ID, OFFICIAL_REGISTRY_INDEX_URL,
     OFFICIAL_REGISTRY_PUBLIC_KEY, OFFICIAL_REGISTRY_SIGNATURE_URL,
 };
 

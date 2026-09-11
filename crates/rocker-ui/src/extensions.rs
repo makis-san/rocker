@@ -18,11 +18,15 @@
 //! still being extended (PLAN §10, Phase 5) — so it's exercised here by tests
 //! against hand-built trees rather than a live panel on screen.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use egui::{vec2, Align, Layout, RichText, Sense, Stroke};
 
 use rocker_ext_api::{Capability, Tier, UiEvent, UiNode};
 use rocker_ext_host::{
-    Discovery, ExtensionRegistry, HostError, InstalledExtension, TrustedRegistry,
+    Discovery, ExtensionRegistry, HostError, HttpTransport, InstalledExtension, RegistryClient,
+    RegistryIndex, RegistryRelease, TrustedRegistry,
 };
 use rocker_store::{AppPaths, ExtensionRegistrySource};
 use rocker_theme::Theme;
@@ -47,6 +51,43 @@ pub struct ExtensionsScreen {
     discovery: Discovery,
     registry_draft: RegistryDraft,
     tab: ExtensionsTab,
+    /// One catalog fetch per trusted registry, keyed by the registry's own
+    /// id. A background thread owns the `Arc<Mutex<_>>` while it fetches;
+    /// the UI thread only ever holds the lock briefly to read or replace it.
+    catalogs: HashMap<String, Arc<Mutex<CatalogState>>>,
+    /// One install in flight (or finished) per `registry-id::release-id@version`.
+    installs: HashMap<String, Arc<Mutex<InstallState>>>,
+}
+
+/// Where one registry's catalog fetch currently stands.
+enum CatalogState {
+    Idle,
+    Fetching,
+    Loaded(RegistryIndex),
+    Failed(String),
+}
+
+/// Where one release's install currently stands. A background thread only
+/// ever downloads and verifies the package (network + crypto, both safe off
+/// the UI thread); the final `Downloaded -> Installed` step runs on the UI
+/// thread each frame in [`finish_pending_installs`], since that's the one
+/// place holding the on-disk `ExtensionRegistry`.
+enum InstallState {
+    Idle,
+    Installing,
+    Downloaded(Box<DownloadedRelease>),
+    Installed,
+    Failed(String),
+}
+
+/// The verified bytes of one release, waiting for
+/// [`ExtensionsScreen::finish_pending_installs`] to write them to disk.
+/// Boxed inside [`InstallState::Downloaded`] so the common, tiny variants
+/// (`Idle`, `Installing`) don't all pay for this one's size.
+struct DownloadedRelease {
+    source: ExtensionRegistrySource,
+    release: RegistryRelease,
+    package: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -92,6 +133,8 @@ impl ExtensionsScreen {
                     discovery,
                     registry_draft: RegistryDraft::default(),
                     tab: ExtensionsTab::Installed,
+                    catalogs: HashMap::new(),
+                    installs: HashMap::new(),
                 }
             }
             Err(err) => {
@@ -101,6 +144,8 @@ impl ExtensionsScreen {
                     discovery: Discovery::default(),
                     registry_draft: RegistryDraft::default(),
                     tab: ExtensionsTab::Installed,
+                    catalogs: HashMap::new(),
+                    installs: HashMap::new(),
                 }
             }
         }
@@ -124,6 +169,146 @@ impl ExtensionsScreen {
     /// this whole screen.
     pub fn discovery(&self) -> &Discovery {
         &self.discovery
+    }
+
+    /// Finish any install whose background download completed since the last
+    /// frame: verify-and-extract onto disk through the real `ExtensionRegistry`
+    /// (the one part of an install that isn't safe to background, since it's
+    /// the only place holding that on-disk state), then re-discover so a
+    /// freshly installed extension appears in the Installed tab immediately.
+    /// Cheap to call every frame — it's a no-op unless a download just landed.
+    fn finish_pending_installs(&mut self) {
+        let pending: Vec<(String, ExtensionRegistrySource, RegistryRelease, Vec<u8>)> = self
+            .installs
+            .iter()
+            .filter_map(|(key, state)| {
+                let mut guard = state.lock().unwrap();
+                if !matches!(&*guard, InstallState::Downloaded { .. }) {
+                    return None;
+                }
+                match std::mem::replace(&mut *guard, InstallState::Installing) {
+                    InstallState::Downloaded(downloaded) => {
+                        let DownloadedRelease {
+                            source,
+                            release,
+                            package,
+                        } = *downloaded;
+                        Some((key.clone(), source, release, package))
+                    }
+                    _ => unreachable!("just matched Downloaded above"),
+                }
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut results = Vec::with_capacity(pending.len());
+        let mut any_installed = false;
+        match &mut self.registry {
+            Ok(registry) => {
+                for (key, source, release, package) in &pending {
+                    let outcome = trusted_registry(source).and_then(|trusted| {
+                        registry.install_registry_package(&trusted, release, package)
+                    });
+                    any_installed |= outcome.is_ok();
+                    results.push((key.clone(), outcome.map(|_| ()).map_err(|e| e.to_string())));
+                }
+                if any_installed {
+                    self.discovery = registry.discover().unwrap_or_else(|err| {
+                        tracing::warn!(%err, "extension discovery failed");
+                        Discovery::default()
+                    });
+                }
+            }
+            Err(message) => {
+                for (key, ..) in &pending {
+                    results.push((key.clone(), Err(message.clone())));
+                }
+            }
+        }
+
+        for (key, result) in results {
+            if let Some(state) = self.installs.get(&key) {
+                *state.lock().unwrap() = match result {
+                    Ok(()) => InstallState::Installed,
+                    Err(err) => InstallState::Failed(err),
+                };
+            }
+        }
+    }
+}
+
+/// Build the pinned trust root for one configured registry source, the same
+/// way the "Add registry" form validates a draft before saving it.
+fn trusted_registry(source: &ExtensionRegistrySource) -> Result<TrustedRegistry, HostError> {
+    let key = decode_public_key(&source.public_key).map_err(HostError::Registry)?;
+    TrustedRegistry::new(&source.id, &source.index_url, &source.signature_url, key)
+}
+
+/// Kick off a background fetch of one registry's signed catalog. The thread
+/// only ever writes into `state` and wakes the UI to re-check it — no
+/// `egui::Ui` access off the UI thread, mirroring the tray heartbeat thread
+/// in `app.rs`.
+fn spawn_catalog_fetch(
+    ctx: &egui::Context,
+    source: ExtensionRegistrySource,
+    state: Arc<Mutex<CatalogState>>,
+) {
+    *state.lock().unwrap() = CatalogState::Fetching;
+    let ctx = ctx.clone();
+    let worker_state = state.clone();
+    let spawned = std::thread::Builder::new()
+        .name("rocker-registry-fetch".into())
+        .spawn(move || {
+            let outcome = trusted_registry(&source)
+                .and_then(|trusted| RegistryClient::new(trusted, HttpTransport).fetch_index());
+            *worker_state.lock().unwrap() = match outcome {
+                Ok(index) => CatalogState::Loaded(index),
+                Err(err) => CatalogState::Failed(err.to_string()),
+            };
+            ctx.request_repaint();
+        });
+    if spawned.is_err() {
+        // Could not even start the thread (exhausted OS resources) — leave a
+        // clear failure rather than a "Fetching…" label that never resolves.
+        *state.lock().unwrap() =
+            CatalogState::Failed("couldn't start a background fetch".to_string());
+    }
+}
+
+/// Kick off a background download-and-verify of one release. Only the
+/// network fetch and cryptographic verification happen here; the actual
+/// install onto disk happens on the UI thread in
+/// [`ExtensionsScreen::finish_pending_installs`].
+fn spawn_install(
+    ctx: &egui::Context,
+    source: ExtensionRegistrySource,
+    release: RegistryRelease,
+    state: Arc<Mutex<InstallState>>,
+) {
+    *state.lock().unwrap() = InstallState::Installing;
+    let ctx = ctx.clone();
+    let worker_state = state.clone();
+    let spawned = std::thread::Builder::new()
+        .name("rocker-registry-install".into())
+        .spawn(move || {
+            let outcome = trusted_registry(&source).and_then(|trusted| {
+                RegistryClient::new(trusted, HttpTransport).download_package(&release)
+            });
+            *worker_state.lock().unwrap() = match outcome {
+                Ok(package) => InstallState::Downloaded(Box::new(DownloadedRelease {
+                    source,
+                    release,
+                    package,
+                })),
+                Err(err) => InstallState::Failed(err.to_string()),
+            };
+            ctx.request_repaint();
+        });
+    if spawned.is_err() {
+        *state.lock().unwrap() =
+            InstallState::Failed("couldn't start a background download".to_string());
     }
 }
 
@@ -204,6 +389,10 @@ pub fn extensions_screen(
     let mut registries_changed = false;
     let mut error = None;
 
+    // Independent of which tab is showing, so an install kicked off from
+    // Browse still lands even if the user has since switched to Installed.
+    screen.finish_pending_installs();
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -231,7 +420,9 @@ pub fn extensions_screen(
                         ExtensionsTab::Installed => {
                             installed_extensions_section(ui, pal, screen, &mut changed, &mut error)
                         }
-                        ExtensionsTab::Browse => browse_extensions_section(ui, pal, registries),
+                        ExtensionsTab::Browse => {
+                            browse_extensions_section(ui, pal, screen, registries)
+                        }
                         ExtensionsTab::Registries => {
                             if registry_sources_section(
                                 ui,
@@ -324,6 +515,7 @@ fn installed_extensions_section(
 fn browse_extensions_section(
     ui: &mut egui::Ui,
     pal: &Palette,
+    screen: &mut ExtensionsScreen,
     registries: &[ExtensionRegistrySource],
 ) {
     ui.label(RichText::new("Browse extensions").strong().color(pal.text));
@@ -335,7 +527,165 @@ fn browse_extensions_section(
     for source in registries {
         registry_catalog_card(ui, pal, source, false);
         ui.add_space(6.0);
+        catalog_section(ui, pal, screen, source);
+        ui.add_space(14.0);
     }
+}
+
+/// One trusted registry's fetched catalog: a fetch/refresh control and
+/// status line, then every release it advertises with an Install button.
+/// Nothing is fetched until the user asks — a signed catalog still means a
+/// network call, and this app doesn't make one without the user's say-so.
+fn catalog_section(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    screen: &mut ExtensionsScreen,
+    source: &ExtensionRegistrySource,
+) {
+    let cat_state = screen
+        .catalogs
+        .entry(source.id.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(CatalogState::Idle)))
+        .clone();
+
+    let (status_text, fetching, failure, releases): (
+        String,
+        bool,
+        Option<String>,
+        Vec<RegistryRelease>,
+    ) = {
+        let guard = cat_state.lock().unwrap();
+        match &*guard {
+            CatalogState::Idle => ("Not fetched yet.".to_string(), false, None, Vec::new()),
+            CatalogState::Fetching => ("Fetching…".to_string(), true, None, Vec::new()),
+            CatalogState::Loaded(index) if index.releases.is_empty() => (
+                "No extensions published yet.".to_string(),
+                false,
+                None,
+                Vec::new(),
+            ),
+            CatalogState::Loaded(index) => (String::new(), false, None, index.releases.clone()),
+            CatalogState::Failed(message) => {
+                (String::new(), false, Some(message.clone()), Vec::new())
+            }
+        }
+    };
+
+    ui.horizontal(|ui| {
+        if !status_text.is_empty() {
+            ui.label(RichText::new(status_text).small().color(pal.text_faint));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let label = if fetching {
+                "Fetching…"
+            } else {
+                "Fetch catalog"
+            };
+            if icons::icon_button_enabled(ui, pal, Icon::Refresh, None, label, !fetching).clicked()
+            {
+                spawn_catalog_fetch(ui.ctx(), source.clone(), cat_state.clone());
+            }
+        });
+    });
+
+    if let Some(message) = failure {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("Couldn't fetch this catalog: {message}"))
+                .small()
+                .color(pal.unhealthy),
+        );
+    }
+
+    for release in &releases {
+        ui.add_space(8.0);
+        release_card(ui, pal, screen, source, release);
+    }
+}
+
+/// One release from a fetched catalog: its id, version, and either an
+/// Install button, an in-progress/finished status, or an inline install
+/// error — never a button that looks live but can't respond (anti-slop:
+/// dead controls).
+fn release_card(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    screen: &mut ExtensionsScreen,
+    source: &ExtensionRegistrySource,
+    release: &RegistryRelease,
+) {
+    let already_installed = screen
+        .discovery
+        .extensions
+        .iter()
+        .any(|ext| ext.manifest.id == release.id);
+    let key = format!("{}::{}@{}", source.id, release.id, release.version);
+    let state = screen
+        .installs
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(InstallState::Idle)))
+        .clone();
+
+    let (status, failure): (Option<&'static str>, Option<String>) = {
+        let guard = state.lock().unwrap();
+        match &*guard {
+            InstallState::Idle => (None, None),
+            InstallState::Installing | InstallState::Downloaded { .. } => {
+                (Some("Installing…"), None)
+            }
+            InstallState::Installed => (Some("Installed"), None),
+            InstallState::Failed(message) => (None, Some(message.clone())),
+        }
+    };
+
+    egui::Frame::new()
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.0, pal.border))
+        .corner_radius(style::radius(pal.corner))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&release.id).strong().color(pal.text));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("v{}", release.version))
+                                .small()
+                                .color(pal.text_faint),
+                        );
+                    });
+                    if let Some(min) = &release.min_rocker_version {
+                        ui.label(
+                            RichText::new(format!("Requires Rocker {min}+"))
+                                .small()
+                                .color(pal.text_muted),
+                        );
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if already_installed {
+                        ui.label(RichText::new("Installed").small().color(pal.text_faint));
+                    } else if let Some(label) = status {
+                        ui.label(RichText::new(label).small().color(pal.text_faint));
+                    } else if icons::text_button(ui, pal, "Install").clicked() {
+                        spawn_install(ui.ctx(), source.clone(), release.clone(), state.clone());
+                    }
+                });
+            });
+            if !already_installed {
+                if let Some(message) = &failure {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("Install failed: {message}"))
+                            .small()
+                            .color(pal.unhealthy),
+                    );
+                }
+            }
+        });
 }
 
 /// Render and edit the trusted catalog list. A registry can be removed even
@@ -1019,6 +1369,8 @@ mod tests {
             },
             registry_draft: RegistryDraft::default(),
             tab: ExtensionsTab::Installed,
+            catalogs: HashMap::new(),
+            installs: HashMap::new(),
         }
     }
 
@@ -1089,6 +1441,8 @@ mod tests {
             discovery: Discovery::default(),
             registry_draft: RegistryDraft::default(),
             tab: ExtensionsTab::Installed,
+            catalogs: HashMap::new(),
+            installs: HashMap::new(),
         };
 
         for screen in [&mut empty, &mut broken] {
@@ -1106,6 +1460,145 @@ mod tests {
                 });
             });
         }
+    }
+
+    fn release(id: &str, version: &str, min_rocker_version: Option<&str>) -> RegistryRelease {
+        RegistryRelease {
+            id: id.to_string(),
+            version: version.to_string(),
+            package_url: format!("https://example.com/{id}-{version}.rockerext"),
+            sha256: "0".repeat(64),
+            signature: "sig".into(),
+            min_rocker_version: min_rocker_version.map(str::to_string),
+        }
+    }
+
+    /// The Browse tab, with one registry's catalog already fetched: a release
+    /// already installed locally, and one that isn't yet. Lays out at a few
+    /// widths with no pointer input, the same no-panic convention as every
+    /// other screen test here — the release list and Install buttons are new
+    /// code this exercises that the other tests never touch.
+    #[test]
+    fn browse_tab_with_a_loaded_catalog_lays_out_without_panic() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+
+        let mut screen = screen_with(
+            vec![InstalledExtension {
+                manifest: manifest("already.installed", vec![]),
+                directory: std::path::PathBuf::from("/nonexistent/already.installed"),
+                settings: ExtensionSettings::default(),
+            }],
+            vec![],
+        );
+        screen.tab = ExtensionsTab::Browse;
+        let source = ExtensionRegistrySource::official();
+        screen.catalogs.insert(
+            source.id.clone(),
+            Arc::new(Mutex::new(CatalogState::Loaded(RegistryIndex {
+                format: 1,
+                releases: vec![
+                    release("already.installed", "1.0.0", None),
+                    release("not.installed", "2.0.0", Some("0.2.0")),
+                ],
+            }))),
+        );
+
+        for width in [420.0_f32, 700.0, 1200.0] {
+            let mut registries = vec![source.clone()];
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(width, 640.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    extensions_screen(ui, &pal, &mut screen, &mut registries);
+                });
+            });
+        }
+    }
+
+    /// The Browse tab before anything has been fetched, and after a fetch
+    /// failed — both must render their status text rather than an empty or
+    /// panicking screen.
+    #[test]
+    fn browse_tab_idle_and_failed_catalog_lay_out_without_panic() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let source = ExtensionRegistrySource::official();
+
+        for initial in [
+            None,
+            Some(CatalogState::Failed("network unreachable".into())),
+        ] {
+            let mut screen = screen_with(vec![], vec![]);
+            screen.tab = ExtensionsTab::Browse;
+            if let Some(state) = initial {
+                screen
+                    .catalogs
+                    .insert(source.id.clone(), Arc::new(Mutex::new(state)));
+            }
+            let mut registries = vec![source.clone()];
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(600.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    extensions_screen(ui, &pal, &mut screen, &mut registries);
+                });
+            });
+        }
+    }
+
+    /// A downloaded release that can't actually be trusted or installed
+    /// (garbage public key, garbage package bytes) must resolve to `Failed`
+    /// rather than crashing or staying stuck at "Installing…" forever —
+    /// exactly the fake-interactivity failure the anti-slop rules call out.
+    /// The real, successful `Downloaded -> Installed` path (real signature,
+    /// real package) is covered by `rocker-ext-host`'s own registry tests and
+    /// by `install_registry_package`, which this method calls unchanged.
+    #[test]
+    fn finish_pending_installs_resolves_a_bad_download_to_failed() {
+        let mut screen = screen_with(vec![], vec![]);
+        let source = ExtensionRegistrySource {
+            id: "test".into(),
+            index_url: "https://example.com/index-v1.json".into(),
+            signature_url: "https://example.com/index-v1.sig".into(),
+            public_key: "0".repeat(64),
+        };
+        let key = "test::example.bad@1.0.0".to_string();
+        let state = Arc::new(Mutex::new(InstallState::Downloaded(Box::new(
+            DownloadedRelease {
+                source,
+                release: release("example.bad", "1.0.0", None),
+                package: b"not a real zip".to_vec(),
+            },
+        ))));
+        screen.installs.insert(key, state.clone());
+
+        screen.finish_pending_installs();
+
+        let resolved = state.lock().unwrap();
+        assert!(
+            matches!(&*resolved, InstallState::Failed(_)),
+            "a bad download must resolve to Failed, not stay stuck as Installing"
+        );
+    }
+
+    /// With nothing pending, a call must be a cheap no-op rather than
+    /// touching the registry or discovery state.
+    #[test]
+    fn finish_pending_installs_is_a_noop_with_nothing_pending() {
+        let mut screen = screen_with(vec![], vec![]);
+        screen.finish_pending_installs();
+        assert!(screen.discovery.extensions.is_empty());
     }
 
     #[test]

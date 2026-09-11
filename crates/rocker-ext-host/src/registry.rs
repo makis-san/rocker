@@ -7,7 +7,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Cursor,
+    io::{Cursor, Read as _},
     path::{Component, Path, PathBuf},
 };
 
@@ -278,6 +278,38 @@ where
     /// Return the registry identity this client is pinned to.
     pub fn registry(&self) -> &TrustedRegistry {
         &self.registry
+    }
+}
+
+/// The real, blocking HTTPS transport the application uses (tests use an
+/// in-memory [`RegistryTransport`] instead). Reads one byte past the caller's
+/// limit and errors rather than silently truncating a response that ran
+/// over, the same way [`RegistryRelease::verify_package`] rejects an
+/// over-limit archive instead of hashing a truncated one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HttpTransport;
+
+impl RegistryTransport for HttpTransport {
+    fn fetch(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        require_https_url(url)?;
+        let response = ureq::get(url)
+            .header("User-Agent", concat!("rocker/", env!("CARGO_PKG_VERSION")))
+            .call()
+            .map_err(|error| HostError::Registry(format!("GET {url}: {error}")))?;
+        let mut reader = response
+            .into_body()
+            .into_reader()
+            .take(max_bytes as u64 + 1);
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| HostError::Registry(format!("read {url}: {error}")))?;
+        if bytes.len() > max_bytes {
+            return Err(HostError::Registry(format!(
+                "{url} exceeds the {max_bytes} byte limit"
+            )));
+        }
+        Ok(bytes)
     }
 }
 
