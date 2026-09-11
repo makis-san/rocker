@@ -33,7 +33,7 @@ files. See `.local/DISTRIBUTION.md` for the design.
   creates the GitHub Release.
 - **`.github/workflows/linux-packages.yml`** — hand-written, runs after
   `release.yml` finishes. Its `package` jobs attach `.deb`/`.rpm` (`dist` has no
-  Debian/RPM support as of 0.28.7); a final `checksums` job then attaches a
+  Debian/RPM support as of 0.32.0); a final `checksums` job then attaches a
   single `SHA256SUMS` over every release asset, plus `SHA256SUMS.minisig` when
   the signing secret is set.
 
@@ -100,7 +100,7 @@ no "unidentified developer" warning.
 
 Code signing and notarization only start to matter if Rocker is ever
 distributed as a `.dmg`/`.pkg` for double-click install, or through the Mac
-App Store. `dist` 0.28.7 has no built-in support for either (it only automates
+App Store. `dist` 0.32.0 has no built-in support for either (it only automates
 Windows signing via SSL.com/Azure) — Mac notarization would need a
 hand-written CI step using your own Developer ID Application certificate and
 `notarytool`. Not needed for the current command-line-first distribution.
