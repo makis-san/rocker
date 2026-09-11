@@ -158,7 +158,7 @@ fn bulk_action_applies(state: ContainerState, action: LifecycleAction) -> bool {
 impl RockerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         let paths = AppPaths::resolve();
-        let config = Config::load(&paths).unwrap_or_else(|err| {
+        let mut config = Config::load(&paths).unwrap_or_else(|err| {
             tracing::warn!(%err, "config load failed; starting from defaults");
             Config::default()
         });
@@ -193,7 +193,25 @@ impl RockerApp {
         let want_tray = config.settings.minimize_to_tray || config.settings.start_minimized;
         let hidden = Arc::new(AtomicBool::new(false));
         let extensions = ExtensionsScreen::new(&paths);
-        let registries = RegistriesScreen::new(Arc::new(rocker_secrets::KeyringSecretStore::new()));
+        let secret_store: Arc<dyn rocker_secrets::SecretStore> =
+            Arc::new(rocker_secrets::KeyringSecretStore::new());
+        let registries = RegistriesScreen::new(secret_store.clone());
+
+        // Pull in Docker CLI credentials on every launch, not just when the
+        // user finds the button — a `docker login` run outside Rocker should
+        // just show up (PLAN §5.2). Registries screen state isn't built yet
+        // at this point, so the summary is surfaced as a startup notice
+        // instead of the screen's own `import_summary` line.
+        let mut startup_import_notice = None;
+        match rocker_secrets::docker_config::import_from_default_location(&*secret_store) {
+            Ok(report) => {
+                let added = registries::apply_import(&report, &mut config.registries);
+                if added > 0 {
+                    startup_import_notice = Some(registries::import_summary_text(&report, added));
+                }
+            }
+            Err(err) => tracing::warn!(%err, "startup Docker-config import failed"),
+        }
 
         let mut app = Self {
             engine,
@@ -218,6 +236,11 @@ impl RockerApp {
             hidden,
             quitting: false,
         };
+
+        if let Some(notice) = startup_import_notice {
+            app.last_notice = Some(notice);
+            app.persist();
+        }
 
         if want_tray {
             app.set_tray_enabled(true, &cc.egui_ctx);

@@ -8,6 +8,10 @@
 //! plain background thread and reports back over a channel drained each
 //! frame, never inline in the UI closure (PLAN §3.2: the UI never blocks).
 //!
+//! `~/.docker/config.json` is also imported automatically on every startup
+//! (`RockerApp::new`, via [`apply_import`]) — the button here is only a
+//! manual re-scan for mid-session changes, not the only way in.
+//!
 //! Native cloud-provider registries (AWS ECR, GCR) don't get a form here —
 //! they ship as extensions (PLAN §5.2), with their own settings surface.
 
@@ -188,8 +192,54 @@ pub fn registries_screen(
     changed
 }
 
+/// Apply a [`docker_config::ImportReport`]'s decoded credentials into
+/// `registries` (update by host if it already exists, else add), and return
+/// how many were applied. Shared by the manual "Import from Docker config"
+/// button and the automatic startup import (`RockerApp::new`) so both stay
+/// in sync — this is the one place that turns an import into config state.
+pub fn apply_import(
+    report: &rocker_secrets::docker_config::ImportReport,
+    registries: &mut Vec<Registry>,
+) -> usize {
+    let mut applied = 0;
+    for entry in &report.imported {
+        if let rocker_secrets::docker_config::ImportedEntry::Credential { host, username } = entry {
+            if let Some(existing) = registries.iter_mut().find(|r| &r.host == host) {
+                existing.username = username.clone();
+                existing.auth_type = AuthType::Basic;
+                existing.keychain_ref = Some(KeychainRef::registry(host).0.clone());
+            } else {
+                registries.push(Registry::basic(host.clone(), username.clone()));
+            }
+            applied += 1;
+        }
+    }
+    applied
+}
+
+/// Human-readable summary of an import, e.g. for a notice banner or the
+/// screen's own summary line.
+pub fn import_summary_text(
+    report: &rocker_secrets::docker_config::ImportReport,
+    applied: usize,
+) -> String {
+    let helper_hosts = report.skipped.len();
+    if applied == 0 && helper_hosts == 0 {
+        "No entries found in ~/.docker/config.json.".to_string()
+    } else {
+        format!(
+            "Imported {applied} credential{}; {helper_hosts} host{} use a \
+             credential helper Rocker can't import a secret for.",
+            if applied == 1 { "" } else { "s" },
+            if helper_hosts == 1 { "" } else { "s" },
+        )
+    }
+}
+
 /// "Import from Docker config" — a local, synchronous file read (no network),
-/// safe to run straight in the UI closure.
+/// safe to run straight in the UI closure. Also runs automatically on every
+/// startup (`RockerApp::new`); this button is a manual re-scan for whenever
+/// `~/.docker/config.json` changes mid-session (a fresh `docker login`).
 fn import_row(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -209,35 +259,8 @@ fn import_row(
         {
             match rocker_secrets::docker_config::import_from_default_location(&*state.secrets) {
                 Ok(report) => {
-                    let mut added = 0;
-                    for entry in &report.imported {
-                        if let rocker_secrets::docker_config::ImportedEntry::Credential {
-                            host,
-                            username,
-                        } = entry
-                        {
-                            if let Some(existing) = registries.iter_mut().find(|r| &r.host == host)
-                            {
-                                existing.username = username.clone();
-                                existing.auth_type = AuthType::Basic;
-                                existing.keychain_ref = Some(KeychainRef::registry(host).0.clone());
-                            } else {
-                                registries.push(Registry::basic(host.clone(), username.clone()));
-                            }
-                            added += 1;
-                        }
-                    }
-                    let helper_hosts = report.skipped.len();
-                    state.import_summary = Some(if added == 0 && helper_hosts == 0 {
-                        "No entries found in ~/.docker/config.json.".to_string()
-                    } else {
-                        format!(
-                            "Imported {added} credential{}; {helper_hosts} host{} use a \
-                             credential helper Rocker can't import a secret for.",
-                            if added == 1 { "" } else { "s" },
-                            if helper_hosts == 1 { "" } else { "s" },
-                        )
-                    });
+                    let added = apply_import(&report, registries);
+                    state.import_summary = Some(import_summary_text(&report, added));
                     changed = added > 0;
                 }
                 Err(e) => state.import_summary = Some(format!("Import failed: {e}")),
@@ -429,10 +452,64 @@ fn outcome_text(pal: &Palette, outcome: &ConnectionOutcome) -> (String, egui::Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocker_secrets::docker_config::{ImportReport, ImportedEntry};
     use rocker_secrets::MemorySecretStore;
 
     fn screen() -> RegistriesScreen {
         RegistriesScreen::new(Arc::new(MemorySecretStore::default()))
+    }
+
+    #[test]
+    fn apply_import_adds_a_new_host_and_updates_an_existing_one() {
+        let mut registries = vec![Registry::basic("ghcr.io", "stale-user")];
+        let report = ImportReport {
+            imported: vec![
+                ImportedEntry::Credential {
+                    host: "ghcr.io".to_string(),
+                    username: "octo".to_string(),
+                },
+                ImportedEntry::Credential {
+                    host: "registry.gitlab.com".to_string(),
+                    username: "octo".to_string(),
+                },
+            ],
+            skipped: vec![],
+        };
+
+        let applied = apply_import(&report, &mut registries);
+
+        assert_eq!(applied, 2);
+        assert_eq!(registries.len(), 2);
+        assert_eq!(registries[0].username, "octo");
+        assert_eq!(registries[1].host, "registry.gitlab.com");
+    }
+
+    /// Re-running the same import (as happens on every startup) neither
+    /// duplicates the entry nor errors — merge by host, not append.
+    #[test]
+    fn apply_import_is_idempotent_for_the_same_host() {
+        let mut registries = Vec::new();
+        let report = ImportReport {
+            imported: vec![ImportedEntry::Credential {
+                host: "ghcr.io".to_string(),
+                username: "octo".to_string(),
+            }],
+            skipped: vec![],
+        };
+
+        apply_import(&report, &mut registries);
+        apply_import(&report, &mut registries);
+
+        assert_eq!(registries.len(), 1);
+    }
+
+    #[test]
+    fn import_summary_text_reports_nothing_found() {
+        let report = ImportReport::default();
+        assert_eq!(
+            import_summary_text(&report, 0),
+            "No entries found in ~/.docker/config.json."
+        );
     }
 
     /// Lay the whole screen out headlessly at a few widths, both empty and
