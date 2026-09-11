@@ -40,6 +40,8 @@ pub const APP_ID: &str = "io.github.makis_san.Rocker";
 pub const APP_NAME: &str = "Rocker";
 /// On-disk binary name.
 pub const BIN_NAME: &str = "rocker";
+/// On-disk name of the companion process used to run extensions.
+pub const EXT_HOST_BIN_NAME: &str = "rocker-ext-host";
 /// `owner/repo` the self-updater queries for releases.
 pub const GITHUB_REPO: &str = "makis-san/rocker";
 /// Version of this build (the workspace version).
@@ -64,6 +66,8 @@ pub struct InstallOptions {
     pub modify_path: bool,
     /// Override the directory the binary is copied into.
     pub bin_dir: Option<PathBuf>,
+    /// Optional extension-host executable to install beside the main binary.
+    pub ext_host: Option<PathBuf>,
     /// Rewrite the desktop/bundle metadata only; don't touch the binary.
     /// Used by `self-update` after it swaps the executable.
     pub refresh_only: bool,
@@ -265,6 +269,76 @@ fn same_contents(a: &std::path::Path, b: &std::path::Path) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
     }
+}
+
+/// Install an already-extracted companion executable beside the main binary.
+///
+/// The main binary is the process invoking `rocker install`, so it keeps its
+/// platform-specific placement logic. The extension host is supplied by the
+/// release installer and uses this shared atomic copy path on every platform.
+pub(crate) fn place_companion(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        source.is_file(),
+        "extension host archive did not contain a regular executable: {}",
+        source.display()
+    );
+    if same_contents(source, destination) {
+        report.push(Change::new(
+            ChangeVerb::Skipped,
+            destination.display().to_string(),
+        ));
+        return Ok(());
+    }
+    let existed = destination.exists();
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", parent.display()))?;
+    }
+    let temporary = destination.with_file_name(format!(".{EXT_HOST_BIN_NAME}.new"));
+    std::fs::copy(source, &temporary).map_err(|e| {
+        anyhow::anyhow!(
+            "copy extension host from {} to {}: {e}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(windows)]
+    {
+        let old = destination.with_file_name(format!(".{EXT_HOST_BIN_NAME}.old"));
+        let _ = std::fs::remove_file(&old);
+        if destination.exists() {
+            std::fs::rename(destination, &old).map_err(|e| {
+                anyhow::anyhow!("replace extension host at {}: {e}", destination.display())
+            })?;
+        }
+    }
+    std::fs::rename(&temporary, destination).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        anyhow::anyhow!("place extension host at {}: {e}", destination.display())
+    })?;
+    #[cfg(windows)]
+    {
+        let old = destination.with_file_name(format!(".{EXT_HOST_BIN_NAME}.old"));
+        let _ = std::fs::remove_file(old);
+    }
+    report.push(Change::new(
+        if existed {
+            ChangeVerb::Updated
+        } else {
+            ChangeVerb::Created
+        },
+        destination.display().to_string(),
+    ));
+    Ok(())
 }
 
 /// Remove `path` if present (file, symlink, or directory) and record it.

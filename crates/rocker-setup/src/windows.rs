@@ -9,8 +9,9 @@ use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
 use crate::{
-    assets, remove_path, write_file, Change, ChangeVerb, Diagnosis, InstallOptions, Report, Scope,
-    UninstallOptions, APP_NAME, BIN_NAME, VERSION,
+    assets, place_companion, remove_path, write_file, Change, ChangeVerb, Diagnosis,
+    InstallOptions, Report, Scope, UninstallOptions, APP_NAME, BIN_NAME, EXT_HOST_BIN_NAME,
+    VERSION,
 };
 
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Rocker";
@@ -41,6 +42,9 @@ impl Layout {
     fn exe(&self) -> PathBuf {
         self.dir.join(format!("{BIN_NAME}.exe"))
     }
+    fn ext_host(&self) -> PathBuf {
+        self.dir.join(format!("{EXT_HOST_BIN_NAME}.exe"))
+    }
     fn icon(&self) -> PathBuf {
         self.dir.join("rocker.ico")
     }
@@ -57,6 +61,9 @@ pub(crate) fn install(opts: &InstallOptions, report: &mut Report) -> anyhow::Res
 
     if !opts.refresh_only {
         place_binary(&layout, report)?;
+    }
+    if let Some(source) = opts.ext_host.as_deref() {
+        place_companion(source, &layout.ext_host(), report)?;
     }
     write_file(report, &layout.icon(), &assets::ico())?;
     create_shortcut(&layout, report)?;
@@ -173,6 +180,7 @@ fn add_to_path(dir: &Path, modify: bool, report: &mut Report) -> anyhow::Result<
 
 pub(crate) fn uninstall(opts: &UninstallOptions, report: &mut Report) -> anyhow::Result<()> {
     let layout = Layout::resolve(opts.scope, None)?;
+    remove_path(report, &layout.ext_host());
     remove_path(report, &layout.start_menu_lnk);
     remove_path(report, &layout.icon());
     // Leave the running exe; drop the rest of the dir on a best-effort basis.
@@ -214,6 +222,11 @@ pub(crate) fn doctor() -> anyhow::Result<Diagnosis> {
 
     let artifacts = vec![
         ("binary".into(), layout.exe(), layout.exe().exists()),
+        (
+            "extension host".into(),
+            layout.ext_host(),
+            layout.ext_host().exists(),
+        ),
         (
             "Start-menu shortcut".into(),
             layout.start_menu_lnk.clone(),

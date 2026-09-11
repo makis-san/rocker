@@ -37,6 +37,7 @@ switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 $Triple  = "$cpu-pc-windows-msvc"
 $Archive = "rocker-$Triple.zip"
+$ExtHostArchive = "rocker-ext-host-$Triple.zip"
 
 # --- resolve the release tag --------------------------------------------------
 $headers = @{ "User-Agent" = "rocker-install"; "Accept" = "application/vnd.github+json" }
@@ -52,22 +53,29 @@ $Base = "https://github.com/$Repo/releases/download/$Tag"
 $Tmp  = Join-Path $env:TEMP ("rocker-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
-    Say "downloading $Archive"
+    Say "downloading $Archive and $ExtHostArchive"
     Invoke-WebRequest -Headers $headers "$Base/$Archive"    -OutFile (Join-Path $Tmp $Archive)
+    Invoke-WebRequest -Headers $headers "$Base/$ExtHostArchive" -OutFile (Join-Path $Tmp $ExtHostArchive)
     Invoke-WebRequest -Headers $headers "$Base/SHA256SUMS"  -OutFile (Join-Path $Tmp "SHA256SUMS")
     try {
         Invoke-WebRequest -Headers $headers "$Base/SHA256SUMS.minisig" -OutFile (Join-Path $Tmp "SHA256SUMS.minisig")
     } catch { }
 
     # --- verify checksum -------------------------------------------------
-    $want = (Select-String -Path (Join-Path $Tmp "SHA256SUMS") -Pattern ([regex]::Escape($Archive)) |
-             Select-Object -First 1).Line -replace '\s.*$', ''
-    if (-not $want) { Die "$Archive not listed in SHA256SUMS" }
-    $got = (Get-FileHash -Algorithm SHA256 (Join-Path $Tmp $Archive)).Hash
-    if ($want.ToLower() -ne $got.ToLower()) {
-        Die "checksum mismatch for $Archive (expected $want, got $got)"
+    function Verify-Archive([string]$Name) {
+        $line = Get-Content (Join-Path $Tmp "SHA256SUMS") |
+            Where-Object { $_ -match ("^\S+\s+\*?" + [regex]::Escape($Name) + "$") } |
+            Select-Object -First 1
+        if (-not $line) { Die "$Name not listed in SHA256SUMS" }
+        $want = ($line -split '\s+')[0]
+        $got = (Get-FileHash -Algorithm SHA256 (Join-Path $Tmp $Name)).Hash
+        if ($want.ToLower() -ne $got.ToLower()) {
+            Die "checksum mismatch for $Name (expected $want, got $got)"
+        }
     }
-    Say "checksum ok"
+    Verify-Archive $Archive
+    Verify-Archive $ExtHostArchive
+    Say "checksums ok"
 
     # --- verify signature --------------------------------------------
     # The checksum above is fetched over HTTPS from GitHub; a minisign
@@ -89,10 +97,13 @@ try {
     # --- unpack and hand off to the binary ---------------------------
     Say "unpacking"
     Expand-Archive -Path (Join-Path $Tmp $Archive) -DestinationPath $Tmp -Force
+    Expand-Archive -Path (Join-Path $Tmp $ExtHostArchive) -DestinationPath $Tmp -Force
     $exe = Get-ChildItem -Path $Tmp -Recurse -Filter "rocker.exe" | Select-Object -First 1
     if (-not $exe) { Die "archive did not contain rocker.exe" }
+    $extHostExe = Get-ChildItem -Path $Tmp -Recurse -Filter "rocker-ext-host.exe" | Select-Object -First 1
+    if (-not $extHostExe) { Die "archive did not contain rocker-ext-host.exe" }
 
-    $fwd = @("install")
+    $fwd = @("install", "--ext-host", $extHostExe.FullName)
     if ($ModifyPath) { $fwd += "--modify-path" }
     if ($System)     { $fwd += "--system" }
     Say "running: rocker $($fwd -join ' ')"

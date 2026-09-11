@@ -68,12 +68,14 @@ say "installing $TAG for $TRIPLE"
 
 BASE="https://github.com/${REPO}/releases/download/${TAG}"
 ARCHIVE="rocker-${TRIPLE}.${ext}"
+EXT_HOST_ARCHIVE="rocker-ext-host-${TRIPLE}.${ext}"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/rocker-install.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-say "downloading $ARCHIVE"
+say "downloading $ARCHIVE and $EXT_HOST_ARCHIVE"
 dl "${BASE}/${ARCHIVE}" "${TMP}/${ARCHIVE}"        || die "download failed: ${BASE}/${ARCHIVE}"
+dl "${BASE}/${EXT_HOST_ARCHIVE}" "${TMP}/${EXT_HOST_ARCHIVE}" || die "download failed: ${BASE}/${EXT_HOST_ARCHIVE}"
 dl "${BASE}/SHA256SUMS" "${TMP}/SHA256SUMS"        || die "download failed: SHA256SUMS"
 dl "${BASE}/SHA256SUMS.minisig" "${TMP}/SHA256SUMS.minisig" 2>/dev/null || true
 
@@ -82,11 +84,16 @@ if have sha256sum; then sha_cmd="sha256sum";
 elif have shasum;   then sha_cmd="shasum -a 256";
 else die "need sha256sum or shasum to verify the download"; fi
 
-want="$(grep " \*\{0,1\}${ARCHIVE}\$" "${TMP}/SHA256SUMS" | awk '{print $1}')"
-[ -n "$want" ] || die "$ARCHIVE not listed in SHA256SUMS"
-got="$(cd "$TMP" && $sha_cmd "$ARCHIVE" | awk '{print $1}')"
-[ "$want" = "$got" ] || die "checksum mismatch for $ARCHIVE (expected $want, got $got)"
-say "checksum ok"
+verify_checksum() {
+	name="$1"
+	want="$(awk -v name="$name" '$2 == name || $2 == "*" name { print $1; exit }' "${TMP}/SHA256SUMS")"
+	[ -n "$want" ] || die "$name not listed in SHA256SUMS"
+	got="$(cd "$TMP" && $sha_cmd "$name" | awk '{print $1}')"
+	[ "$want" = "$got" ] || die "checksum mismatch for $name (expected $want, got $got)"
+}
+verify_checksum "$ARCHIVE"
+verify_checksum "$EXT_HOST_ARCHIVE"
+say "checksums ok"
 
 # --- verify signature -----------------------------------------------------
 # The checksum above is already fetched over HTTPS from GitHub. A minisign
@@ -112,9 +119,14 @@ BIN="$(find "$TMP" -type f -name rocker -perm -u+x | head -1)"
 [ -n "$BIN" ] || BIN="$(find "$TMP" -type f -name rocker | head -1)"
 [ -n "$BIN" ] || die "archive did not contain the rocker binary"
 chmod +x "$BIN"
+tar -xf "${TMP}/${EXT_HOST_ARCHIVE}" -C "$TMP"
+EXT_HOST_BIN="$(find "$TMP" -type f -name rocker-ext-host -perm -u+x | head -1)"
+[ -n "$EXT_HOST_BIN" ] || EXT_HOST_BIN="$(find "$TMP" -type f -name rocker-ext-host | head -1)"
+[ -n "$EXT_HOST_BIN" ] || die "archive did not contain the rocker extension host"
+chmod +x "$EXT_HOST_BIN"
 
-say "running: rocker install$FORWARD"
+say "running: rocker install --ext-host $EXT_HOST_BIN$FORWARD"
 # shellcheck disable=SC2086
-"$BIN" install $FORWARD
+"$BIN" install --ext-host "$EXT_HOST_BIN" $FORWARD
 
 say "done. launch Rocker from your application menu, or run: rocker"

@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 use crate::{
-    assets, home, is_flatpak, remove_path, run_hook, write_file, Change, ChangeVerb, Diagnosis,
-    InstallOptions, Report, Scope, UninstallOptions, APP_ID, BIN_NAME, VERSION,
+    assets, home, is_flatpak, place_companion, remove_path, run_hook, write_file, Change,
+    ChangeVerb, Diagnosis, InstallOptions, Report, Scope, UninstallOptions, APP_ID, BIN_NAME,
+    EXT_HOST_BIN_NAME, VERSION,
 };
 
 struct Layout {
@@ -53,6 +54,12 @@ impl Layout {
     fn pixmap_file(&self) -> PathBuf {
         self.pixmaps.join(format!("{APP_ID}.png"))
     }
+    fn ext_host(&self) -> PathBuf {
+        self.bin
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(EXT_HOST_BIN_NAME)
+    }
 }
 
 fn xdg_data_home() -> anyhow::Result<PathBuf> {
@@ -85,6 +92,9 @@ pub(crate) fn install(opts: &InstallOptions, report: &mut Report) -> anyhow::Res
     } else {
         place_binary(&layout.bin, report)?
     };
+    if let Some(source) = opts.ext_host.as_deref() {
+        place_companion(source, &layout.ext_host(), report)?;
+    }
 
     // Desktop entry, with every Exec= made absolute and a TryExec= guard added.
     let desktop = rewrite_desktop_entry(assets::DESKTOP_ENTRY, &exec_target);
@@ -267,6 +277,7 @@ fn shell_rc_file() -> anyhow::Result<PathBuf> {
 pub(crate) fn uninstall(opts: &UninstallOptions, report: &mut Report) -> anyhow::Result<()> {
     let layout = Layout::resolve(opts.scope, None)?;
     remove_path(report, &layout.bin);
+    remove_path(report, &layout.ext_host());
     remove_path(report, &layout.desktop_file());
     remove_path(report, &layout.metainfo_file());
     for (size, _) in assets::ICON_PNGS {
@@ -290,6 +301,11 @@ pub(crate) fn doctor() -> anyhow::Result<Diagnosis> {
 
     let artifacts = vec![
         ("binary".into(), layout.bin.clone(), layout.bin.exists()),
+        (
+            "extension host".into(),
+            layout.ext_host(),
+            layout.ext_host().exists(),
+        ),
         (
             "desktop entry".into(),
             layout.desktop_file(),
