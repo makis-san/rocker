@@ -9,7 +9,7 @@ pub mod config;
 pub mod history;
 pub mod paths;
 
-pub use config::{Config, Settings};
+pub use config::{Config, ExtensionRegistrySource, Settings};
 pub use history::HistoryStore;
 pub use paths::AppPaths;
 
