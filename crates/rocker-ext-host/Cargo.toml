@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[package.metadata.wix]
+upgrade-guid = "B7927A75-88CB-4A31-BF8A-F03C4371697D"
+path-guid = "A11693DD-3BC4-49AC-BCEF-8A87AF69F15B"
+license = false
+eula = false
 
 [dependencies]
 rhai = { version = "1.20", default-features = false, features = ["std"] }
