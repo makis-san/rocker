@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rhai = { version = "1.20", default-features = false, features = ["std"] }
 rocker-ext-api = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+toml = "1.1.5"
