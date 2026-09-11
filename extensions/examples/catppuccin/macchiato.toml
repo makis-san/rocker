@@ -1,0 +1,44 @@
+# Catppuccin Macchiato — https://catppuccin.com/palette/
+#
+# Colors are the official, published Macchiato hex values, used as-is.
+# `accent` is mauve, the palette's own signature color. The terminal ramp
+# is Catppuccin's own published ANSI mapping, so a shell run inside Rocker
+# matches the same terminal every other Catppuccin port draws.
+schema_version = 1
+id = "catppuccin-macchiato"
+name = "Catppuccin Macchiato"
+author = "Catppuccin"
+mode = "dark"
+
+[tokens]
+surface = "#24273a"         # base
+surface_raised = "#363a4f"  # surface0
+text = "#cad3f5"            # text
+text_muted = "#a5adcb"      # subtext0
+border = "#494d64"          # surface1
+accent = "#c6a0f6"          # mauve
+terminal_palette = [
+  "#494d64", # black   (surface1)
+  "#ed8796", # red
+  "#a6da95", # green
+  "#eed49f", # yellow
+  "#8aadf4", # blue
+  "#f5bde6", # magenta (pink)
+  "#8bd5ca", # cyan    (teal)
+  "#b8c0e0", # white   (subtext1)
+  "#5b6078", # bright black   (surface2)
+  "#ed8796", # bright red
+  "#a6da95", # bright green
+  "#eed49f", # bright yellow
+  "#8aadf4", # bright blue
+  "#f5bde6", # bright magenta
+  "#8bd5ca", # bright cyan
+  "#a5adcb", # bright white   (subtext0)
+]
+radius = 8.0
+
+[tokens.status]
+running = "#a6da95"   # green
+paused = "#eed49f"    # yellow
+exited = "#6e738d"    # overlay0
+unhealthy = "#ed8796" # red

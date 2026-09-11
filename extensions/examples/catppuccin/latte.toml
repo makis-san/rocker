@@ -1,0 +1,45 @@
+# Catppuccin Latte — https://catppuccin.com/palette/
+#
+# Colors are the official, published Latte hex values, used as-is. Latte is
+# Catppuccin's only light flavor. `accent` is mauve, the palette's own
+# signature color. The terminal ramp is Catppuccin's own published ANSI
+# mapping, so a shell run inside Rocker matches the same terminal every
+# other Catppuccin port draws.
+schema_version = 1
+id = "catppuccin-latte"
+name = "Catppuccin Latte"
+author = "Catppuccin"
+mode = "light"
+
+[tokens]
+surface = "#eff1f5"         # base
+surface_raised = "#e6e9ef"  # mantle
+text = "#4c4f69"            # text
+text_muted = "#6c6f85"      # subtext0
+border = "#ccd0da"          # surface0
+accent = "#8839ef"          # mauve
+terminal_palette = [
+  "#5c5f77", # black   (subtext1)
+  "#d20f39", # red
+  "#40a02b", # green
+  "#df8e1d", # yellow
+  "#1e66f5", # blue
+  "#ea76cb", # magenta (pink)
+  "#179299", # cyan    (teal)
+  "#acb0be", # white   (surface2)
+  "#6c6f85", # bright black   (subtext0)
+  "#d20f39", # bright red
+  "#40a02b", # bright green
+  "#df8e1d", # bright yellow
+  "#1e66f5", # bright blue
+  "#ea76cb", # bright magenta
+  "#179299", # bright cyan
+  "#bcc0cc", # bright white   (surface1)
+]
+radius = 8.0
+
+[tokens.status]
+running = "#40a02b"   # green
+paused = "#df8e1d"    # yellow
+exited = "#9ca0b0"    # overlay0
+unhealthy = "#d20f39" # red

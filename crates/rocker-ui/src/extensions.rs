@@ -1802,7 +1802,12 @@ mod tests {
         assert_eq!(options[0].id, "catppuccin.theme");
         assert_eq!(
             options[0].variants,
-            vec![("mocha".to_string(), "Mocha".to_string())]
+            vec![
+                ("latte".to_string(), "Latte".to_string()),
+                ("frappe".to_string(), "Frappé".to_string()),
+                ("macchiato".to_string(), "Macchiato".to_string()),
+                ("mocha".to_string(), "Mocha".to_string()),
+            ]
         );
 
         let theme = resolve_custom_theme(&discovery, "catppuccin.theme", "mocha")
@@ -1811,6 +1816,22 @@ mod tests {
         assert_eq!(theme.mode, rocker_theme::Mode::Dark);
         assert_eq!(theme.tokens.accent.0, "#cba6f7");
         assert_eq!(theme.tokens.terminal_palette.len(), 16);
+
+        let latte = resolve_custom_theme(&discovery, "catppuccin.theme", "latte")
+            .expect("the Latte variant parses into a real Theme");
+        assert_eq!(latte.id, "catppuccin-latte");
+        assert_eq!(latte.mode, rocker_theme::Mode::Light);
+        assert_eq!(latte.tokens.accent.0, "#8839ef");
+
+        let frappe = resolve_custom_theme(&discovery, "catppuccin.theme", "frappe")
+            .expect("the Frappé variant parses into a real Theme");
+        assert_eq!(frappe.id, "catppuccin-frappe");
+        assert_eq!(frappe.mode, rocker_theme::Mode::Dark);
+
+        let macchiato = resolve_custom_theme(&discovery, "catppuccin.theme", "macchiato")
+            .expect("the Macchiato variant parses into a real Theme");
+        assert_eq!(macchiato.id, "catppuccin-macchiato");
+        assert_eq!(macchiato.mode, rocker_theme::Mode::Dark);
 
         // A disabled extension (the install default) must not surface as a
         // pickable custom theme, mirroring how a disabled extension's code
