@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "releases": [
+    {
+      "id": "example.summary",
+      "version": "1.2.3",
+      "package_url": "https://github.com/example/rocker-registry/releases/download/example.summary-v1.2.3/example.summary-1.2.3.rockerext",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "signature": "BASE64_ED25519_SIGNATURE_OF_THE_PACKAGE_BYTES",
+      "min_rocker_version": "0.1.5"
+    }
+  ]
+}

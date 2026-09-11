@@ -6,7 +6,11 @@
 //! node vocabulary — shared by `rocker-ext-host` and (via generated bindings)
 //! the WIT world in `wit/world.wit`.
 
+use std::path::{Component, Path};
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Deny-by-default capabilities, granted at install and revocable (PLAN §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,6 +26,36 @@ pub enum Capability {
     Network,
     Storage,
     Notifications,
+}
+
+/// The container lifecycle operations an extension may request from Rocker.
+///
+/// This is an intent only: the application checks
+/// [`Capability::ContainersLifecycle`] and executes the Docker API call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerAction {
+    Start,
+    Stop,
+    Restart,
+    Pause,
+    Unpause,
+    Kill,
+}
+
+impl ContainerAction {
+    /// Parse the stable lowercase spellings used by the scripting API.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "start" => Some(Self::Start),
+            "stop" => Some(Self::Stop),
+            "restart" => Some(Self::Restart),
+            "pause" => Some(Self::Pause),
+            "unpause" => Some(Self::Unpause),
+            "kill" => Some(Self::Kill),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +77,85 @@ pub struct Manifest {
     pub capabilities: Vec<Capability>,
     /// Extension entry point, relative to the extension folder.
     pub entry: String,
+    /// Optional interval for invoking the script's `on_schedule` hook.
+    #[serde(default)]
+    pub schedule_seconds: Option<u64>,
+}
+
+/// A manifest that would let an extension escape its installation directory or
+/// cannot be addressed reliably by Rocker.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ManifestError {
+    /// Extension identifiers are used as stable configuration keys and local
+    /// directory names, so their vocabulary is deliberately narrow.
+    #[error("extension id `{id}` must contain only lowercase ASCII letters, digits, `-`, or `.`")]
+    InvalidId { id: String },
+    /// The entry point must remain inside the installed extension directory.
+    #[error("extension entry `{entry}` must be a relative path without `..` components")]
+    InvalidEntry { entry: String },
+    /// Repeated capabilities would make install prompts and configuration
+    /// comparisons ambiguous.
+    #[error("extension `{id}` declares capability {cap:?} more than once")]
+    DuplicateCapability { id: String, cap: Capability },
+    /// Scheduled scripts must wait at least one second between evaluations.
+    #[error("extension `{id}` must use a schedule of at least one second")]
+    InvalidSchedule { id: String },
+}
+
+impl Manifest {
+    /// Validate fields which define the local extension boundary.
+    ///
+    /// This does not grant the requested capabilities. Installers must obtain
+    /// those grants explicitly before activating the extension.
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.id.is_empty()
+            || !self.id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+            })
+        {
+            return Err(ManifestError::InvalidId {
+                id: self.id.clone(),
+            });
+        }
+
+        let entry_path = Path::new(&self.entry);
+        if self.entry.is_empty()
+            || entry_path.is_absolute()
+            || entry_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ManifestError::InvalidEntry {
+                entry: self.entry.clone(),
+            });
+        }
+
+        let mut capabilities = std::collections::HashSet::new();
+        for capability in &self.capabilities {
+            if !capabilities.insert(*capability) {
+                return Err(ManifestError::DuplicateCapability {
+                    id: self.id.clone(),
+                    cap: *capability,
+                });
+            }
+        }
+
+        if self.schedule_seconds == Some(0) {
+            return Err(ManifestError::InvalidSchedule {
+                id: self.id.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Return the optional recurring script interval.
+    pub fn schedule_interval(&self) -> Option<Duration> {
+        self.schedule_seconds.map(Duration::from_secs)
+    }
 }
 
 /// The constrained UI vocabulary for v1 (PLAN §5.5). Expanded from real
@@ -79,4 +192,48 @@ pub enum UiNode {
 pub enum UiEvent {
     Clicked { id: String },
     Changed { id: String, value: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        Manifest {
+            id: "example.extension".into(),
+            name: "Example".into(),
+            version: "0.1.0".into(),
+            tier: Tier::Script,
+            capabilities: vec![Capability::ContainersRead],
+            entry: "main.rhai".into(),
+            schedule_seconds: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_safe_manifest() {
+        assert_eq!(manifest().validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_parent_entry_paths() {
+        let mut manifest = manifest();
+        manifest.entry = "../outside.rhai".into();
+
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::InvalidEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_capabilities() {
+        let mut manifest = manifest();
+        manifest.capabilities.push(Capability::ContainersRead);
+
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::DuplicateCapability { .. })
+        ));
+    }
 }

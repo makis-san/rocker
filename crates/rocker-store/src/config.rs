@@ -13,6 +13,8 @@ pub struct Config {
     pub settings: Settings,
     pub connections: Vec<Connection>,
     pub groups: Vec<Group>,
+    /// Signed extension catalogs the user has chosen to browse.
+    pub extension_registries: Vec<ExtensionRegistrySource>,
 }
 
 impl Default for Config {
@@ -21,6 +23,41 @@ impl Default for Config {
             settings: Settings::default(),
             connections: vec![Connection::local_default()],
             groups: Vec::new(),
+            extension_registries: vec![ExtensionRegistrySource::official()],
+        }
+    }
+}
+
+/// A user-trusted extension registry.
+///
+/// Registries use a detached Ed25519 signature. The public key is stored here
+/// rather than accepted from a downloaded index, so adding a registry is an
+/// explicit trust decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionRegistrySource {
+    /// Stable identifier used for installed-package provenance.
+    pub id: String,
+    /// HTTPS location of the signed registry index.
+    pub index_url: String,
+    /// HTTPS location of the detached index signature.
+    pub signature_url: String,
+    /// Hex-encoded, 32-byte Ed25519 public key.
+    pub public_key: String,
+}
+
+impl ExtensionRegistrySource {
+    /// Rocker's curated registry, enabled for new configurations.
+    pub fn official() -> Self {
+        Self {
+            id: "official".to_string(),
+            index_url:
+                "https://raw.githubusercontent.com/makis-san/rocker-registry/main/index-v1.json"
+                    .to_string(),
+            signature_url:
+                "https://raw.githubusercontent.com/makis-san/rocker-registry/main/index-v1.sig"
+                    .to_string(),
+            public_key: "21bc5889a2e5293ee6a22da5678f0497e90b2c67a2c55fd79f1ca0434af21e0a"
+                .to_string(),
         }
     }
 }
@@ -98,5 +135,9 @@ mod tests {
         assert!(cfg.settings.minimize_to_tray);
         assert!(!cfg.settings.start_minimized);
         assert!(!cfg.settings.open_at_login);
+        assert_eq!(
+            cfg.extension_registries,
+            vec![ExtensionRegistrySource::official()]
+        );
     }
 }

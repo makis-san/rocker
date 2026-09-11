@@ -6,6 +6,7 @@
 mod app;
 mod autostart;
 mod detail;
+mod extensions;
 mod format;
 mod groups;
 mod icons;
@@ -16,4 +17,5 @@ mod tray;
 mod widgets;
 
 pub use app::RockerApp;
+pub use extensions::render_ui_node;
 pub use style::{install, Palette};

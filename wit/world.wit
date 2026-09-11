@@ -41,7 +41,7 @@ interface types {
 interface containers {
     use types.{container, lifecycle-action};
 
-    list: func() -> list<container>;
+    list-containers: func() -> list<container>;
     lifecycle: func(id: string, action: lifecycle-action) -> result<_, string>;
     logs-tail: func(id: string, lines: u32) -> list<string>;
 }

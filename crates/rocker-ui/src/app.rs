@@ -8,6 +8,7 @@ use rocker_store::{AppPaths, Config};
 use rocker_theme::Theme;
 
 use crate::detail::DetailScreen;
+use crate::extensions::{self, ExtensionsScreen};
 use crate::groups;
 use crate::icons::{self, Icon};
 use crate::settings::{self, About};
@@ -28,6 +29,7 @@ enum ConnStatus {
 enum View {
     Containers,
     Groups,
+    Extensions,
     Settings,
 }
 
@@ -36,6 +38,7 @@ enum View {
 enum HeaderAction {
     Refresh,
     ToggleGroups,
+    ToggleExtensions,
     ToggleSettings,
 }
 
@@ -83,6 +86,10 @@ pub struct RockerApp {
     /// A group's "delete all" waiting on confirmation before it is sent —
     /// destructive and irreversible, so it never fires straight off the click.
     pending_delete: Option<PendingDelete>,
+    /// The local extension registry and its last discovery pass. Lives
+    /// alongside `view` rather than inside it, same as `detail`, so a
+    /// discovery re-scan survives navigating away and back.
+    extensions: ExtensionsScreen,
     /// Docker's total on-disk usage (bytes) from `/system/df`, polled on a
     /// timer for the tray summary. `None` until the first answer, or when the
     /// daemon doesn't report it.
@@ -178,6 +185,7 @@ impl RockerApp {
         // no tray icon at all and the window close button just quits.
         let want_tray = config.settings.minimize_to_tray || config.settings.start_minimized;
         let hidden = Arc::new(AtomicBool::new(false));
+        let extensions = ExtensionsScreen::new(&paths);
 
         let mut app = Self {
             engine,
@@ -193,6 +201,7 @@ impl RockerApp {
             last_notice: None,
             detail: None,
             pending_delete: None,
+            extensions,
             disk_usage: None,
             last_disk_poll: f64::NEG_INFINITY,
             tray: None,
@@ -647,6 +656,19 @@ impl RockerApp {
                         {
                             action = Some(HeaderAction::ToggleGroups);
                         }
+                        ui.add_space(2.0);
+                        let extensions_open = self.view == View::Extensions;
+                        if icons::toggle_icon_button(
+                            ui,
+                            pal,
+                            Icon::Puzzle,
+                            extensions_open,
+                            "Extensions",
+                        )
+                        .clicked()
+                        {
+                            action = Some(HeaderAction::ToggleExtensions);
+                        }
                         ui.add_space(style::SM);
                         self.conn_status(ui);
                     });
@@ -1041,6 +1063,25 @@ impl RockerApp {
         }
     }
 
+    /// Render the Extensions screen. Extension grants persist through the
+    /// local installer; registry sources are app configuration and are saved
+    /// here with the rest of that configuration.
+    fn extensions_view(&mut self, ui: &mut egui::Ui) {
+        if let Some(edit) = extensions::extensions_screen(
+            ui,
+            &self.pal,
+            &mut self.extensions,
+            &mut self.config.extension_registries,
+        ) {
+            if edit.registries_changed {
+                self.persist();
+            }
+            if let Some(err) = edit.error {
+                self.last_error = Some(format!("Couldn't save extensions: {err}"));
+            }
+        }
+    }
+
     /// Render the open container screen and act on whatever it asks for.
     fn detail_view(&mut self, ui: &mut egui::Ui) {
         let response = self
@@ -1126,6 +1167,16 @@ impl eframe::App for RockerApp {
                         View::Groups
                     };
                 }
+                HeaderAction::ToggleExtensions => {
+                    if self.view == View::Containers {
+                        self.close_detail();
+                    }
+                    self.view = if self.view == View::Extensions {
+                        View::Containers
+                    } else {
+                        View::Extensions
+                    };
+                }
             }
         }
 
@@ -1142,6 +1193,7 @@ impl eframe::App for RockerApp {
                 match self.view {
                     View::Settings => self.settings_view(ui, ctx),
                     View::Groups => self.groups_view(ui),
+                    View::Extensions => self.extensions_view(ui),
                     View::Containers if self.detail.is_some() => self.detail_view(ui),
                     View::Containers => self.containers_view(ui),
                 }
