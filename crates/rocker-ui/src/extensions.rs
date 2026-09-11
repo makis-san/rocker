@@ -750,7 +750,7 @@ fn release_card(
 
     egui::Frame::new()
         .fill(pal.surface)
-        .stroke(Stroke::new(1.0, pal.border))
+        .stroke(Stroke::new(1.0_f32, pal.border))
         .corner_radius(style::radius(pal.corner))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
@@ -946,7 +946,7 @@ fn registry_catalog_card(
     let mut remove = false;
     egui::Frame::new()
         .fill(pal.surface)
-        .stroke(Stroke::new(1.0, pal.border))
+        .stroke(Stroke::new(1.0_f32, pal.border))
         .corner_radius(style::radius(pal.corner))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
