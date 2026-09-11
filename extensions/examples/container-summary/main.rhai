@@ -12,3 +12,7 @@ fn on_event(event) {
 fn restart_container(container_id) {
     containers_lifecycle(container_id, "restart");
 }
+
+fn render_panel(_context) {
+    "{\"node\":\"label\",\"text\":\"Container summary extension is active\"}"
+}

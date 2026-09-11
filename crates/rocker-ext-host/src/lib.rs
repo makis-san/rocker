@@ -16,7 +16,7 @@ use std::{
 };
 
 use rhai::{Engine, EvalAltResult, Position, Scope, AST};
-use rocker_ext_api::{Capability, ContainerAction, Manifest, ManifestError, Tier};
+use rocker_ext_api::{Capability, ContainerAction, Manifest, ManifestError, Tier, UiNode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -210,6 +210,18 @@ impl ScriptRuntime {
         self.engine
             .call_fn::<()>(&mut scope, &self.ast, "on_event", (event.to_owned(),))
             .map_err(|error| HostError::Runtime(error.to_string()))
+    }
+
+    /// Render a constrained declarative panel from the script's
+    /// `render_panel` hook. The script returns JSON so it cannot execute any
+    /// immediate-mode UI code inside Rocker's process.
+    pub fn render_panel(&self, context: &str) -> Result<UiNode> {
+        let mut scope = Scope::new();
+        let json = self
+            .engine
+            .call_fn::<String>(&mut scope, &self.ast, "render_panel", (context.to_owned(),))
+            .map_err(|error| HostError::Runtime(error.to_string()))?;
+        serde_json::from_str(&json).map_err(|error| HostError::Runtime(error.to_string()))
     }
 }
 
@@ -455,12 +467,14 @@ pub enum HostRequest {
     Activate,
     /// Route a Docker lifecycle or health event to `on_event`.
     Event { event: String },
+    /// Request a declarative panel for the supplied host context JSON.
+    RenderPanel { context: String },
     /// Shut down the host process cleanly.
     Shutdown,
 }
 
 /// An intent or completion emitted by the isolated extension-host process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "message")]
 pub enum HostMessage {
     /// Request a read-only Docker container operation from the application.
@@ -474,6 +488,8 @@ pub enum HostMessage {
     },
     /// Request an application-owned notification.
     Notify { text: String },
+    /// A declarative panel that the application renders with `egui`.
+    Ui { node: UiNode },
     /// Report the result of a host command.
     Completed { ok: bool, error: Option<String> },
 }
@@ -572,7 +588,7 @@ impl Drop for HostProcess {
 }
 
 /// An intent emitted by an extension, paired with its stable extension id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExtensionIntent {
     /// The installed extension that emitted this intent.
     pub extension_id: String,
@@ -626,6 +642,13 @@ impl ExtensionSupervisor {
     pub fn dispatch_event(&mut self, event: &str) -> Result<Vec<ExtensionIntent>> {
         self.request_all(HostRequest::Event {
             event: event.to_owned(),
+        })
+    }
+
+    /// Ask every supervised extension for its current declarative panel tree.
+    pub fn render_panels(&mut self, context: &str) -> Result<Vec<ExtensionIntent>> {
+        self.request_all(HostRequest::RenderPanel {
+            context: context.to_owned(),
         })
     }
 
@@ -844,6 +867,26 @@ mod tests {
         assert_eq!(
             *host.calls.lock().expect("recording API lock is available"),
             ["lifecycle:abc123:Restart"]
+        );
+    }
+
+    #[test]
+    fn script_runtime_returns_a_declarative_ui_node() {
+        let host: Arc<dyn ScriptHostApi> = Arc::new(RecordingApi::default());
+        let runtime = ScriptRuntime::compile(
+            &manifest(vec![]),
+            r#"fn render_panel(_context) { "{\"node\":\"label\",\"text\":\"Hello\"}" }"#,
+            [],
+            host,
+            ScriptLimits::default(),
+        )
+        .expect("script compiles");
+
+        assert_eq!(
+            runtime.render_panel("{}").expect("panel renders"),
+            UiNode::Label {
+                text: "Hello".into()
+            }
         );
     }
 

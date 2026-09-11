@@ -59,6 +59,9 @@ fn run() -> Result<(), String> {
         let result = match request {
             HostRequest::Activate => runtime.activate(),
             HostRequest::Event { event } => runtime.handle_event(&event),
+            HostRequest::RenderPanel { context } => runtime
+                .render_panel(&context)
+                .and_then(|node| protocol.emit(&HostMessage::Ui { node })),
             HostRequest::Shutdown => Ok(()),
         };
         protocol
