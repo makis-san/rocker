@@ -61,6 +61,13 @@ pub enum Icon {
     Download,
     /// Jump to newest — a double chevron settling onto a baseline.
     JumpDown,
+    /// Extensions — a single puzzle piece: a squared outline with one
+    /// outward tab and one inward notch, built from the same straight-edge
+    /// lines as `Cube` and `Stack` rather than a curved pack glyph.
+    Puzzle,
+    /// Open in file manager — a folder silhouette (body + top tab), traced as
+    /// one closed straight-edge outline like the rest of the set.
+    Folder,
 }
 
 /// Maps 0..16 grid coordinates into a centered square inside `rect`.
@@ -260,6 +267,39 @@ pub fn draw(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
             line(&[(4.5, 3.4), (8.0, 6.9), (11.5, 3.4)], false);
             line(&[(4.5, 7.9), (8.0, 11.4), (11.5, 7.9)], false);
             line(&[(4.0, 13.7), (12.0, 13.7)], false);
+        }
+        Icon::Puzzle => {
+            line(
+                &[
+                    (3.0, 3.0),
+                    (6.5, 3.0),
+                    (7.3, 1.8),
+                    (8.7, 1.8),
+                    (9.5, 3.0),
+                    (13.0, 3.0),
+                    (13.0, 6.5),
+                    (11.8, 7.3),
+                    (11.8, 8.7),
+                    (13.0, 9.5),
+                    (13.0, 13.0),
+                    (3.0, 13.0),
+                ],
+                true,
+            );
+        }
+        Icon::Folder => {
+            line(
+                &[
+                    (2.0, 5.0),
+                    (2.0, 3.5),
+                    (6.5, 3.5),
+                    (7.5, 5.0),
+                    (14.0, 5.0),
+                    (14.0, 13.0),
+                    (2.0, 13.0),
+                ],
+                true,
+            );
         }
     }
 }

@@ -3973,6 +3973,8 @@ dependencies = [
  "regex-lite",
  "rocker-core",
  "rocker-engine",
+ "rocker-ext-api",
+ "rocker-ext-host",
  "rocker-store",
  "rocker-term",
  "rocker-theme",

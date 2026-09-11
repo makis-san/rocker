@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 rocker-core = { workspace = true }
 rocker-engine = { workspace = true }
+rocker-ext-api = { workspace = true }
+rocker-ext-host = { workspace = true }
 rocker-store = { workspace = true }
 rocker-term = { workspace = true }
 rocker-theme = { workspace = true }
