@@ -20,7 +20,7 @@ rocker — a native desktop client for the Docker Engine API
 
 usage:
   rocker                     launch the app
-  rocker install [options]   install the binary + desktop entry, icon, URL handler
+  rocker install [options]   install the binary, extension host, and desktop integration
   rocker uninstall [options] remove everything `install` added
   rocker self-update [--check] [--tag vX.Y.Z]
   rocker doctor              report install health and available updates
@@ -30,6 +30,7 @@ install options:
   --system         install into the shared prefix instead of ~/.local (may need sudo)
   --modify-path    add the binary directory to your shell PATH
   --bin-dir <dir>  override where the binary is placed
+  --ext-host <path> install the companion extension-host executable
 
 uninstall options:
   --system         operate on a --system install
@@ -93,6 +94,12 @@ fn parse_install(args: &[String]) -> anyhow::Result<InstallOptions> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--bin-dir needs a path"))?;
                 opts.bin_dir = Some(dir.into());
+            }
+            "--ext-host" => {
+                let path = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--ext-host needs a path"))?;
+                opts.ext_host = Some(path.into());
             }
             other => anyhow::bail!("unknown option for `install`: {other}\n\n{HELP}"),
         }

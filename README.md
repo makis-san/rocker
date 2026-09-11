@@ -69,8 +69,10 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/makis-san/rocker/main/install.sh | sh
 ```
 
-Downloads the latest release, verifies its checksum, and runs `rocker install`:
-the binary lands in `~/.local/bin` (no `sudo`) and Rocker shows up in your
+Downloads the latest release and its companion extension host, verifies both
+checksums, and runs `rocker install`: the binaries land together in the
+Rocker install location, while the main binary also lands in `~/.local/bin`
+(no `sudo`) and Rocker shows up in your
 application menu / Launchpad with its icon and a `docker://` URL handler. Works
 on any distro and any desktop (GNOME, KDE, XFCE, Sway, ...). Pass options after
 `| sh -s --`, e.g. `--modify-path` to add `~/.local/bin` to your shell `PATH`,
@@ -86,8 +88,9 @@ newer release exists.
 irm https://raw.githubusercontent.com/makis-san/rocker/main/install.ps1 | iex
 ```
 
-Same idea: verified download, then a Start-menu shortcut, an "Apps & features"
-entry, and the binary under `%LOCALAPPDATA%\Programs\Rocker`. A `.msi` is also
+Same idea: verified download of both binaries, then a Start-menu shortcut, an
+"Apps & features" entry, and both binaries under
+`%LOCALAPPDATA%\Programs\Rocker`. A `.msi` is also
 attached to each release for a double-click install.
 
 ### Other ways

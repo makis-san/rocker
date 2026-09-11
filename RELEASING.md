@@ -17,11 +17,11 @@ A Flatpak manifest exists too (`flatpak/`) but it is community maintained, not
 the recommended path.
 
 The primary install path is the **`install.sh` / `install.ps1`** scripts at the
-repo root: they fetch the `.tar.xz`/`.zip` archive, verify it against
-`SHA256SUMS` (+ `SHA256SUMS.minisig` once a key is configured), and run
-`rocker install`, which writes the desktop entry, icon set, and URL handler
-into `~/.local` with no package manager. `rocker self-update` uses the same two
-files. See `.local/DISTRIBUTION.md` for the design.
+repo root: they fetch both the main app and `rocker-ext-host`, verify them
+against `SHA256SUMS` (+ `SHA256SUMS.minisig` once a key is configured), and run
+`rocker install` once to place both binaries plus the desktop entry, icon set,
+and URL handler into the user install location. See `.local/DISTRIBUTION.md`
+for the design.
 
 ## How it's wired
 

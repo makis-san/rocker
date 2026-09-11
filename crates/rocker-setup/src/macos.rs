@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 use crate::{
-    assets, home, remove_path, run_hook, write_file, Change, ChangeVerb, Diagnosis, InstallOptions,
-    Report, Scope, UninstallOptions, APP_ID, APP_NAME, BIN_NAME, VERSION,
+    assets, home, place_companion, remove_path, run_hook, write_file, Change, ChangeVerb,
+    Diagnosis, InstallOptions, Report, Scope, UninstallOptions, APP_ID, APP_NAME, BIN_NAME,
+    EXT_HOST_BIN_NAME, VERSION,
 };
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
@@ -41,6 +42,9 @@ impl Layout {
     fn binary(&self) -> PathBuf {
         self.macos_dir().join(BIN_NAME)
     }
+    fn ext_host(&self) -> PathBuf {
+        self.macos_dir().join(EXT_HOST_BIN_NAME)
+    }
     fn info_plist(&self) -> PathBuf {
         self.app.join("Contents/Info.plist")
     }
@@ -57,6 +61,9 @@ pub(crate) fn install(opts: &InstallOptions, report: &mut Report) -> anyhow::Res
 
     if !opts.refresh_only {
         place_binary(&layout, report)?;
+    }
+    if let Some(source) = opts.ext_host.as_deref() {
+        place_companion(source, &layout.ext_host(), report)?;
     }
     write_file(report, &layout.info_plist(), info_plist().as_bytes())?;
     write_file(report, &layout.pkginfo(), b"APPL????")?;
@@ -152,6 +159,7 @@ fn info_plist() -> String {
 pub(crate) fn uninstall(opts: &UninstallOptions, report: &mut Report) -> anyhow::Result<()> {
     let layout = Layout::resolve(opts.scope, None)?;
     remove_path(report, &layout.app);
+    remove_path(report, &layout.ext_host());
     if std::fs::read_link(&layout.cli_symlink).is_ok() {
         remove_path(report, &layout.cli_symlink);
     }
@@ -174,6 +182,11 @@ pub(crate) fn doctor() -> anyhow::Result<Diagnosis> {
             "bundle binary".into(),
             layout.binary(),
             layout.binary().exists(),
+        ),
+        (
+            "extension host".into(),
+            layout.ext_host(),
+            layout.ext_host().exists(),
         ),
         (
             "Info.plist".into(),
