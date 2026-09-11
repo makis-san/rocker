@@ -7,9 +7,15 @@
 //! [`ExtensionRuntime`].
 
 mod component;
+mod registry;
 
 pub use component::{
     ComponentContainer, ComponentHostApi, ComponentLimits, ComponentRuntime, ToastLevel,
+};
+pub use registry::{
+    official_registry, RegistryClient, RegistryIndex, RegistryRelease, RegistryTransport,
+    TrustedRegistry, OFFICIAL_REGISTRY_ID, OFFICIAL_REGISTRY_INDEX_URL,
+    OFFICIAL_REGISTRY_PUBLIC_KEY, OFFICIAL_REGISTRY_SIGNATURE_URL,
 };
 
 use std::{
@@ -49,6 +55,20 @@ pub enum HostError {
     AlreadyInstalled(String),
     #[error("extension source contains a symbolic link: {0}")]
     SymbolicLink(PathBuf),
+    #[error("registry metadata is invalid: {0}")]
+    Registry(String),
+    #[error("registry signature is invalid")]
+    InvalidSignature,
+    #[error("package digest does not match the signed registry release")]
+    PackageDigestMismatch,
+    #[error("extension archive is invalid: {0}")]
+    Archive(String),
+    #[error("extension archive exceeds the allowed {limit} byte limit")]
+    ArchiveTooLarge { limit: u64 },
+    #[error("extension archive contains unsafe entry `{0}`")]
+    UnsafeArchiveEntry(String),
+    #[error("archive manifest does not match signed release {id}@{version}")]
+    PackageManifestMismatch { id: String, version: String },
     #[error("extension state TOML: {0}")]
     StateToml(String),
     #[error("host protocol: {0}")]
@@ -303,6 +323,20 @@ pub struct ExtensionSettings {
 #[serde(default)]
 struct ExtensionStateFile {
     extensions: BTreeMap<String, ExtensionSettings>,
+    #[serde(default)]
+    provenance: BTreeMap<String, RegistryProvenance>,
+}
+
+/// Immutable origin information recorded after a verified registry install.
+///
+/// It lets a future update flow compare the publisher and exact package hash
+/// before changing an extension's executable files or permission decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryProvenance {
+    /// Stable identifier of the trusted registry that signed the release.
+    pub registry_id: String,
+    /// SHA-256 digest of the installed package, lowercase hexadecimal.
+    pub package_sha256: String,
 }
 
 /// An extension discovered in the local installation directory.
@@ -360,25 +394,61 @@ impl ExtensionRegistry {
     pub fn install_from_dir(&mut self, source: impl AsRef<Path>) -> Result<InstalledExtension> {
         let source = fs::canonicalize(source)?;
         let manifest = read_manifest(&source)?;
-        let destination = self.root.join(&manifest.id);
-        if destination.exists() {
-            return Err(HostError::AlreadyInstalled(manifest.id));
+        let staging = self.create_staging_dir(&manifest.id)?;
+        let cleanup_path = staging.clone();
+        let install = (|| {
+            copy_extension_dir(&source, &staging)?;
+            self.activate_staged_install(manifest, staging)
+        })();
+        if install.is_err() {
+            let _ = fs::remove_dir_all(cleanup_path);
         }
+        install
+    }
 
-        copy_extension_dir(&source, &destination)?;
-        let settings = self
-            .state
-            .extensions
-            .entry(manifest.id.clone())
-            .or_default()
-            .clone();
-        self.save()?;
+    /// Install one signed registry release from its already-downloaded archive.
+    ///
+    /// The archive is verified and extracted into a new directory before an
+    /// atomic rename makes it discoverable. Registry packages never inherit
+    /// local permissions; the new extension starts disabled with no grants.
+    pub fn install_registry_package(
+        &mut self,
+        registry: &TrustedRegistry,
+        release: &RegistryRelease,
+        package: &[u8],
+    ) -> Result<InstalledExtension> {
+        release.verify_package(package, registry.verifying_key())?;
+        let staging = self.create_staging_dir(&release.id)?;
+        let cleanup_path = staging.clone();
+        let install = (|| {
+            registry::extract_package(package, &staging)?;
+            let manifest = read_manifest(&staging)?;
+            if manifest.id != release.id || manifest.version != release.version {
+                return Err(HostError::PackageManifestMismatch {
+                    id: release.id.clone(),
+                    version: release.version.clone(),
+                });
+            }
+            let installed = self.activate_staged_install(manifest, staging)?;
+            self.state.provenance.insert(
+                release.id.clone(),
+                RegistryProvenance {
+                    registry_id: registry.id().to_owned(),
+                    package_sha256: release.sha256.clone(),
+                },
+            );
+            self.save()?;
+            Ok(installed)
+        })();
+        if install.is_err() {
+            let _ = fs::remove_dir_all(cleanup_path);
+        }
+        install
+    }
 
-        Ok(InstalledExtension {
-            manifest,
-            directory: destination,
-            settings,
-        })
+    /// Return the verified registry origin recorded for an installed extension.
+    pub fn provenance(&self, extension_id: &str) -> Option<&RegistryProvenance> {
+        self.state.provenance.get(extension_id)
     }
 
     /// Update a local extension's enablement, developer mode, and user grants.
@@ -406,6 +476,9 @@ impl ExtensionRegistry {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
+            if path == self.staging_root() {
+                continue;
+            }
             if !entry.file_type()?.is_dir() {
                 continue;
             }
@@ -439,6 +512,51 @@ impl ExtensionRegistry {
             .map_err(|error| HostError::StateToml(error.to_string()))?;
         fs::write(self.root.join(Self::STATE_FILE), contents)?;
         Ok(())
+    }
+
+    fn create_staging_dir(&self, id: &str) -> Result<PathBuf> {
+        let staging_root = self.staging_root();
+        fs::create_dir_all(&staging_root)?;
+        for attempt in 0..128_u16 {
+            let path = staging_root.join(format!("{id}-{}-{attempt}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(HostError::Runtime(
+            "could not allocate an extension installation staging directory".into(),
+        ))
+    }
+
+    fn staging_root(&self) -> PathBuf {
+        self.root.join(".staging")
+    }
+
+    fn activate_staged_install(
+        &mut self,
+        manifest: Manifest,
+        staging: PathBuf,
+    ) -> Result<InstalledExtension> {
+        let destination = self.root.join(&manifest.id);
+        if destination.exists() {
+            return Err(HostError::AlreadyInstalled(manifest.id));
+        }
+        fs::rename(staging, &destination)?;
+        let settings = self
+            .state
+            .extensions
+            .entry(manifest.id.clone())
+            .or_default()
+            .clone();
+        self.save()?;
+
+        Ok(InstalledExtension {
+            manifest,
+            directory: destination,
+            settings,
+        })
     }
 }
 
