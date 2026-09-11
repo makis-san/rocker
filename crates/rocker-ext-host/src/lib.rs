@@ -544,6 +544,100 @@ impl Drop for HostProcess {
     }
 }
 
+/// An intent emitted by an extension, paired with its stable extension id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionIntent {
+    /// The installed extension that emitted this intent.
+    pub extension_id: String,
+    /// The capability-gated operation requested by the extension.
+    pub message: HostMessage,
+}
+
+/// Owns isolated child processes for the enabled Tier 1 extensions.
+///
+/// The supervisor deliberately returns intents rather than performing Docker
+/// work itself. This retains the application's single Engine client and makes
+/// the UI/engine event bridge the sole authority that can execute them.
+pub struct ExtensionSupervisor {
+    host_program: PathBuf,
+    hosts: BTreeMap<String, HostProcess>,
+}
+
+impl ExtensionSupervisor {
+    /// Create a supervisor using the path to the `rocker-ext-host` executable.
+    pub fn new(host_program: impl Into<PathBuf>) -> Self {
+        Self {
+            host_program: host_program.into(),
+            hosts: BTreeMap::new(),
+        }
+    }
+
+    /// Launch all enabled script extensions from one registry discovery pass.
+    /// Component extensions remain discoverable but cannot be launched until
+    /// their Component Model runtime is attached.
+    pub fn launch_enabled(&mut self, discovery: Discovery) -> Result<()> {
+        self.shutdown_all()?;
+        for extension in discovery.extensions {
+            if extension.settings.enabled && extension.manifest.tier == Tier::Script {
+                let host = HostProcess::spawn(
+                    &self.host_program,
+                    &extension.directory,
+                    &extension.settings.granted_capabilities,
+                )?;
+                self.hosts.insert(extension.manifest.id, host);
+            }
+        }
+        Ok(())
+    }
+
+    /// Activate every supervised extension and return all requested intents.
+    pub fn activate_all(&mut self) -> Result<Vec<ExtensionIntent>> {
+        self.request_all(HostRequest::Activate)
+    }
+
+    /// Broadcast a Docker lifecycle or health event to every supervised script.
+    pub fn dispatch_event(&mut self, event: &str) -> Result<Vec<ExtensionIntent>> {
+        self.request_all(HostRequest::Event {
+            event: event.to_owned(),
+        })
+    }
+
+    /// Stop every child process. The first shutdown failure is returned after
+    /// all remaining children have still been given a shutdown request.
+    pub fn shutdown_all(&mut self) -> Result<()> {
+        let hosts = std::mem::take(&mut self.hosts);
+        let mut first_error = None;
+        for (_, host) in hosts {
+            if let Err(error) = host.shutdown() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn request_all(&mut self, request: HostRequest) -> Result<Vec<ExtensionIntent>> {
+        let mut intents = Vec::new();
+        for (extension_id, host) in &mut self.hosts {
+            let messages = host.request(&request)?;
+            for message in messages {
+                if !matches!(message, HostMessage::Completed { .. }) {
+                    intents.push(ExtensionIntent {
+                        extension_id: extension_id.clone(),
+                        message,
+                    });
+                }
+            }
+        }
+        Ok(intents)
+    }
+}
+
+impl Drop for ExtensionSupervisor {
+    fn drop(&mut self) {
+        let _ = self.shutdown_all();
+    }
+}
+
 impl<W> ProtocolApi<W>
 where
     W: Write,
