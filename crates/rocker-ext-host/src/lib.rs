@@ -450,6 +450,14 @@ fn read_manifest(extension_dir: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+/// Read and validate one extension's manifest without instantiating a
+/// runtime. The isolated `rocker-ext-host` binary uses this to pick the
+/// correct tier (`ScriptRuntime` vs [`component::ComponentRuntime`]) before
+/// loading it.
+pub fn extension_manifest(extension_dir: impl AsRef<Path>) -> Result<Manifest> {
+    read_manifest(extension_dir.as_ref())
+}
+
 fn copy_extension_dir(source: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
@@ -486,6 +494,9 @@ pub enum HostRequest {
     RenderPanel { context: String },
     /// Invoke the script's recurring-work hook.
     Schedule,
+    /// Answer a [`HostQuery`] the extension emitted mid-command. Only ever
+    /// sent in reply to a [`HostMessage::Query`]; never a top-level command.
+    Answer { answer: HostAnswer },
     /// Shut down the host process cleanly.
     Shutdown,
 }
@@ -507,8 +518,122 @@ pub enum HostMessage {
     Notify { text: String },
     /// A declarative panel that the application renders with `egui`.
     Ui { node: UiNode },
+    /// A data query the extension is blocked on. Unlike the intents above,
+    /// which the application executes independently and never answers, the
+    /// process cannot resume running the extension until it receives a
+    /// matching [`HostRequest::Answer`] on its standard input.
+    Query { query: HostQuery },
     /// Report the result of a host command.
     Completed { ok: bool, error: Option<String> },
+}
+
+/// A blocking data query emitted by a Tier 2 (component) extension through
+/// [`crate::component::ComponentHostApi`]. Tier 1 (rhai) extensions never
+/// emit these today: [`ScriptHostApi`] is fire-and-forget by design.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "query")]
+pub enum HostQuery {
+    /// Ask for the containers visible to this extension's host scope.
+    ListContainers,
+    /// Ask for a bounded tail of one container's logs.
+    LogsTail { container: String, lines: u32 },
+}
+
+/// The application's reply to a [`HostQuery`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "answer")]
+pub enum HostAnswer {
+    /// Reply to [`HostQuery::ListContainers`].
+    Containers { containers: Vec<ComponentContainer> },
+    /// Reply to [`HostQuery::LogsTail`].
+    Logs { lines: Vec<String> },
+    /// The application could not answer the query (e.g. no live Docker
+    /// connection). Carried as data rather than a transport failure so the
+    /// extension's own error handling sees it, the same way
+    /// [`HostMessage::Completed`] carries a script's runtime error.
+    Error { message: String },
+}
+
+/// A synchronous source of Docker data the supervisor consults while a Tier 2
+/// extension is blocked on a [`HostQuery`].
+///
+/// Kept separate from the fire-and-forget [`HostMessage`] intents: this is
+/// the one path where an extension needs a real answer, not just permission,
+/// before it can continue running. Implemented by whichever part of the
+/// application owns the live Docker connection (the UI/engine bridge); until
+/// that's wired in, [`NoDataSource`] answers every query with an error so
+/// Component-tier extensions still run, just without live data.
+pub trait ExtensionDataSource: Send + Sync {
+    /// Answer [`HostQuery::ListContainers`].
+    fn list_containers(&self) -> Result<Vec<ComponentContainer>>;
+    /// Answer [`HostQuery::LogsTail`].
+    fn logs_tail(&self, container: &str, lines: u32) -> Result<Vec<String>>;
+}
+
+/// An [`ExtensionDataSource`] that answers every query with an error.
+/// The default until the application wires in a real, Docker-backed source.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDataSource;
+
+impl ExtensionDataSource for NoDataSource {
+    fn list_containers(&self) -> Result<Vec<ComponentContainer>> {
+        Err(HostError::Runtime(
+            "no live data source is configured for this extension host".into(),
+        ))
+    }
+
+    fn logs_tail(&self, _container: &str, _lines: u32) -> Result<Vec<String>> {
+        Err(HostError::Runtime(
+            "no live data source is configured for this extension host".into(),
+        ))
+    }
+}
+
+fn answer_query(data_source: &dyn ExtensionDataSource, query: &HostQuery) -> HostAnswer {
+    let result = match query {
+        HostQuery::ListContainers => data_source
+            .list_containers()
+            .map(|containers| HostAnswer::Containers { containers }),
+        HostQuery::LogsTail { container, lines } => data_source
+            .logs_tail(container, *lines)
+            .map(|lines| HostAnswer::Logs { lines }),
+    };
+    result.unwrap_or_else(|error| HostAnswer::Error {
+        message: error.to_string(),
+    })
+}
+
+/// Emit a [`HostQuery`] and block for the matching [`HostRequest::Answer`].
+///
+/// Used by the isolated `rocker-ext-host` binary so a Tier 2 extension's
+/// blocked import call can resume once the supervising application has
+/// replied. Generic over the reader/writer so the blocking exchange can be
+/// exercised with in-memory buffers in tests, without a real child process or
+/// any wasm involved.
+pub fn ask_query<W, R>(
+    protocol: &ProtocolApi<W>,
+    reader: &mut R,
+    query: HostQuery,
+) -> Result<HostAnswer>
+where
+    W: Write,
+    R: BufRead,
+{
+    protocol.emit(&HostMessage::Query { query })?;
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(HostError::Protocol(
+            "extension host's answer stream closed".into(),
+        ));
+    }
+    match serde_json::from_str::<HostRequest>(&line)
+        .map_err(|error| HostError::Protocol(error.to_string()))?
+    {
+        HostRequest::Answer { answer } => Ok(answer),
+        other => Err(HostError::Protocol(format!(
+            "expected an answer to a pending query, got {other:?}"
+        ))),
+    }
 }
 
 /// A [`ScriptHostApi`] that forwards script intents over the line-delimited
@@ -558,34 +683,21 @@ impl HostProcess {
     }
 
     /// Send one command and collect its API intents through the completion
-    /// message. The caller executes those intents against its own Docker API.
-    pub fn request(&mut self, request: &HostRequest) -> Result<Vec<HostMessage>> {
-        serde_json::to_writer(&mut self.stdin, request)
-            .map_err(|error| HostError::Protocol(error.to_string()))?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-
-        let mut messages = Vec::new();
-        loop {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line)? == 0 {
-                return Err(HostError::Crashed(
-                    "extension host closed its protocol stream".into(),
-                ));
-            }
-            let message: HostMessage = serde_json::from_str(&line)
-                .map_err(|error| HostError::Protocol(error.to_string()))?;
-            let completed = matches!(message, HostMessage::Completed { .. });
-            messages.push(message);
-            if completed {
-                return Ok(messages);
-            }
-        }
+    /// message. Any [`HostMessage::Query`] the extension emits mid-command is
+    /// answered from `data_source` and does not appear in the returned
+    /// intents; the caller executes the remaining, fire-and-forget intents
+    /// against its own Docker API.
+    pub fn request(
+        &mut self,
+        request: &HostRequest,
+        data_source: &dyn ExtensionDataSource,
+    ) -> Result<Vec<HostMessage>> {
+        drive_request(&mut self.stdout, &mut self.stdin, request, data_source)
     }
 
     /// Request a clean shutdown, then wait for the child to exit.
     pub fn shutdown(mut self) -> Result<()> {
-        self.request(&HostRequest::Shutdown)?;
+        self.request(&HostRequest::Shutdown, &NoDataSource)?;
         let status = self.child.wait()?;
         if status.success() {
             Ok(())
@@ -593,6 +705,55 @@ impl HostProcess {
             Err(HostError::Crashed(format!(
                 "extension host exited with {status}"
             )))
+        }
+    }
+}
+
+/// Send `request` over `writer` and drive `reader` until the matching
+/// [`HostMessage::Completed`], answering any [`HostMessage::Query`] the
+/// extension emits along the way from `data_source`.
+///
+/// Factored out of [`HostProcess::request`] so the parent side of the
+/// query/answer exchange can be exercised with in-memory buffers in tests,
+/// without spawning a real child process.
+fn drive_request<R, W>(
+    mut reader: R,
+    mut writer: W,
+    request: &HostRequest,
+    data_source: &dyn ExtensionDataSource,
+) -> Result<Vec<HostMessage>>
+where
+    R: BufRead,
+    W: Write,
+{
+    serde_json::to_writer(&mut writer, request)
+        .map_err(|error| HostError::Protocol(error.to_string()))?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+
+    let mut messages = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(HostError::Crashed(
+                "extension host closed its protocol stream".into(),
+            ));
+        }
+        let message: HostMessage =
+            serde_json::from_str(&line).map_err(|error| HostError::Protocol(error.to_string()))?;
+        match message {
+            HostMessage::Query { query } => {
+                let answer = answer_query(data_source, &query);
+                serde_json::to_writer(&mut writer, &HostRequest::Answer { answer })
+                    .map_err(|error| HostError::Protocol(error.to_string()))?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+            }
+            HostMessage::Completed { .. } => {
+                messages.push(message);
+                return Ok(messages);
+            }
+            other => messages.push(other),
         }
     }
 }
@@ -613,15 +774,20 @@ pub struct ExtensionIntent {
     pub message: HostMessage,
 }
 
-/// Owns isolated child processes for the enabled Tier 1 extensions.
+/// Owns isolated child processes for the enabled extensions, of either tier.
 ///
 /// The supervisor deliberately returns intents rather than performing Docker
 /// work itself. This retains the application's single Engine client and makes
-/// the UI/engine event bridge the sole authority that can execute them.
+/// the UI/engine event bridge the sole authority that can execute them. The
+/// one exception is a Tier 2 extension's [`HostQuery`]: that's answered
+/// synchronously, inline, from `data_source`, because the extension is
+/// blocked on the reply and cannot be resumed later the way a fire-and-forget
+/// intent can.
 pub struct ExtensionSupervisor {
     host_program: PathBuf,
     hosts: BTreeMap<String, HostProcess>,
     schedules: BTreeMap<String, ScheduledExtension>,
+    data_source: Arc<dyn ExtensionDataSource>,
 }
 
 struct ScheduledExtension {
@@ -631,21 +797,27 @@ struct ScheduledExtension {
 
 impl ExtensionSupervisor {
     /// Create a supervisor using the path to the `rocker-ext-host` executable.
-    pub fn new(host_program: impl Into<PathBuf>) -> Self {
+    /// `data_source` answers the [`HostQuery`]s Tier 2 extensions block on;
+    /// pass [`NoDataSource`] until the application wires in a live one.
+    pub fn new(
+        host_program: impl Into<PathBuf>,
+        data_source: Arc<dyn ExtensionDataSource>,
+    ) -> Self {
         Self {
             host_program: host_program.into(),
             hosts: BTreeMap::new(),
             schedules: BTreeMap::new(),
+            data_source,
         }
     }
 
-    /// Launch all enabled script extensions from one registry discovery pass.
-    /// Component extensions remain discoverable but cannot be launched until
-    /// their Component Model runtime is attached.
+    /// Launch every enabled extension from one registry discovery pass,
+    /// script and component tier alike — both run as an isolated
+    /// `rocker-ext-host` child process over the same protocol.
     pub fn launch_enabled(&mut self, discovery: Discovery) -> Result<()> {
         self.shutdown_all()?;
         for extension in discovery.extensions {
-            if extension.settings.enabled && extension.manifest.tier == Tier::Script {
+            if extension.settings.enabled {
                 let host = HostProcess::spawn(
                     &self.host_program,
                     &extension.directory,
@@ -733,7 +905,7 @@ impl ExtensionSupervisor {
             let Some(host) = self.hosts.get_mut(extension_id) else {
                 continue;
             };
-            let messages = host.request(request)?;
+            let messages = host.request(request, self.data_source.as_ref())?;
             for message in messages {
                 if !matches!(message, HostMessage::Completed { .. }) {
                     intents.push(ExtensionIntent {
@@ -1086,5 +1258,201 @@ mod tests {
             )
             .expect("reference script compiles");
         }
+    }
+
+    // The isolated process's query/answer exchange (`drive_request` on the
+    // supervisor side, `ask_query` on the child side) is tested here with
+    // in-memory readers/writers standing in for the two ends of the pipe.
+    // That proves the actual bidirectional protocol logic without spawning a
+    // real child process or compiling any wasm.
+
+    #[derive(Default)]
+    struct StubDataSource {
+        containers: Vec<ComponentContainer>,
+        logs: Vec<String>,
+        fail: bool,
+    }
+
+    impl ExtensionDataSource for StubDataSource {
+        fn list_containers(&self) -> Result<Vec<ComponentContainer>> {
+            if self.fail {
+                Err(HostError::Runtime("no docker connection".into()))
+            } else {
+                Ok(self.containers.clone())
+            }
+        }
+
+        fn logs_tail(&self, _container: &str, _lines: u32) -> Result<Vec<String>> {
+            if self.fail {
+                Err(HostError::Runtime("no docker connection".into()))
+            } else {
+                Ok(self.logs.clone())
+            }
+        }
+    }
+
+    /// A `Write` sink that keeps its bytes reachable after the writer has
+    /// been moved into whatever it's driving, so a test can inspect what was
+    /// sent.
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ndjson(messages: &[impl Serialize]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for message in messages {
+            serde_json::to_writer(&mut bytes, message).expect("serializes");
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn lines_of<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Vec<T> {
+        std::str::from_utf8(bytes)
+            .expect("utf8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("deserializes"))
+            .collect()
+    }
+
+    #[test]
+    fn drive_request_answers_a_query_and_does_not_surface_it_as_an_intent() {
+        let container = ComponentContainer {
+            id: "abc123".into(),
+            name: "web".into(),
+            image: "nginx".into(),
+            state: "running".into(),
+            status: "Up 2 minutes".into(),
+        };
+        let reader = std::io::Cursor::new(ndjson(&[
+            HostMessage::Query {
+                query: HostQuery::ListContainers,
+            },
+            HostMessage::Completed {
+                ok: true,
+                error: None,
+            },
+        ]));
+        let data_source = StubDataSource {
+            containers: vec![container.clone()],
+            ..Default::default()
+        };
+        let mut sent = Vec::new();
+
+        let messages = drive_request(reader, &mut sent, &HostRequest::Activate, &data_source)
+            .expect("request completes");
+
+        assert_eq!(
+            messages,
+            [HostMessage::Completed {
+                ok: true,
+                error: None
+            }]
+        );
+
+        let written: Vec<HostRequest> = lines_of(&sent);
+        assert_eq!(
+            written,
+            [
+                HostRequest::Activate,
+                HostRequest::Answer {
+                    answer: HostAnswer::Containers {
+                        containers: vec![container]
+                    }
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn drive_request_turns_a_failed_query_into_an_error_answer_not_a_crash() {
+        let reader = std::io::Cursor::new(ndjson(&[
+            HostMessage::Query {
+                query: HostQuery::LogsTail {
+                    container: "abc123".into(),
+                    lines: 10,
+                },
+            },
+            HostMessage::Completed {
+                ok: true,
+                error: None,
+            },
+        ]));
+        let data_source = StubDataSource {
+            fail: true,
+            ..Default::default()
+        };
+        let mut sent = Vec::new();
+
+        drive_request(reader, &mut sent, &HostRequest::Activate, &data_source)
+            .expect("request still completes");
+
+        let written: Vec<HostRequest> = lines_of(&sent);
+        assert_eq!(
+            written[1],
+            HostRequest::Answer {
+                answer: HostAnswer::Error {
+                    message: "runtime: no docker connection".into()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn ask_query_blocks_for_and_returns_the_matching_answer() {
+        let writer = SharedBuffer::default();
+        let protocol = ProtocolApi::new(writer.clone());
+        let mut reader = std::io::Cursor::new(ndjson(&[HostRequest::Answer {
+            answer: HostAnswer::Logs {
+                lines: vec!["hello".into()],
+            },
+        }]));
+
+        let answer = ask_query(
+            &protocol,
+            &mut reader,
+            HostQuery::LogsTail {
+                container: "abc123".into(),
+                lines: 5,
+            },
+        )
+        .expect("query is answered");
+
+        assert_eq!(
+            answer,
+            HostAnswer::Logs {
+                lines: vec!["hello".into()]
+            }
+        );
+        let written: Vec<HostMessage> = lines_of(&writer.0.lock().expect("lock"));
+        assert_eq!(
+            written,
+            [HostMessage::Query {
+                query: HostQuery::LogsTail {
+                    container: "abc123".into(),
+                    lines: 5
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn ask_query_rejects_a_reply_that_is_not_an_answer() {
+        let protocol = ProtocolApi::new(Vec::new());
+        let mut reader = std::io::Cursor::new(ndjson(&[HostRequest::Shutdown]));
+
+        let result = ask_query(&protocol, &mut reader, HostQuery::ListContainers);
+
+        assert!(matches!(result, Err(HostError::Protocol(_))));
     }
 }

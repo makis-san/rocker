@@ -17,7 +17,10 @@ wasmtime::component::bindgen!({
 });
 
 /// A container exposed through the component host API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Also carried over the isolated-process protocol as the answer to a
+/// [`crate::HostQuery::ListContainers`] query, so it round-trips as JSON.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComponentContainer {
     /// Docker container identifier.
     pub id: String,
@@ -406,5 +409,221 @@ mod tests {
         );
 
         assert!(matches!(result, Err(HostError::WrongTier { .. })));
+    }
+
+    // The tests below call `ComponentState`'s `Host` trait implementations
+    // directly, bypassing wasmtime and any wasm bytes entirely. They exercise
+    // the capability-gate + host-API dispatch logic that a real component
+    // would trigger through an import call, without the risk or ceremony of
+    // hand-authoring canonical-ABI WAT for every capability. The end-to-end
+    // wasm path (activate + render-panel, above) already proves that a real
+    // guest can drive `ComponentState` through wasmtime.
+
+    #[derive(Default)]
+    struct RecordingApi {
+        calls: std::sync::Mutex<Vec<String>>,
+        containers: Vec<ComponentContainer>,
+        logs: Vec<String>,
+    }
+
+    impl RecordingApi {
+        fn new(containers: Vec<ComponentContainer>, logs: Vec<String>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                containers,
+                logs,
+            }
+        }
+    }
+
+    impl ComponentHostApi for RecordingApi {
+        fn list_containers(&self) -> Result<Vec<ComponentContainer>> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push("list_containers".into());
+            Ok(self.containers.clone())
+        }
+
+        fn lifecycle(&self, container: &str, action: ContainerAction) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(format!("lifecycle:{container}:{action:?}"));
+            Ok(())
+        }
+
+        fn logs_tail(&self, container: &str, lines: u32) -> Result<Vec<String>> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(format!("logs_tail:{container}:{lines}"));
+            Ok(self.logs.clone())
+        }
+
+        fn notify(&self, level: ToastLevel, text: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(format!("notify:{level:?}:{text}"));
+            Ok(())
+        }
+    }
+
+    fn state(
+        requested: Vec<Capability>,
+        granted: Vec<Capability>,
+        api: Arc<dyn ComponentHostApi>,
+    ) -> ComponentState {
+        ComponentState {
+            gate: CapabilityGate::new(&manifest(requested), granted),
+            api,
+            storage: HashMap::new(),
+            limits: StoreLimitsBuilder::new().build(),
+        }
+    }
+
+    #[test]
+    fn host_dispatch_denies_list_containers_without_the_capability() {
+        let mut host = state(vec![], vec![], Arc::new(RecordingApi::default()));
+
+        assert!(rocker::extension::containers::Host::list_containers(&mut host).is_err());
+    }
+
+    #[test]
+    fn host_dispatch_lists_containers_when_granted() {
+        let container = ComponentContainer {
+            id: "abc123".into(),
+            name: "web".into(),
+            image: "nginx".into(),
+            state: "running".into(),
+            status: "Up 2 minutes".into(),
+        };
+        let api = Arc::new(RecordingApi::new(vec![container], Vec::new()));
+        let mut host = state(
+            vec![Capability::ContainersRead],
+            vec![Capability::ContainersRead],
+            api.clone(),
+        );
+
+        let containers = rocker::extension::containers::Host::list_containers(&mut host)
+            .expect("granted call succeeds");
+
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].id, "abc123");
+        assert_eq!(containers[0].name, "web");
+        assert_eq!(*api.calls.lock().expect("lock"), ["list_containers"]);
+    }
+
+    #[test]
+    fn host_dispatch_routes_granted_lifecycle_actions() {
+        let api = Arc::new(RecordingApi::default());
+        let mut host = state(
+            vec![Capability::ContainersLifecycle],
+            vec![Capability::ContainersLifecycle],
+            api.clone(),
+        );
+
+        let outcome = rocker::extension::containers::Host::lifecycle(
+            &mut host,
+            "abc123".into(),
+            rocker::extension::types::LifecycleAction::Restart,
+        )
+        .expect("host call does not trap");
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            *api.calls.lock().expect("lock"),
+            ["lifecycle:abc123:Restart"]
+        );
+    }
+
+    #[test]
+    fn host_dispatch_denies_lifecycle_without_the_capability() {
+        let mut host = state(vec![], vec![], Arc::new(RecordingApi::default()));
+
+        let result = rocker::extension::containers::Host::lifecycle(
+            &mut host,
+            "abc123".into(),
+            rocker::extension::types::LifecycleAction::Kill,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn host_dispatch_tails_logs_when_granted() {
+        let api = Arc::new(RecordingApi::new(Vec::new(), vec!["line one".into()]));
+        let mut host = state(
+            vec![Capability::LogsRead],
+            vec![Capability::LogsRead],
+            api.clone(),
+        );
+
+        let lines = rocker::extension::containers::Host::logs_tail(&mut host, "abc123".into(), 10)
+            .expect("granted call succeeds");
+
+        assert_eq!(lines, ["line one"]);
+        assert_eq!(*api.calls.lock().expect("lock"), ["logs_tail:abc123:10"]);
+    }
+
+    #[test]
+    fn host_dispatch_round_trips_storage_when_granted() {
+        let mut host = state(
+            vec![Capability::Storage],
+            vec![Capability::Storage],
+            Arc::new(RecordingApi::default()),
+        );
+
+        rocker::extension::storage::Host::set(&mut host, "k".into(), "v".into())
+            .expect("set succeeds");
+        assert_eq!(
+            rocker::extension::storage::Host::get(&mut host, "k".into()).expect("get succeeds"),
+            Some("v".into())
+        );
+
+        rocker::extension::storage::Host::delete(&mut host, "k".into()).expect("delete succeeds");
+        assert_eq!(
+            rocker::extension::storage::Host::get(&mut host, "k".into()).expect("get succeeds"),
+            None
+        );
+    }
+
+    #[test]
+    fn host_dispatch_denies_storage_without_the_capability() {
+        let mut host = state(vec![], vec![], Arc::new(RecordingApi::default()));
+
+        assert!(rocker::extension::storage::Host::set(&mut host, "k".into(), "v".into()).is_err());
+    }
+
+    #[test]
+    fn host_dispatch_toasts_when_granted() {
+        let api = Arc::new(RecordingApi::default());
+        let mut host = state(
+            vec![Capability::Notifications],
+            vec![Capability::Notifications],
+            api.clone(),
+        );
+
+        rocker::extension::notify::Host::toast(
+            &mut host,
+            rocker::extension::types::ToastLevel::Warn,
+            "disk almost full".into(),
+        )
+        .expect("granted call succeeds");
+
+        assert_eq!(
+            *api.calls.lock().expect("lock"),
+            ["notify:Warn:disk almost full"]
+        );
+    }
+
+    #[test]
+    fn host_dispatch_denies_events_subscribe_without_the_capability() {
+        let mut host = state(vec![], vec![], Arc::new(RecordingApi::default()));
+
+        assert!(
+            rocker::extension::events::Host::subscribe(&mut host, vec!["start".into()]).is_err()
+        );
     }
 }
