@@ -8,8 +8,9 @@ name: Linux packages
 # A final `checksums` job then publishes a single SHA256SUMS (+ a minisign
 # SHA256SUMS.minisig when the signing secret is set) over every asset on the
 # release. `install.sh` / `install.ps1` and `rocker self-update` verify against
-# those two files. It lives here rather than in its own workflow so it has the
-# release tag directly (a second `workflow_run` hop loses the tag ref).
+# those two files. Because workflow_run exposes the triggering commit reliably
+# but not always the tag ref, the first job resolves the release tag from that
+# commit before packaging starts.
 
 on:
   workflow_run:
@@ -23,13 +24,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  package:
-    name: package (${{ matrix.target }})
-    # dist's own release.yml triggers on tags like `v1.2.3` (see its `on.push.tags`
-    # pattern); mirror that loosely here since workflow_run only exposes the ref name.
+  resolve-tag:
+    name: resolve release tag
     if: >
       github.event.workflow_run.conclusion == 'success' &&
-      contains(github.event.workflow_run.head_branch, '.')
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        name: Resolve tag for release commit
+        shell: bash
+        run: |
+          tag="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/tags" \
+            --jq '.[].name' \
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$' \
+            | head -1)"
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: package (${{ matrix.target }})
+    needs: [resolve-tag]
+    if: >
+      needs.resolve-tag.result == 'success'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -41,10 +66,11 @@ jobs:
             runner: ubuntu-24.04-arm
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_branch }}
+          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -89,14 +115,14 @@ jobs:
           done
 
       - name: Upload to the GitHub Release
-        run: gh release upload "${{ github.event.workflow_run.head_branch }}" dist-out/* --clobber --repo "${{ github.repository }}"
+        run: gh release upload "$TAG" dist-out/* --clobber --repo "${{ github.repository }}"
 
   checksums:
     name: checksums & signature
-    needs: [package]
+    needs: [resolve-tag, package]
     if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      contains(github.event.workflow_run.head_branch, '.')
+      needs.resolve-tag.result == 'success' &&
+      needs.package.result == 'success'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
