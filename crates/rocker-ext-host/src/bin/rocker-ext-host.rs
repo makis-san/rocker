@@ -12,7 +12,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rocker_ext_api::{Capability, ContainerAction, Tier};
+use rocker_ext_api::{
+    Capability, ContainerAction, KubernetesContext, KubernetesNamespace, KubernetesWorkloadSummary,
+    Tier,
+};
 use rocker_ext_host::{
     ask_query, extension_manifest, ComponentContainer, ComponentHostApi, ComponentRuntime,
     ExtensionRuntime, HostAnswer, HostError, HostMessage, HostQuery, HostRequest, ProtocolApi,
@@ -182,6 +185,39 @@ impl ComponentHostApi for ProtocolComponentApi {
             HostAnswer::Logs { lines } => Ok(lines),
             HostAnswer::Error { message } => Err(HostError::Runtime(message)),
             other => Err(unexpected_answer("logs-tail", &other)),
+        }
+    }
+
+    fn kubernetes_contexts(&self) -> HostResult<Vec<KubernetesContext>> {
+        match self.ask(HostQuery::KubernetesContexts)? {
+            HostAnswer::KubernetesContexts { contexts } => Ok(contexts),
+            HostAnswer::Error { message } => Err(HostError::Runtime(message)),
+            other => Err(unexpected_answer("kubernetes.list-contexts", &other)),
+        }
+    }
+
+    fn kubernetes_namespaces(&self, context: &str) -> HostResult<Vec<KubernetesNamespace>> {
+        match self.ask(HostQuery::KubernetesNamespaces {
+            context: context.to_owned(),
+        })? {
+            HostAnswer::KubernetesNamespaces { namespaces } => Ok(namespaces),
+            HostAnswer::Error { message } => Err(HostError::Runtime(message)),
+            other => Err(unexpected_answer("kubernetes.list-namespaces", &other)),
+        }
+    }
+
+    fn kubernetes_workloads(
+        &self,
+        context: &str,
+        namespace: &str,
+    ) -> HostResult<Vec<KubernetesWorkloadSummary>> {
+        match self.ask(HostQuery::KubernetesWorkloads {
+            context: context.to_owned(),
+            namespace: namespace.to_owned(),
+        })? {
+            HostAnswer::KubernetesWorkloads { workloads } => Ok(workloads),
+            HostAnswer::Error { message } => Err(HostError::Runtime(message)),
+            other => Err(unexpected_answer("kubernetes.list-workloads", &other)),
         }
     }
 

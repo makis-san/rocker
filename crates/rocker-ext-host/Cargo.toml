@@ -15,6 +15,10 @@ authors.workspace = true
 [package.metadata.dist]
 dist = false
 
+[[bin]]
+name = "rocker-ext-host"
+path = "src/bin/main.rs"
+
 [package.metadata.wix]
 upgrade-guid = "B7927A75-88CB-4A31-BF8A-F03C4371697D"
 path-guid = "A11693DD-3BC4-49AC-BCEF-8A87AF69F15B"
