@@ -139,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.event.workflow_run.head_branch }}
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
       # Passwordless minisign key (rsign generate -W); no companion password.
       MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
     steps:
