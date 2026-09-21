@@ -77,6 +77,11 @@ egui = "0.33.3"
 tokio = "1.53.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# eframe uses winit internally. We need winit's X11 event-loop extension to
+# select the backend that supports hiding and restoring a tray-managed window.
+winit = { version = "0.30.13", default-features = false, features = ["x11"] }
+
 [features]
 # System-tray icon + "minimize to tray". This is enabled for the shipped app;
 # use `--no-default-features` for a headless or GTK-less build.

@@ -2,7 +2,10 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use rocker_ext_api::{Capability, ContainerAction, Manifest, Tier, UiNode};
+use rocker_ext_api::{
+    Capability, ContainerAction, KubernetesContext, KubernetesNamespace, KubernetesWorkloadKind,
+    KubernetesWorkloadSummary, Manifest, Tier, UiNode,
+};
 use wasmtime::{
     component::{Component, HasSelf, Linker},
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
@@ -42,6 +45,16 @@ pub trait ComponentHostApi: Send + Sync + 'static {
     fn lifecycle(&self, container: &str, action: ContainerAction) -> Result<()>;
     /// Return a bounded tail of container logs.
     fn logs_tail(&self, container: &str, lines: u32) -> Result<Vec<String>>;
+    /// List kubeconfig contexts without exposing their credentials.
+    fn kubernetes_contexts(&self) -> Result<Vec<KubernetesContext>>;
+    /// List namespaces visible in the specified context.
+    fn kubernetes_namespaces(&self, context: &str) -> Result<Vec<KubernetesNamespace>>;
+    /// List normalized workloads in one context and namespace.
+    fn kubernetes_workloads(
+        &self,
+        context: &str,
+        namespace: &str,
+    ) -> Result<Vec<KubernetesWorkloadSummary>>;
     /// Display an application-owned notification.
     fn notify(&self, level: ToastLevel, text: &str) -> Result<()>;
 }
@@ -167,6 +180,95 @@ impl rocker::extension::events::Host for ComponentState {
     fn subscribe(&mut self, _kinds: Vec<String>) -> wasmtime::Result<()> {
         self.gate.require(Capability::ContainersRead)?;
         Ok(())
+    }
+}
+
+impl rocker::extension::kubernetes::Host for ComponentState {
+    fn list_contexts(
+        &mut self,
+    ) -> wasmtime::Result<std::result::Result<Vec<rocker::extension::types::ClusterContext>, String>>
+    {
+        self.gate.require(Capability::KubernetesRead)?;
+        Ok(self
+            .api
+            .kubernetes_contexts()
+            .map(|contexts| {
+                contexts
+                    .into_iter()
+                    .map(|context| rocker::extension::types::ClusterContext {
+                        name: context.name,
+                        cluster: context.cluster,
+                        user: context.user,
+                        current: context.current,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string()))
+    }
+
+    fn list_namespaces(
+        &mut self,
+        context: String,
+    ) -> wasmtime::Result<std::result::Result<Vec<rocker::extension::types::Namespace>, String>>
+    {
+        self.gate.require(Capability::KubernetesRead)?;
+        Ok(self
+            .api
+            .kubernetes_namespaces(&context)
+            .map(|namespaces| {
+                namespaces
+                    .into_iter()
+                    .map(|namespace| rocker::extension::types::Namespace {
+                        name: namespace.name,
+                        phase: namespace.phase,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string()))
+    }
+
+    fn list_workloads(
+        &mut self,
+        context: String,
+        namespace: String,
+    ) -> wasmtime::Result<std::result::Result<Vec<rocker::extension::types::WorkloadSummary>, String>>
+    {
+        self.gate.require(Capability::KubernetesRead)?;
+        Ok(self
+            .api
+            .kubernetes_workloads(&context, &namespace)
+            .map(|workloads| {
+                workloads
+                    .into_iter()
+                    .map(|workload| rocker::extension::types::WorkloadSummary {
+                        kind: match workload.kind {
+                            KubernetesWorkloadKind::Pod => {
+                                rocker::extension::types::WorkloadKind::Pod
+                            }
+                            KubernetesWorkloadKind::Deployment => {
+                                rocker::extension::types::WorkloadKind::Deployment
+                            }
+                            KubernetesWorkloadKind::StatefulSet => {
+                                rocker::extension::types::WorkloadKind::StatefulSet
+                            }
+                            KubernetesWorkloadKind::DaemonSet => {
+                                rocker::extension::types::WorkloadKind::DaemonSet
+                            }
+                            KubernetesWorkloadKind::Job => {
+                                rocker::extension::types::WorkloadKind::Job
+                            }
+                            KubernetesWorkloadKind::CronJob => {
+                                rocker::extension::types::WorkloadKind::CronJob
+                            }
+                        },
+                        name: workload.name,
+                        namespace: workload.namespace,
+                        status: workload.status,
+                        created_at: workload.created_at,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string()))
     }
 }
 
@@ -373,6 +475,22 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn kubernetes_contexts(&self) -> Result<Vec<KubernetesContext>> {
+            Ok(Vec::new())
+        }
+
+        fn kubernetes_namespaces(&self, _context: &str) -> Result<Vec<KubernetesNamespace>> {
+            Ok(Vec::new())
+        }
+
+        fn kubernetes_workloads(
+            &self,
+            _context: &str,
+            _namespace: &str,
+        ) -> Result<Vec<KubernetesWorkloadSummary>> {
+            Ok(Vec::new())
+        }
+
         fn notify(&self, _level: ToastLevel, _text: &str) -> Result<()> {
             Ok(())
         }
@@ -466,6 +584,34 @@ mod tests {
             Ok(self.logs.clone())
         }
 
+        fn kubernetes_contexts(&self) -> Result<Vec<KubernetesContext>> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push("kubernetes_contexts".into());
+            Ok(Vec::new())
+        }
+
+        fn kubernetes_namespaces(&self, context: &str) -> Result<Vec<KubernetesNamespace>> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(format!("kubernetes_namespaces:{context}"));
+            Ok(Vec::new())
+        }
+
+        fn kubernetes_workloads(
+            &self,
+            context: &str,
+            namespace: &str,
+        ) -> Result<Vec<KubernetesWorkloadSummary>> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(format!("kubernetes_workloads:{context}:{namespace}"));
+            Ok(Vec::new())
+        }
+
         fn notify(&self, level: ToastLevel, text: &str) -> Result<()> {
             self.calls
                 .lock()
@@ -493,6 +639,30 @@ mod tests {
         let mut host = state(vec![], vec![], Arc::new(RecordingApi::default()));
 
         assert!(rocker::extension::containers::Host::list_containers(&mut host).is_err());
+    }
+
+    #[test]
+    fn host_dispatch_denies_kubernetes_reads_without_the_capability() {
+        let mut host = state(vec![], vec![], Arc::new(RecordingApi::default()));
+
+        assert!(rocker::extension::kubernetes::Host::list_contexts(&mut host).is_err());
+    }
+
+    #[test]
+    fn host_dispatch_routes_kubernetes_reads_when_granted() {
+        let api = Arc::new(RecordingApi::default());
+        let mut host = state(
+            vec![Capability::KubernetesRead],
+            vec![Capability::KubernetesRead],
+            api.clone(),
+        );
+
+        let contexts = rocker::extension::kubernetes::Host::list_contexts(&mut host)
+            .expect("granted call does not trap")
+            .expect("host returns a successful result");
+
+        assert!(contexts.is_empty());
+        assert_eq!(*api.calls.lock().expect("lock"), ["kubernetes_contexts"]);
     }
 
     #[test]

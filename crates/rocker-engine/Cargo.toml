@@ -8,11 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bollard = "0.21.1"
+bollard = { version = "0.21.1", features = ["ssl", "ssh"] }
 rocker-core = { workspace = true }
 rocker-store = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net", "process"] }
 tracing = { workspace = true }

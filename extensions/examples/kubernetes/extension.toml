@@ -1,0 +1,6 @@
+id = "rocker.kubernetes"
+name = "Kubernetes"
+version = "0.1.0"
+tier = "component"
+capabilities = ["kubernetes-read"]
+entry = "extension.wasm"

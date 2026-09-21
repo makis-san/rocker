@@ -29,7 +29,10 @@ use std::{
 };
 
 use rhai::{Engine, EvalAltResult, Position, Scope, AST};
-use rocker_ext_api::{Capability, ContainerAction, Manifest, ManifestError, Tier, UiNode};
+use rocker_ext_api::{
+    Capability, ContainerAction, KubernetesContext, KubernetesNamespace, KubernetesWorkloadSummary,
+    Manifest, ManifestError, Tier, UiNode,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -749,6 +752,13 @@ pub enum HostQuery {
     ListContainers,
     /// Ask for a bounded tail of one container's logs.
     LogsTail { container: String, lines: u32 },
+    /// List contexts from the host-owned kubeconfig; no credentials are
+    /// included in the response.
+    KubernetesContexts,
+    /// List namespaces visible in one selected Kubernetes context.
+    KubernetesNamespaces { context: String },
+    /// List the initial extension's supported workload types in one scope.
+    KubernetesWorkloads { context: String, namespace: String },
 }
 
 /// The application's reply to a [`HostQuery`].
@@ -759,6 +769,16 @@ pub enum HostAnswer {
     Containers { containers: Vec<ComponentContainer> },
     /// Reply to [`HostQuery::LogsTail`].
     Logs { lines: Vec<String> },
+    /// Reply to [`HostQuery::KubernetesContexts`].
+    KubernetesContexts { contexts: Vec<KubernetesContext> },
+    /// Reply to [`HostQuery::KubernetesNamespaces`].
+    KubernetesNamespaces {
+        namespaces: Vec<KubernetesNamespace>,
+    },
+    /// Reply to [`HostQuery::KubernetesWorkloads`].
+    KubernetesWorkloads {
+        workloads: Vec<KubernetesWorkloadSummary>,
+    },
     /// The application could not answer the query (e.g. no live Docker
     /// connection). Carried as data rather than a transport failure so the
     /// extension's own error handling sees it, the same way
@@ -780,6 +800,16 @@ pub trait ExtensionDataSource: Send + Sync {
     fn list_containers(&self) -> Result<Vec<ComponentContainer>>;
     /// Answer [`HostQuery::LogsTail`].
     fn logs_tail(&self, container: &str, lines: u32) -> Result<Vec<String>>;
+    /// Answer [`HostQuery::KubernetesContexts`].
+    fn kubernetes_contexts(&self) -> Result<Vec<KubernetesContext>>;
+    /// Answer [`HostQuery::KubernetesNamespaces`].
+    fn kubernetes_namespaces(&self, context: &str) -> Result<Vec<KubernetesNamespace>>;
+    /// Answer [`HostQuery::KubernetesWorkloads`].
+    fn kubernetes_workloads(
+        &self,
+        context: &str,
+        namespace: &str,
+    ) -> Result<Vec<KubernetesWorkloadSummary>>;
 }
 
 /// An [`ExtensionDataSource`] that answers every query with an error.
@@ -799,6 +829,28 @@ impl ExtensionDataSource for NoDataSource {
             "no live data source is configured for this extension host".into(),
         ))
     }
+
+    fn kubernetes_contexts(&self) -> Result<Vec<KubernetesContext>> {
+        no_kubernetes_data_source()
+    }
+
+    fn kubernetes_namespaces(&self, _context: &str) -> Result<Vec<KubernetesNamespace>> {
+        no_kubernetes_data_source()
+    }
+
+    fn kubernetes_workloads(
+        &self,
+        _context: &str,
+        _namespace: &str,
+    ) -> Result<Vec<KubernetesWorkloadSummary>> {
+        no_kubernetes_data_source()
+    }
+}
+
+fn no_kubernetes_data_source<T>() -> Result<T> {
+    Err(HostError::Runtime(
+        "no Kubernetes data source is configured for this extension host".into(),
+    ))
 }
 
 fn answer_query(data_source: &dyn ExtensionDataSource, query: &HostQuery) -> HostAnswer {
@@ -809,6 +861,15 @@ fn answer_query(data_source: &dyn ExtensionDataSource, query: &HostQuery) -> Hos
         HostQuery::LogsTail { container, lines } => data_source
             .logs_tail(container, *lines)
             .map(|lines| HostAnswer::Logs { lines }),
+        HostQuery::KubernetesContexts => data_source
+            .kubernetes_contexts()
+            .map(|contexts| HostAnswer::KubernetesContexts { contexts }),
+        HostQuery::KubernetesNamespaces { context } => data_source
+            .kubernetes_namespaces(context)
+            .map(|namespaces| HostAnswer::KubernetesNamespaces { namespaces }),
+        HostQuery::KubernetesWorkloads { context, namespace } => data_source
+            .kubernetes_workloads(context, namespace)
+            .map(|workloads| HostAnswer::KubernetesWorkloads { workloads }),
     };
     result.unwrap_or_else(|error| HostAnswer::Error {
         message: error.to_string(),
@@ -1566,6 +1627,22 @@ mod tests {
             } else {
                 Ok(self.logs.clone())
             }
+        }
+
+        fn kubernetes_contexts(&self) -> Result<Vec<KubernetesContext>> {
+            no_kubernetes_data_source()
+        }
+
+        fn kubernetes_namespaces(&self, _context: &str) -> Result<Vec<KubernetesNamespace>> {
+            no_kubernetes_data_source()
+        }
+
+        fn kubernetes_workloads(
+            &self,
+            _context: &str,
+            _namespace: &str,
+        ) -> Result<Vec<KubernetesWorkloadSummary>> {
+            no_kubernetes_data_source()
         }
     }
 

@@ -4,7 +4,21 @@
 //! tasks post [`Event`]s back; the UI drains them each frame and requests a
 //! repaint (PLAN §3.2).
 
-use rocker_core::{ConnectionId, Container, ContainerDetail, ContainerId, ExecAudit, StatSample};
+use rocker_core::{
+    Connection, ConnectionId, Container, ContainerDetail, ContainerId, ExecAudit, KubernetesPod,
+    KubernetesWorkloadRef, StatSample,
+};
+
+/// Kubernetes-native lifecycle operations for scalable workloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KubernetesLifecycleAction {
+    /// Scale a workload to zero replicas.
+    Stop,
+    /// Restore a previously recorded replica count.
+    Start { replicas: u32 },
+    /// Ask the controller for a rolling restart.
+    Restart,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleAction {
@@ -87,12 +101,52 @@ pub struct LogLine {
 #[derive(Debug, Clone)]
 pub enum Command {
     /// Connect (or reconnect) and begin the events stream for this host.
-    Connect(ConnectionId),
+    Connect(Connection),
     /// One-shot refresh of the container list.
     RefreshContainers,
     /// One-shot query of Docker's on-disk usage (`/system/df`) for the tray
     /// summary. Answered with [`Event::DiskUsage`].
     RefreshDiskUsage,
+    /// Query Pods through the selected local kubeconfig without blocking the UI.
+    RefreshKubernetesPods {
+        kubeconfig: String,
+        context: String,
+    },
+    /// Aggregate Metrics Server usage for one Kubernetes context.
+    RefreshKubernetesUsage {
+        kubeconfig: String,
+        context: String,
+    },
+    /// Apply a Kubernetes-native lifecycle action to one workload.
+    KubernetesLifecycle {
+        kubeconfig: String,
+        workload: KubernetesWorkloadRef,
+        action: KubernetesLifecycleAction,
+    },
+    /// Fetch a read-only Pod description for the Kubernetes detail screen.
+    InspectKubernetesPod {
+        kubeconfig: String,
+        pod: KubernetesPod,
+    },
+    /// Fetch a bounded Pod log tail across its containers.
+    KubernetesPodLogs {
+        kubeconfig: String,
+        pod: KubernetesPod,
+    },
+    /// Fetch current Pod resource usage from Metrics Server when available.
+    KubernetesPodStats {
+        kubeconfig: String,
+        pod: KubernetesPod,
+    },
+    /// Start an interactive shell in a Kubernetes Pod.
+    OpenKubernetesExec {
+        kubeconfig: String,
+        pod: KubernetesPod,
+    },
+    /// Send bytes to the active Kubernetes exec session.
+    KubernetesExecInput(Vec<u8>),
+    /// Close the active Kubernetes exec session.
+    CloseKubernetesExec,
     /// Run a lifecycle action against a container.
     Lifecycle {
         container: ContainerId,
@@ -172,6 +226,54 @@ pub enum Event {
     /// Docker's total on-disk usage in bytes, or `None` if the daemon didn't
     /// report it. Answer to [`Command::RefreshDiskUsage`].
     DiskUsage(Option<u64>),
+    /// Pods returned from a read-only Kubernetes query.
+    KubernetesPods {
+        context: String,
+        pods: Vec<KubernetesPod>,
+    },
+    /// Kubernetes query failure kept separate from Docker connection errors.
+    KubernetesPodsFailed(String),
+    /// Aggregate CPU millicores and memory bytes for one Kubernetes context.
+    KubernetesUsage {
+        context: String,
+        cpu_millicores: u64,
+        memory_bytes: u64,
+    },
+    /// A workload action completed; Stop carries the count needed for Start.
+    KubernetesLifecycleDone {
+        workload: KubernetesWorkloadRef,
+        action: KubernetesLifecycleAction,
+        previous_replicas: Option<u32>,
+    },
+    /// A Kubernetes lifecycle action failed without affecting Docker state.
+    KubernetesLifecycleFailed(String),
+    KubernetesPodInfo {
+        pod: KubernetesPod,
+        text: String,
+    },
+    KubernetesPodLogs {
+        pod: KubernetesPod,
+        text: String,
+    },
+    KubernetesPodStats {
+        pod: KubernetesPod,
+        text: String,
+    },
+    KubernetesPodQueryFailed {
+        pod: KubernetesPod,
+        message: String,
+    },
+    KubernetesExecReady {
+        pod: KubernetesPod,
+    },
+    KubernetesExecOutput {
+        pod: KubernetesPod,
+        bytes: Vec<u8>,
+    },
+    KubernetesExecClosed {
+        pod: KubernetesPod,
+        reason: Option<String>,
+    },
     /// A lifecycle action finished.
     LifecycleDone {
         container: ContainerId,
@@ -185,7 +287,9 @@ pub enum Event {
         lines: Vec<LogLine>,
     },
     /// The logs stream ended; `reason` is `None` on a clean EOF.
-    LogsClosed { reason: Option<String> },
+    LogsClosed {
+        reason: Option<String>,
+    },
     /// One resource sample for an open stats stream.
     Stat {
         container: ContainerId,
@@ -207,11 +311,15 @@ pub enum Event {
         reason: Option<String>,
     },
     /// The exec shell is attached and ready for input.
-    ExecReady { container: ContainerId },
+    ExecReady {
+        container: ContainerId,
+    },
     /// Raw bytes from the exec stdout/stderr TTY.
     ExecOutput(Vec<u8>),
     /// The exec session ended.
-    ExecClosed { reason: Option<String> },
+    ExecClosed {
+        reason: Option<String>,
+    },
     /// Something went wrong; surface it in a banner.
     Error(String),
 }

@@ -2,7 +2,7 @@
 //! header, and the connection-status cluster. All status is drawn, never pulled
 //! from an icon pack (PLAN §9).
 
-use rocker_core::{Container, ContainerState};
+use rocker_core::{Container, ContainerState, KubernetesPod};
 use rocker_engine::LifecycleAction;
 
 use crate::format;
@@ -15,6 +15,60 @@ use crate::style::{self, Palette};
 /// (`container_row`, two text lines + margins); `container_row_fits_the_list_slot`
 /// guards it.
 pub const LIST_ROW_H: f32 = 64.0;
+
+/// An action selected from a managed Kubernetes Pod row.
+pub enum KubernetesPodOutcome {
+    Open,
+    Start,
+    Stop,
+    Restart,
+}
+
+/// Draw a Kubernetes Pod through the same host-owned inventory row as Docker
+/// containers. An extension-backed source can supply only normalized metadata;
+/// it never receives an `egui` handle or a command sender.
+pub fn kubernetes_pod_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    pod: &KubernetesPod,
+    manageable: bool,
+    paused: bool,
+) -> Option<KubernetesPodOutcome> {
+    let owner = pod
+        .owner
+        .as_ref()
+        .map(|owner| format!("{}/{}", owner.kind, owner.name))
+        .unwrap_or_else(|| "Bare Pod".to_owned());
+    let model = InventoryRow {
+        id: &pod.name,
+        name: &pod.name,
+        detail: &owner,
+        status: &pod.phase,
+        secondary_tail: None,
+        right_label: &pod.ready,
+        state: kubernetes_phase_state(&pod.phase),
+        source: InventorySource::Kubernetes,
+    };
+    let actions = if manageable {
+        if paused {
+            InventoryActions::StartOnly
+        } else {
+            InventoryActions::RestartStop
+        }
+    } else {
+        InventoryActions::None
+    };
+
+    match inventory_row(ui, pal, &model, actions) {
+        Some(InventoryRowOutcome::Open) => Some(KubernetesPodOutcome::Open),
+        Some(InventoryRowOutcome::Act(InventoryAction::Start)) => Some(KubernetesPodOutcome::Start),
+        Some(InventoryRowOutcome::Act(InventoryAction::Stop)) => Some(KubernetesPodOutcome::Stop),
+        Some(InventoryRowOutcome::Act(InventoryAction::Restart)) => {
+            Some(KubernetesPodOutcome::Restart)
+        }
+        None => None,
+    }
+}
 
 /// A drawn state indicator: a filled core for a live container, a hollow ring
 /// for a stopped one, and a soft halo that breathes while the container is
@@ -115,20 +169,59 @@ pub enum RowOutcome {
     Act(LifecycleAction),
 }
 
-/// One container row. Tonal card that lifts on hover by tone alone (no
-/// translate, no shadow). A press on the inline cluster returns [`RowOutcome::Act`];
-/// a press anywhere else on the row returns [`RowOutcome::Open`].
-pub fn container_row(
+/// The source which the trusted host attaches to an inventory row.
+///
+/// This is intentionally not extension-provided UI: an extension may describe
+/// a resource, but only Rocker decides which source badge and actions it gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InventorySource {
+    Docker,
+    Kubernetes,
+}
+
+/// Borrowed data consumed by the common home-screen row renderer.
+struct InventoryRow<'a> {
+    id: &'a str,
+    name: &'a str,
+    detail: &'a str,
+    status: &'a str,
+    secondary_tail: Option<&'a str>,
+    right_label: &'a str,
+    state: ContainerState,
+    source: InventorySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryActions {
+    None,
+    StartOnly,
+    RestartStop,
+}
+
+enum InventoryRowOutcome {
+    Open,
+    Act(InventoryAction),
+}
+
+/// One trusted, host-rendered inventory row. Both Docker containers and
+/// extension-backed resources use this component so hover behavior, hit zones,
+/// spacing, and lifecycle affordances cannot drift apart.
+fn inventory_row(
     ui: &mut egui::Ui,
     pal: &Palette,
-    container: &Container,
-) -> Option<RowOutcome> {
+    row: &InventoryRow<'_>,
+    actions: InventoryActions,
+) -> Option<InventoryRowOutcome> {
     let mut action = None;
     let mut actions_rect = egui::Rect::NOTHING;
-    let id = ui.make_persistent_id(("row", &container.id.0));
-
-    // Reserve the background shape now; fill it once we know the hover state,
-    // so the tone is correct on the same frame (no one-frame lag).
+    let id = ui.make_persistent_id(("inventory-row", row.id, row.source));
     let bg_idx = ui.painter().add(egui::Shape::Noop);
 
     let inner = egui::Frame::new()
@@ -139,33 +232,34 @@ pub fn container_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
-                state_indicator(ui, pal, container.state);
+                state_indicator(ui, pal, row.state);
+                if matches!(row.source, InventorySource::Kubernetes) {
+                    ui.add_space(4.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    icons::draw(ui.painter(), Icon::Kubernetes, rect, pal.accent);
+                }
                 ui.add_space(style::SM);
-
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.label(
-                        egui::RichText::new(&container.name)
-                            .strong()
-                            .color(pal.text),
-                    );
+                    ui.label(egui::RichText::new(row.name).strong().color(pal.text));
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         ui.label(
-                            egui::RichText::new(&container.image)
+                            egui::RichText::new(row.detail)
                                 .small()
                                 .color(pal.text_muted),
                         );
                         dot_sep(ui, pal);
                         ui.label(
-                            egui::RichText::new(status_phrase(container))
+                            egui::RichText::new(row.status)
                                 .small()
-                                .color(pal.state(container.state)),
+                                .color(pal.state(row.state)),
                         );
-                        if let Some(ports) = ports_summary(container) {
+                        if let Some(tail) = row.secondary_tail {
                             dot_sep(ui, pal);
                             ui.label(
-                                egui::RichText::new(ports)
+                                egui::RichText::new(tail)
                                     .small()
                                     .monospace()
                                     .color(pal.text_muted),
@@ -173,7 +267,6 @@ pub fn container_row(
                         }
                     });
                 });
-
                 let cluster =
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(2.0);
@@ -182,29 +275,47 @@ pub fn container_row(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                if container.state.is_active() {
-                                    if icons::icon_button(ui, pal, Icon::Restart, None, "Restart")
+                                match actions {
+                                    InventoryActions::None => {}
+                                    InventoryActions::StartOnly => {
+                                        if icons::icon_button(
+                                            ui,
+                                            pal,
+                                            Icon::Play,
+                                            Some(pal.accent),
+                                            "Start",
+                                        )
                                         .clicked()
-                                    {
-                                        action = Some(LifecycleAction::Restart);
+                                        {
+                                            action = Some(InventoryAction::Start);
+                                        }
                                     }
-                                    if icons::icon_button(ui, pal, Icon::Stop, None, "Stop")
+                                    InventoryActions::RestartStop => {
+                                        if icons::icon_button(
+                                            ui,
+                                            pal,
+                                            Icon::Restart,
+                                            None,
+                                            "Restart",
+                                        )
                                         .clicked()
-                                    {
-                                        action = Some(LifecycleAction::Stop);
+                                        {
+                                            action = Some(InventoryAction::Restart);
+                                        }
+                                        if icons::icon_button(ui, pal, Icon::Stop, None, "Stop")
+                                            .clicked()
+                                        {
+                                            action = Some(InventoryAction::Stop);
+                                        }
                                     }
-                                } else if icons::icon_button(
-                                    ui,
-                                    pal,
-                                    Icon::Play,
-                                    Some(pal.accent),
-                                    "Start",
-                                )
-                                .clicked()
-                                {
-                                    action = Some(LifecycleAction::Start);
                                 }
                             },
+                        );
+                        ui.label(
+                            egui::RichText::new(row.right_label)
+                                .monospace()
+                                .small()
+                                .color(pal.text_muted),
                         );
                     });
                 actions_rect = cluster.response.rect;
@@ -212,11 +323,6 @@ pub fn container_row(
         });
 
     let row_rect = inner.response.rect;
-    // The "open on any other press" hit-zone must not overlap the action
-    // cluster: egui breaks a tie between two perfectly-overlapping click
-    // senses by picking whichever was registered last, which would always be
-    // this outer interact (it's added after the buttons) and would swallow
-    // every button click before it ever reaches Restart/Stop/Start.
     let open_rect = if actions_rect.is_finite() {
         egui::Rect::from_min_max(
             row_rect.min,
@@ -229,7 +335,6 @@ pub fn container_row(
         .interact(open_rect, id, egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     let t = ui.ctx().animate_bool(id, resp.hovered());
-
     ui.painter().set(
         bg_idx,
         egui::epaint::RectShape::new(
@@ -241,11 +346,58 @@ pub fn container_row(
         ),
     );
 
-    // A cluster press wins; otherwise a press anywhere on the row opens it.
     match action {
-        Some(a) => Some(RowOutcome::Act(a)),
-        None if resp.clicked() => Some(RowOutcome::Open),
+        Some(action) => Some(InventoryRowOutcome::Act(action)),
+        None if resp.clicked() => Some(InventoryRowOutcome::Open),
         None => None,
+    }
+}
+
+/// One Docker container row, adapted into the common inventory renderer.
+pub fn container_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    container: &Container,
+) -> Option<RowOutcome> {
+    let ports = ports_summary(container);
+    let status = status_phrase(container);
+    let model = InventoryRow {
+        id: &container.id.0,
+        name: &container.name,
+        detail: &container.image,
+        status: &status,
+        secondary_tail: ports.as_deref(),
+        right_label: "",
+        state: container.state,
+        source: InventorySource::Docker,
+    };
+    let actions = if container.state.is_active() {
+        InventoryActions::RestartStop
+    } else {
+        InventoryActions::StartOnly
+    };
+    match inventory_row(ui, pal, &model, actions) {
+        Some(InventoryRowOutcome::Open) => Some(RowOutcome::Open),
+        Some(InventoryRowOutcome::Act(InventoryAction::Start)) => {
+            Some(RowOutcome::Act(LifecycleAction::Start))
+        }
+        Some(InventoryRowOutcome::Act(InventoryAction::Stop)) => {
+            Some(RowOutcome::Act(LifecycleAction::Stop))
+        }
+        Some(InventoryRowOutcome::Act(InventoryAction::Restart)) => {
+            Some(RowOutcome::Act(LifecycleAction::Restart))
+        }
+        None => None,
+    }
+}
+
+fn kubernetes_phase_state(phase: &str) -> ContainerState {
+    match phase.to_ascii_lowercase().as_str() {
+        "running" => ContainerState::Running,
+        "pending" => ContainerState::Created,
+        "succeeded" | "failed" => ContainerState::Exited,
+        "unknown" => ContainerState::Unknown,
+        _ => ContainerState::Unknown,
     }
 }
 
@@ -307,6 +459,7 @@ pub fn group_header(
     any_stopped: bool,
     any_active: bool,
     usage: Option<GroupUsage>,
+    show_actions: bool,
 ) -> Option<GroupOutcome> {
     let full_w = ui.available_width();
     let bg_idx = ui.painter().add(egui::Shape::Noop);
@@ -380,30 +533,35 @@ pub fn group_header(
                 let cluster =
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        if icons::icon_button(ui, pal, Icon::Trash, None, "Delete all").clicked() {
+                        if show_actions
+                            && icons::icon_button(ui, pal, Icon::Trash, None, "Delete all")
+                                .clicked()
+                        {
                             action = Some(GroupOutcome::BulkAct(LifecycleAction::Remove));
                         }
-                        if icons::icon_button_enabled(
-                            ui,
-                            pal,
-                            Icon::Stop,
-                            None,
-                            "Stop all",
-                            any_active,
-                        )
-                        .clicked()
+                        if show_actions
+                            && icons::icon_button_enabled(
+                                ui,
+                                pal,
+                                Icon::Stop,
+                                None,
+                                "Stop all",
+                                any_active,
+                            )
+                            .clicked()
                         {
                             action = Some(GroupOutcome::BulkAct(LifecycleAction::Stop));
                         }
-                        if icons::icon_button_enabled(
-                            ui,
-                            pal,
-                            Icon::Play,
-                            Some(pal.accent),
-                            "Start all",
-                            any_stopped,
-                        )
-                        .clicked()
+                        if show_actions
+                            && icons::icon_button_enabled(
+                                ui,
+                                pal,
+                                Icon::Play,
+                                Some(pal.accent),
+                                "Start all",
+                                any_stopped,
+                            )
+                            .clicked()
                         {
                             action = Some(GroupOutcome::BulkAct(LifecycleAction::Start));
                         }
@@ -840,7 +998,8 @@ mod tests {
             let mut outcome_was_none = false;
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let outcome = group_header(ui, &pal, "demo", None, 3, 1.0, true, true, None);
+                    let outcome =
+                        group_header(ui, &pal, "demo", None, 3, 1.0, true, true, None, true);
                     outcome_was_none = outcome.is_none();
                 });
             });
@@ -879,6 +1038,7 @@ mod tests {
                             mem_used: 1_073_741_824,
                             partial: true,
                         }),
+                        true,
                     );
                 });
             });
@@ -963,6 +1123,44 @@ mod tests {
             assert!(
                 measured <= LIST_ROW_H,
                 "container_row is {measured}px at width {w}, over the {LIST_ROW_H}px list slot"
+            );
+        }
+    }
+
+    #[test]
+    fn kubernetes_pod_row_lays_out_in_the_list_slot() {
+        let ctx = egui::Context::default();
+        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+        let pod = KubernetesPod {
+            connection: "rancher-desktop".into(),
+            namespace: "kube-system".into(),
+            name: "metrics-server-6dc596dfb8-2xmln".into(),
+            owner: None,
+            ready: "1/1".into(),
+            phase: "Running".into(),
+        };
+        for width in [320.0_f32, 480.0, 760.0, 1200.0] {
+            let mut measured = 0.0_f32;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let before = ui.cursor().top();
+                        let _ = kubernetes_pod_row(ui, &pal, &pod, false, false);
+                        measured = ui.cursor().top() - before;
+                    });
+                },
+            );
+            assert!(
+                measured <= LIST_ROW_H,
+                "kubernetes_pod_row is {measured}px at width {width}, over the {LIST_ROW_H}px list slot"
             );
         }
     }

@@ -26,6 +26,68 @@ pub enum Capability {
     Network,
     Storage,
     Notifications,
+    /// Read Kubernetes contexts, namespaces, and workload metadata through the
+    /// host-owned kubeconfig client.
+    KubernetesRead,
+    /// Mutate Kubernetes workloads (for example scale or rollout restart).
+    KubernetesWorkloadsManage,
+    /// Read bounded Kubernetes pod log output.
+    KubernetesLogsRead,
+    /// Open an interactive Kubernetes pod exec session.
+    KubernetesExec,
+    /// Open a local Kubernetes port-forward session.
+    KubernetesPortForward,
+}
+
+/// One Kubernetes context exposed by the host-owned kubeconfig client.
+///
+/// Credentials deliberately do not cross the extension boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubernetesContext {
+    /// Stable kubeconfig context name.
+    pub name: String,
+    /// API server cluster name associated with this context.
+    pub cluster: String,
+    /// User identity name associated with this context.
+    pub user: String,
+    /// Whether this is kubeconfig's current context.
+    pub current: bool,
+}
+
+/// A namespace visible within one Kubernetes context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubernetesNamespace {
+    /// Namespace name.
+    pub name: String,
+    /// Kubernetes lifecycle phase, such as `Active` or `Terminating`.
+    pub phase: String,
+}
+
+/// Workload categories supported by the initial Kubernetes extension slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KubernetesWorkloadKind {
+    Pod,
+    Deployment,
+    StatefulSet,
+    DaemonSet,
+    Job,
+    CronJob,
+}
+
+/// A normalized, read-only Kubernetes workload row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubernetesWorkloadSummary {
+    /// Kubernetes resource kind.
+    pub kind: KubernetesWorkloadKind,
+    /// Object name.
+    pub name: String,
+    /// Namespace containing the object.
+    pub namespace: String,
+    /// Short host-produced readiness or phase summary.
+    pub status: String,
+    /// Creation timestamp in RFC 3339 form when the API supplied one.
+    pub created_at: Option<String>,
 }
 
 /// The container lifecycle operations an extension may request from Rocker.

@@ -9,8 +9,8 @@ use bollard::models::{ContainerInspectResponse, ContainerStatsResponse};
 use bollard::query_parameters as qp;
 
 use rocker_core::{
-    Container, ContainerDetail, ContainerId, ContainerState, HealthInfo, MountInfo, NetworkInfo,
-    PortBinding, StatSample,
+    Connection, ConnectionKind, Container, ContainerDetail, ContainerId, ContainerState,
+    HealthInfo, MountInfo, NetworkInfo, PortBinding, StatSample,
 };
 
 use crate::error::{EngineError, Result};
@@ -42,10 +42,35 @@ pub struct LocalDocker {
 }
 
 impl LocalDocker {
-    /// Connect using Docker's own environment/default resolution.
-    pub fn connect() -> Result<Self> {
-        let inner = bollard::Docker::connect_with_local_defaults()
-            .map_err(|e| EngineError::Unreachable(e.to_string()))?;
+    /// Connect to a configured Docker endpoint.
+    pub fn connect(connection: &Connection) -> Result<Self> {
+        let inner = match &connection.kind {
+            ConnectionKind::Socket { path } => {
+                bollard::Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)
+            }
+            #[cfg(windows)]
+            ConnectionKind::NamedPipe { path } => {
+                bollard::Docker::connect_with_named_pipe(path, 120, bollard::API_DEFAULT_VERSION)
+            }
+            #[cfg(not(windows))]
+            ConnectionKind::NamedPipe { .. } => {
+                return Err(EngineError::Unreachable(
+                    "Windows named-pipe connections are only available on Windows".to_string(),
+                ));
+            }
+            ConnectionKind::Tcp { host, port, tls } => bollard::Docker::connect_with_ssl(
+                &format!("tcp://{host}:{port}"),
+                std::path::Path::new(&tls.client_key),
+                std::path::Path::new(&tls.client_cert),
+                std::path::Path::new(&tls.ca_cert),
+                120,
+                bollard::API_DEFAULT_VERSION,
+            ),
+            ConnectionKind::Ssh { uri } => {
+                bollard::Docker::connect_with_ssh(uri, 120, bollard::API_DEFAULT_VERSION, None)
+            }
+        }
+        .map_err(|e| EngineError::Unreachable(e.to_string()))?;
         Ok(Self { inner })
     }
 

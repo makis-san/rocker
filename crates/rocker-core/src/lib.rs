@@ -8,6 +8,7 @@ pub mod connection;
 pub mod container;
 pub mod detail;
 pub mod group;
+pub mod kubernetes;
 pub mod stat;
 
 pub use audit::ExecAudit;
@@ -17,6 +18,7 @@ pub use detail::{ContainerDetail, HealthInfo, MountInfo, NetworkInfo};
 pub use group::{
     resolve as resolve_groups, Group, GroupId, GroupKind, GroupRule, ResolvedSection, SectionId,
 };
+pub use kubernetes::{KubernetesOwner, KubernetesPod, KubernetesWorkloadRef};
 pub use stat::StatSample;
 
 /// Semantic version of the token schema that themes and extensions freeze

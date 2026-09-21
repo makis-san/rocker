@@ -61,34 +61,212 @@ pub struct LogExport {
     pub body: String,
 }
 
+/// The stable tabs shared by Docker and extension-backed resource details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub enum DetailTab {
     Overview,
     Logs,
     Stats,
     Terminal,
 }
 
-impl Tab {
-    const ALL: [Tab; 4] = [Tab::Overview, Tab::Logs, Tab::Stats, Tab::Terminal];
+impl DetailTab {
+    const ALL: [Self; 4] = [Self::Overview, Self::Logs, Self::Stats, Self::Terminal];
 
     fn label(self) -> &'static str {
         match self {
-            Tab::Overview => "Overview",
-            Tab::Logs => "Logs",
-            Tab::Stats => "Stats",
-            Tab::Terminal => "Terminal",
+            Self::Overview => "Overview",
+            Self::Logs => "Logs",
+            Self::Stats => "Stats",
+            Self::Terminal => "Terminal",
         }
     }
 
     fn icon(self) -> Icon {
         match self {
-            Tab::Overview => Icon::Info,
-            Tab::Logs => Icon::Lines,
-            Tab::Stats => Icon::Pulse,
-            Tab::Terminal => Icon::Terminal,
+            Self::Overview => Icon::Info,
+            Self::Logs => Icon::Lines,
+            Self::Stats => Icon::Pulse,
+            Self::Terminal => Icon::Terminal,
         }
     }
+}
+
+/// Identity data for the shared detail-screen header.
+pub struct DetailHeader<'a> {
+    pub name: &'a str,
+    pub status: &'a str,
+    pub state: ContainerState,
+    /// An optional source glyph supplied by the trusted host, such as the
+    /// Kubernetes mark. Extensions never draw directly into this header.
+    pub source_icon: Option<Icon>,
+}
+
+/// Draw the common detail header and return whether the user requested Back.
+/// `actions` is rendered by the host at the trailing edge so each backend can
+/// expose only operations it is authorized to perform.
+pub fn detail_header(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    header: DetailHeader<'_>,
+    actions: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut back = false;
+    ui.horizontal(|ui| {
+        if icons::icon_button(ui, pal, Icon::Back, None, "Back to inventory").clicked() {
+            back = true;
+        }
+        ui.add_space(4.0);
+        widgets::state_indicator(ui, pal, header.state);
+        if let Some(icon) = header.source_icon {
+            ui.add_space(4.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+            icons::draw(ui.painter(), icon, rect, pal.accent);
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(header.name)
+                .size(15.0)
+                .strong()
+                .color(pal.text),
+        );
+        ui.add_space(8.0);
+        ui.label(RichText::new(header.status).small().color(pal.text_muted));
+        ui.with_layout(Layout::right_to_left(Align::Center), actions);
+    });
+    back
+}
+
+/// Draw the common tab strip used by Docker and extension-backed details.
+pub fn detail_tabstrip(ui: &mut egui::Ui, pal: &Palette, selected: &mut DetailTab) {
+    let strip = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let mut rects = Vec::new();
+            for tab in DetailTab::ALL {
+                let active = *selected == tab;
+                let label = tab.label();
+                let galley = ui.painter().layout_no_wrap(
+                    label.to_owned(),
+                    FontId::proportional(12.5),
+                    Color32::WHITE,
+                );
+                let width = galley.rect.width() + 26.0;
+                let (rect, response) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+                let hot = ui.ctx().animate_bool(response.id, response.hovered());
+                let color = if active {
+                    pal.text
+                } else {
+                    pal.text_muted.lerp_to_gamma(pal.text, 0.35 * hot)
+                };
+                let icon_rect = Rect::from_min_size(
+                    egui::pos2(rect.left(), rect.center().y - 7.0),
+                    vec2(14.0, 14.0),
+                );
+                icons::draw(ui.painter(), tab.icon(), icon_rect, color);
+                ui.painter().text(
+                    egui::pos2(icon_rect.right() + 6.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(12.5),
+                    color,
+                );
+                if response.clicked() && !active {
+                    *selected = tab;
+                }
+                rects.push((tab, rect));
+            }
+            rects
+        })
+        .inner;
+    let baseline_y = strip
+        .iter()
+        .map(|(_, rect)| rect.bottom())
+        .fold(f32::MIN, f32::max)
+        + 4.0;
+    ui.painter().hline(
+        ui.max_rect().x_range(),
+        baseline_y,
+        Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7)),
+    );
+    if let Some((_, active)) = strip.iter().find(|(tab, _)| *tab == *selected) {
+        let id = ui.make_persistent_id("tab-indicator");
+        let x = ui
+            .ctx()
+            .animate_value_with_time(id.with("x"), active.left(), 0.14);
+        let width = ui
+            .ctx()
+            .animate_value_with_time(id.with("w"), active.width(), 0.14);
+        ui.painter().rect_filled(
+            Rect::from_min_size(egui::pos2(x, baseline_y - 1.0), vec2(width, 2.0)),
+            style::radius(1.0),
+            pal.accent,
+        );
+    }
+    ui.add_space(4.0);
+}
+
+/// Draw a compact, structured property section for a non-Docker resource.
+/// This deliberately reuses the container overview's key/value treatment
+/// instead of making extensions fall back to unbounded diagnostic text.
+pub fn detail_properties(ui: &mut egui::Ui, pal: &Palette, title: &str, fields: &[(&str, &str)]) {
+    ui.label(RichText::new(title).small().strong().color(pal.text_muted));
+    ui.add_space(6.0);
+    for &(key, value) in fields {
+        kv(ui, pal, key, value);
+    }
+}
+
+/// Render captured output in the same terminal surface used by Docker logs.
+/// The caller owns retrieval and normalization, while this component owns the
+/// bounded, scrollable visual treatment.
+pub fn log_output(ui: &mut egui::Ui, pal: &Palette, lines: &[LogLine]) {
+    if lines.is_empty() {
+        waiting(ui, pal, "No output captured yet");
+        return;
+    }
+    egui::Frame::new()
+        .fill(pal.term_bg)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .corner_radius(style::radius(pal.corner))
+        .show(ui, |ui| {
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    for line in lines {
+                        let mut job = log_line_job(pal, line, None, true);
+                        job.wrap.max_width = ui.available_width();
+                        ui.add(egui::Label::new(job));
+                    }
+                });
+        });
+}
+
+/// Draw one metric tile with the exact card and sparkline treatment used by
+/// Docker stats. Backends may use this when a metric is reported in a native
+/// unit rather than Docker's percentage/counter sample format.
+pub fn metric_snapshot(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    value: &str,
+    sub: &str,
+    color: Color32,
+) {
+    metric_card(
+        ui,
+        pal,
+        MetricCard {
+            label,
+            value,
+            sub,
+            series: &[],
+            scale: 1.0,
+            color,
+        },
+    );
 }
 
 /// Commands the app should forward to the engine, plus a `back` flag asking it
@@ -235,7 +413,7 @@ pub struct DetailScreen {
     name: String,
     image: String,
     summary_state: ContainerState,
-    tab: Tab,
+    tab: DetailTab,
     detail: Option<ContainerDetail>,
     logs: Logs,
     stats: Stats,
@@ -257,7 +435,7 @@ impl DetailScreen {
             name: c.name.clone(),
             image: c.image.clone(),
             summary_state: c.state,
-            tab: Tab::Overview,
+            tab: DetailTab::Overview,
             detail: None,
             logs: Logs::default(),
             stats: Stats::default(),
@@ -277,10 +455,10 @@ impl DetailScreen {
     /// specific tab headlessly; the running app switches tabs from a click.
     pub fn debug_set_tab(&mut self, name: &str) {
         self.tab = match name {
-            "logs" => Tab::Logs,
-            "stats" => Tab::Stats,
-            "terminal" => Tab::Terminal,
-            _ => Tab::Overview,
+            "logs" => DetailTab::Logs,
+            "stats" => DetailTab::Stats,
+            "terminal" => DetailTab::Terminal,
+            _ => DetailTab::Overview,
         };
     }
 
@@ -411,45 +589,38 @@ impl DetailScreen {
 
         self.subheader(ui, pal, &mut out);
         ui.add_space(8.0);
-        self.tabstrip(ui, pal);
+        detail_tabstrip(ui, pal, &mut self.tab);
         ui.add_space(12.0);
 
         match self.tab {
-            Tab::Overview => self.overview(ui, pal),
-            Tab::Logs => self.logs_tab(ui, pal, &mut out),
-            Tab::Stats => self.stats_tab(ui, pal),
-            Tab::Terminal => self.terminal_tab(ui, pal, &mut out),
+            DetailTab::Overview => self.overview(ui, pal),
+            DetailTab::Logs => self.logs_tab(ui, pal, &mut out),
+            DetailTab::Stats => self.stats_tab(ui, pal),
+            DetailTab::Terminal => self.terminal_tab(ui, pal, &mut out),
         }
 
         out
     }
 
     fn subheader(&mut self, ui: &mut egui::Ui, pal: &Palette, out: &mut DetailResponse) {
-        ui.horizontal(|ui| {
-            if icons::icon_button(ui, pal, Icon::Back, None, "Back to containers").clicked() {
-                out.back = true;
-            }
-            ui.add_space(4.0);
-            widgets::state_indicator(ui, pal, self.state());
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(&self.name)
-                    .size(15.0)
-                    .strong()
-                    .color(pal.text),
-            );
-
-            let status = self
-                .detail
-                .as_ref()
-                .map(|d| d.status_line.clone())
-                .unwrap_or_else(|| state_word(self.state()).to_string());
-            ui.add_space(8.0);
-            ui.label(RichText::new(status).small().color(pal.text_muted));
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let state = self.state();
+        let status = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.status_line.as_str())
+            .unwrap_or_else(|| state_word(state));
+        out.back = detail_header(
+            ui,
+            pal,
+            DetailHeader {
+                name: &self.name,
+                status,
+                state,
+                source_icon: None,
+            },
+            |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                for (icon, tint, tip, action) in lifecycle_actions(self.state()) {
+                for (icon, tint, tip, action) in lifecycle_actions(state) {
                     if icons::icon_button(ui, pal, icon, tint.then_some(pal.accent), tip).clicked()
                     {
                         out.commands.push(Command::Lifecycle {
@@ -458,83 +629,8 @@ impl DetailScreen {
                         });
                     }
                 }
-            });
-        });
-    }
-
-    fn tabstrip(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let strip = ui
-            .horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let mut rects = Vec::new();
-                for tab in Tab::ALL {
-                    let rect = self.tab_button(ui, pal, tab);
-                    rects.push((tab, rect));
-                }
-                rects
-            })
-            .inner;
-
-        let baseline_y = strip
-            .iter()
-            .map(|(_, r)| r.bottom())
-            .fold(f32::MIN, f32::max)
-            + 4.0;
-        let full = ui.max_rect();
-        ui.painter().hline(
-            full.x_range(),
-            baseline_y,
-            Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7)),
+            },
         );
-
-        if let Some((_, active)) = strip.iter().find(|(t, _)| *t == self.tab) {
-            let id = ui.make_persistent_id("tab-indicator");
-            let x = ui
-                .ctx()
-                .animate_value_with_time(id.with("x"), active.left(), 0.14);
-            let w = ui
-                .ctx()
-                .animate_value_with_time(id.with("w"), active.width(), 0.14);
-            let seg = Rect::from_min_size(egui::pos2(x, baseline_y - 1.0), vec2(w, 2.0));
-            ui.painter()
-                .rect_filled(seg, style::radius(1.0), pal.accent);
-        }
-        ui.add_space(4.0);
-    }
-
-    fn tab_button(&mut self, ui: &mut egui::Ui, pal: &Palette, tab: Tab) -> Rect {
-        let active = self.tab == tab;
-        let label = tab.label();
-        let galley = ui.painter().layout_no_wrap(
-            label.to_owned(),
-            FontId::proportional(12.5),
-            Color32::WHITE,
-        );
-        let w = galley.rect.width() + 14.0 + 12.0; // icon + gaps
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
-        let hot = ui.ctx().animate_bool(resp.id, resp.hovered());
-
-        let color = if active {
-            pal.text
-        } else {
-            pal.text_muted.lerp_to_gamma(pal.text, 0.35 * hot)
-        };
-        let icon_rect = Rect::from_min_size(
-            egui::pos2(rect.left(), rect.center().y - 7.0),
-            vec2(14.0, 14.0),
-        );
-        icons::draw(ui.painter(), tab.icon(), icon_rect, color);
-        ui.painter().text(
-            egui::pos2(icon_rect.right() + 6.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(12.5),
-            color,
-        );
-        if resp.clicked() && !active {
-            self.tab = tab;
-        }
-        rect
     }
 
     // ---- Overview --------------------------------------------------------
@@ -1849,7 +1945,7 @@ mod tests {
         screen.on_exec_output(b"$ echo hi\r\nhi\r\n\x1b[32mgreen\x1b[0m\r\n");
 
         for size in [egui::vec2(420.0, 500.0), egui::vec2(900.0, 700.0)] {
-            for tab in Tab::ALL {
+            for tab in DetailTab::ALL {
                 screen.tab = tab;
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size)),
@@ -1876,7 +1972,7 @@ mod tests {
         let container = fake_container("beadfeed0002");
         let mut screen = DetailScreen::new(&container);
         screen.on_inspected(fake_detail(&container.id));
-        screen.tab = Tab::Overview;
+        screen.tab = DetailTab::Overview;
         for key in [
             "status", "image", "command", "ports", "networks", "mounts", "env", "labels",
         ] {
@@ -1910,7 +2006,7 @@ mod tests {
         let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
         let container = fake_container("cafefeed0001");
         let mut screen = DetailScreen::new(&container);
-        screen.tab = Tab::Terminal;
+        screen.tab = DetailTab::Terminal;
 
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -2016,7 +2112,7 @@ mod tests {
         let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
         let container = fake_container("f00dcafe0003");
         let mut screen = DetailScreen::new(&container);
-        screen.tab = Tab::Logs;
+        screen.tab = DetailTab::Logs;
         screen.on_log_lines(vec![
             LogLine {
                 stream: LogStream::Stdout,

@@ -1,14 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use rocker_core::{Connection, Container, ContainerId, ContainerState, StatSample};
-use rocker_engine::{start, Command, EngineHandle, Event, LifecycleAction};
+use rocker_core::{Connection, Container, ContainerId, ContainerState, KubernetesPod, StatSample};
+use rocker_engine::{
+    start, Command, EngineHandle, Event, KubernetesLifecycleAction, LifecycleAction, LogLine,
+    LogStream,
+};
 use rocker_ext_host::Discovery;
 use rocker_store::{AppPaths, Config, Settings};
+use rocker_term::Screen;
 use rocker_theme::Theme;
 
-use crate::detail::DetailScreen;
+use crate::detail::{self, DetailHeader, DetailScreen, DetailTab};
 use crate::extensions::{self, ExtensionsScreen};
 use crate::groups;
 use crate::icons::{self, Icon};
@@ -16,8 +20,19 @@ use crate::settings::{self, About};
 use crate::style::{self, Palette};
 use crate::tray::{Tray, TrayAction, TraySummary};
 use crate::widgets::{
-    confirm_dialog, container_row, group_header, GroupOutcome, GroupUsage, RowOutcome, LIST_ROW_H,
+    confirm_dialog, container_row, group_header, kubernetes_pod_row, GroupOutcome, GroupUsage,
+    KubernetesPodOutcome, RowOutcome, LIST_ROW_H,
 };
+
+/// The longest collapsed error preview. The full error remains available from
+/// the banner's "Read more" control.
+const ERROR_PREVIEW_CHARS: usize = 180;
+
+fn error_preview(message: &str) -> Option<String> {
+    let mut chars = message.chars();
+    let preview: String = chars.by_ref().take(ERROR_PREVIEW_CHARS).collect();
+    chars.next().map(|_| format!("{preview}\u{2026}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConnStatus {
@@ -32,6 +47,7 @@ enum View {
     Groups,
     Extensions,
     Settings,
+    KubernetesDetail,
 }
 
 /// A click in the header, applied after the panel closure returns so the header
@@ -50,6 +66,12 @@ enum ListHit {
     /// A group header's bulk action, already narrowed to the containers it
     /// actually applies to (e.g. "start all" only names the stopped ones).
     BulkAct(Vec<ContainerId>, LifecycleAction),
+    KubernetesAct(KubernetesPod, KubernetesLifecycleAction),
+    KubernetesWorkloadAct(
+        rocker_core::KubernetesWorkloadRef,
+        KubernetesLifecycleAction,
+    ),
+    OpenKubernetes(KubernetesPod),
 }
 
 /// A bulk delete waiting on the confirm dialog before it is sent.
@@ -58,11 +80,32 @@ struct PendingDelete {
     detail: String,
     containers: Vec<ContainerId>,
 }
+struct PendingKubernetesAction {
+    kubeconfig: String,
+    workload: rocker_core::KubernetesWorkloadRef,
+    action: KubernetesLifecycleAction,
+    title: String,
+    detail: String,
+}
+
+/// The two aggregate values Metrics Server returns for one Pod.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KubernetesPodUsage {
+    cpu: String,
+    memory: String,
+}
 
 pub struct RockerApp {
     engine: EngineHandle,
     paths: AppPaths,
     config: Config,
+    /// Context metadata discovered from local kubeconfig files. This remains
+    /// host-owned; extensions never receive kubeconfig credentials.
+    kubernetes_engines: Vec<settings::KubernetesEngine>,
+    kubernetes_pods: Vec<KubernetesPod>,
+    kubernetes_usage: HashMap<String, (u64, u64)>,
+    kubernetes_loading: bool,
+    kubernetes_error: Option<String>,
     pal: Palette,
     view: View,
     status: ConnStatus,
@@ -77,6 +120,8 @@ pub struct RockerApp {
     /// frame.
     stats_subscribed: HashSet<ContainerId>,
     last_error: Option<String>,
+    /// Whether the current error banner shows its complete diagnostic.
+    error_expanded: bool,
     /// A transient, non-error confirmation (e.g. "logs exported to …"), shown
     /// in a quiet accent banner and dismissable like the error one.
     last_notice: Option<String>,
@@ -84,9 +129,20 @@ pub struct RockerApp {
     /// inside it so the list's scroll position and group state survive a trip
     /// into a container and back.
     detail: Option<DetailScreen>,
+    kubernetes_detail: Option<KubernetesPod>,
+    kubernetes_detail_tab: DetailTab,
+    kubernetes_info: Option<String>,
+    kubernetes_logs: Vec<LogLine>,
+    kubernetes_stats: Option<KubernetesPodUsage>,
+    kubernetes_terminal: Screen,
+    kubernetes_terminal_cache: crate::terminal::RowCache,
+    kubernetes_terminal_started: bool,
+    kubernetes_terminal_ready: bool,
+    kubernetes_terminal_ended: Option<String>,
     /// A group's "delete all" waiting on confirmation before it is sent —
     /// destructive and irreversible, so it never fires straight off the click.
     pending_delete: Option<PendingDelete>,
+    pending_kubernetes_action: Option<PendingKubernetesAction>,
     /// The local extension registry and its last discovery pass. Lives
     /// alongside `view` rather than inside it, same as `detail`, so a
     /// discovery re-scan survives navigating away and back.
@@ -164,6 +220,18 @@ fn bulk_action_applies(state: ContainerState, action: LifecycleAction) -> bool {
     }
 }
 
+fn kubernetes_workload(pod: &KubernetesPod) -> Option<rocker_core::KubernetesWorkloadRef> {
+    let owner = pod.owner.as_ref()?;
+    matches!(owner.kind.as_str(), "Deployment" | "StatefulSet").then(|| {
+        rocker_core::KubernetesWorkloadRef {
+            connection: pod.connection.clone(),
+            namespace: pod.namespace.clone(),
+            kind: owner.kind.clone(),
+            name: owner.name.clone(),
+        }
+    })
+}
+
 impl RockerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         let paths = AppPaths::resolve();
@@ -171,6 +239,8 @@ impl RockerApp {
             tracing::warn!(%err, "config load failed; starting from defaults");
             Config::default()
         });
+        let kubernetes_engines =
+            settings::discover_kubernetes_engines(&config.kubernetes_kubeconfigs);
 
         // Built before the initial theme resolves, so a `custom` theme setting
         // can be looked up against real discovery on the very first frame
@@ -192,7 +262,30 @@ impl RockerApp {
 
         let ctx = cc.egui_ctx.clone();
         let engine = start(&rt, move || ctx.request_repaint(), history);
-        engine.send(Command::Connect(Connection::local_default().id));
+        let kubernetes_queries = if config.settings.kubernetes_enabled {
+            settings::kubernetes_pod_queries(&kubernetes_engines)
+        } else {
+            Vec::new()
+        };
+        let kubernetes_loading = !kubernetes_queries.is_empty();
+        for (kubeconfig, context) in kubernetes_queries {
+            engine.send(Command::RefreshKubernetesPods {
+                kubeconfig: kubeconfig.clone(),
+                context: context.clone(),
+            });
+            engine.send(Command::RefreshKubernetesUsage {
+                kubeconfig,
+                context,
+            });
+        }
+        let initial_connection = config
+            .connections
+            .iter()
+            .find(|connection| connection.default)
+            .or_else(|| config.connections.first())
+            .cloned()
+            .unwrap_or_else(Connection::local_default);
+        engine.send(Command::Connect(initial_connection));
         engine.send(Command::SetMaxStatsStreams(
             config.settings.max_stats_streams,
         ));
@@ -211,6 +304,11 @@ impl RockerApp {
             engine,
             paths,
             config,
+            kubernetes_engines,
+            kubernetes_pods: Vec::new(),
+            kubernetes_usage: HashMap::new(),
+            kubernetes_loading,
+            kubernetes_error: None,
             pal,
             view: View::Containers,
             status: ConnStatus::Connecting,
@@ -218,9 +316,21 @@ impl RockerApp {
             stats: HashMap::new(),
             stats_subscribed: HashSet::new(),
             last_error: None,
+            error_expanded: false,
             last_notice: None,
             detail: None,
+            kubernetes_detail: None,
+            kubernetes_detail_tab: DetailTab::Overview,
+            kubernetes_info: None,
+            kubernetes_logs: Vec::new(),
+            kubernetes_stats: None,
+            kubernetes_terminal: Screen::new(80, 24),
+            kubernetes_terminal_cache: crate::terminal::RowCache::default(),
+            kubernetes_terminal_started: false,
+            kubernetes_terminal_ready: false,
+            kubernetes_terminal_ended: None,
             pending_delete: None,
+            pending_kubernetes_action: None,
             extensions,
             disk_usage: None,
             last_disk_poll: f64::NEG_INFINITY,
@@ -342,7 +452,7 @@ impl RockerApp {
             match event {
                 Event::Connected { version, .. } => {
                     self.status = ConnStatus::Connected { version };
-                    self.last_error = None;
+                    self.clear_error();
                     // Pull a fresh disk figure for the tray on the next frame.
                     self.last_disk_poll = f64::NEG_INFINITY;
                 }
@@ -351,6 +461,100 @@ impl RockerApp {
                     self.disk_usage = None;
                 }
                 Event::DiskUsage(bytes) => self.disk_usage = bytes,
+                Event::KubernetesPods { context, pods } => {
+                    self.kubernetes_pods.retain(|pod| pod.connection != context);
+                    self.kubernetes_pods.extend(pods);
+                    self.kubernetes_loading = false;
+                    self.kubernetes_error = None;
+                }
+                Event::KubernetesPodsFailed(error) => {
+                    self.kubernetes_loading = false;
+                    self.kubernetes_error = Some(error);
+                }
+                Event::KubernetesUsage {
+                    context,
+                    cpu_millicores,
+                    memory_bytes,
+                } => {
+                    self.kubernetes_usage
+                        .insert(context, (cpu_millicores, memory_bytes));
+                }
+                Event::KubernetesLifecycleDone {
+                    workload,
+                    action,
+                    previous_replicas,
+                } => {
+                    self.config
+                        .kubernetes_paused_workloads
+                        .retain(|paused| paused.workload != workload);
+                    if let (KubernetesLifecycleAction::Stop, Some(replicas)) =
+                        (action, previous_replicas)
+                    {
+                        self.config
+                            .kubernetes_paused_workloads
+                            .push(rocker_store::PausedKubernetesWorkload { workload, replicas });
+                    }
+                    self.persist();
+                    let queries = settings::kubernetes_pod_queries(&self.kubernetes_engines);
+                    if !queries.is_empty() {
+                        self.kubernetes_loading = true;
+                        for (kubeconfig, context) in queries {
+                            self.engine.send(Command::RefreshKubernetesPods {
+                                kubeconfig,
+                                context,
+                            });
+                        }
+                    }
+                }
+                Event::KubernetesLifecycleFailed(error) => {
+                    self.kubernetes_error = Some(error);
+                }
+                Event::KubernetesPodInfo { pod, text }
+                    if self.kubernetes_detail.as_ref() == Some(&pod) =>
+                {
+                    self.kubernetes_info = Some(text);
+                }
+                Event::KubernetesPodLogs { pod, text }
+                    if self.kubernetes_detail.as_ref() == Some(&pod) =>
+                {
+                    self.kubernetes_logs = kubernetes_log_lines(&text);
+                }
+                Event::KubernetesPodStats { pod, text }
+                    if self.kubernetes_detail.as_ref() == Some(&pod) =>
+                {
+                    self.kubernetes_stats = kubernetes_pod_usage(&text);
+                }
+                Event::KubernetesPodQueryFailed { pod, message }
+                    if self.kubernetes_detail.as_ref() == Some(&pod) =>
+                {
+                    self.kubernetes_error = Some(message);
+                }
+                Event::KubernetesExecReady { pod }
+                    if self.kubernetes_detail.as_ref() == Some(&pod) =>
+                {
+                    self.kubernetes_terminal_started = true;
+                    self.kubernetes_terminal_ready = true;
+                    self.kubernetes_terminal_ended = None;
+                }
+                Event::KubernetesExecOutput { pod, bytes }
+                    if self.kubernetes_detail.as_ref() == Some(&pod) =>
+                {
+                    self.kubernetes_terminal.feed(&bytes);
+                }
+                Event::KubernetesExecClosed { pod, reason }
+                    if self.kubernetes_detail.as_ref() == Some(&pod) =>
+                {
+                    self.kubernetes_terminal_started = false;
+                    self.kubernetes_terminal_ready = false;
+                    self.kubernetes_terminal_ended = Some(reason.unwrap_or_default());
+                }
+                Event::KubernetesPodInfo { .. }
+                | Event::KubernetesPodLogs { .. }
+                | Event::KubernetesPodStats { .. }
+                | Event::KubernetesPodQueryFailed { .. }
+                | Event::KubernetesExecReady { .. }
+                | Event::KubernetesExecOutput { .. }
+                | Event::KubernetesExecClosed { .. } => {}
                 Event::Containers(mut list) => {
                     // Grouped containers first (by Compose project, then name),
                     // ungrouped last, so the list reads as sections.
@@ -380,7 +584,7 @@ impl RockerApp {
                         self.engine.send(Command::Inspect(container));
                     }
                 }
-                Event::Error(message) => self.last_error = Some(message),
+                Event::Error(message) => self.show_error(message),
                 Event::Inspected(d) => {
                     if let Some(screen) = &mut self.detail {
                         if *screen.id() == d.id {
@@ -486,8 +690,15 @@ impl RockerApp {
     }
 
     fn reconnect(&self) {
-        self.engine
-            .send(Command::Connect(Connection::local_default().id));
+        let connection = self
+            .config
+            .connections
+            .iter()
+            .find(|connection| connection.default)
+            .or_else(|| self.config.connections.first())
+            .cloned()
+            .unwrap_or_else(Connection::local_default);
+        self.engine.send(Command::Connect(connection));
     }
 
     fn act(&self, container: &Container, action: LifecycleAction) {
@@ -537,8 +748,19 @@ impl RockerApp {
     /// Write the config back to disk, surfacing any failure in the error banner.
     fn persist(&mut self) {
         if let Err(err) = self.config.save(&self.paths) {
-            self.last_error = Some(format!("Couldn't save settings: {err}"));
+            self.show_error(format!("Couldn't save settings: {err}"));
         }
+    }
+
+    /// Show a new error and reset its diagnostic disclosure to the preview.
+    fn show_error(&mut self, message: String) {
+        self.last_error = Some(message);
+        self.error_expanded = false;
+    }
+
+    fn clear_error(&mut self) {
+        self.last_error = None;
+        self.error_expanded = false;
     }
 
     /// Rebuild the palette from the current `settings.theme` and re-install the
@@ -752,6 +974,7 @@ impl RockerApp {
         };
         let pal = self.pal;
         let mut dismiss = false;
+        let preview = error_preview(&message);
         egui::Frame::new()
             .fill(pal.unhealthy.gamma_multiply(0.12))
             .stroke(egui::Stroke::new(
@@ -770,16 +993,53 @@ impl RockerApp {
                         ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
                     icons::draw(ui.painter(), Icon::Alert, rect, pal.unhealthy);
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new(message).color(pal.text));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icons::icon_button(ui, &pal, Icon::Close, None, "Dismiss").clicked() {
-                            dismiss = true;
-                        }
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Action failed")
+                                    .small()
+                                    .strong()
+                                    .color(pal.unhealthy),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if icons::icon_button(ui, &pal, Icon::Close, None, "Dismiss")
+                                        .clicked()
+                                    {
+                                        dismiss = true;
+                                    }
+                                    if preview.is_some()
+                                        && icons::text_button(
+                                            ui,
+                                            &pal,
+                                            if self.error_expanded {
+                                                "Show less"
+                                            } else {
+                                                "Read more"
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        self.error_expanded = !self.error_expanded;
+                                    }
+                                },
+                            );
+                        });
+                        let text = if self.error_expanded {
+                            &message
+                        } else {
+                            preview.as_deref().unwrap_or(&message)
+                        };
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).color(pal.text_muted))
+                                .wrap(),
+                        );
                     });
                 });
             });
         if dismiss {
-            self.last_error = None;
+            self.clear_error();
         }
     }
 
@@ -914,6 +1174,9 @@ impl RockerApp {
         enum Slot<'a> {
             Header(usize),
             Row(&'a Container),
+            KubernetesHeader(&'a str, usize, egui::Id),
+            KubernetesPod(&'a KubernetesPod),
+            KubernetesPaused(&'a rocker_store::PausedKubernetesWorkload),
         }
         let mut slots: Vec<Slot> = Vec::new();
         for (si, sec) in sections.iter().enumerate() {
@@ -921,6 +1184,36 @@ impl RockerApp {
             slots.push(Slot::Header(si));
             if open {
                 slots.extend(sec.containers.iter().map(|c| Slot::Row(c)));
+            }
+        }
+        let mut kubernetes_sections: BTreeMap<
+            &str,
+            (
+                Vec<&KubernetesPod>,
+                Vec<&rocker_store::PausedKubernetesWorkload>,
+            ),
+        > = BTreeMap::new();
+        for pod in &self.kubernetes_pods {
+            kubernetes_sections
+                .entry(&pod.connection)
+                .or_default()
+                .0
+                .push(pod);
+        }
+        for paused in &self.config.kubernetes_paused_workloads {
+            kubernetes_sections
+                .entry(&paused.workload.connection)
+                .or_default()
+                .1
+                .push(paused);
+        }
+        for (connection, (pods, paused)) in kubernetes_sections {
+            let id = ui.make_persistent_id(("sect-kubernetes", connection));
+            let open = CollapsingState::load_with_default_open(ui.ctx(), id, true).is_open();
+            slots.push(Slot::KubernetesHeader(connection, pods.len(), id));
+            if open {
+                slots.extend(pods.into_iter().map(Slot::KubernetesPod));
+                slots.extend(paused.into_iter().map(Slot::KubernetesPaused));
             }
         }
 
@@ -955,6 +1248,7 @@ impl RockerApp {
                                     any_stopped,
                                     any_active,
                                     usage,
+                                    true,
                                 ) {
                                     Some(GroupOutcome::Toggle) => {
                                         state.toggle(ui);
@@ -988,6 +1282,135 @@ impl RockerApp {
                                 }
                             });
                         }
+                        Slot::KubernetesHeader(connection, count, id) => {
+                            ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
+                                let mut state =
+                                    CollapsingState::load_with_default_open(ui.ctx(), *id, true);
+                                let open_t =
+                                    ui.ctx().animate_bool(id.with("open"), state.is_open());
+                                ui.add_space((LIST_ROW_H - 40.0).max(0.0));
+                                let label = format!("Kubernetes · {connection}");
+                                let usage = self.kubernetes_usage.get(*connection).map(
+                                    |&(cpu_millicores, memory_bytes)| GroupUsage {
+                                        cpu_pct: cpu_millicores as f32 / 10.0,
+                                        mem_used: memory_bytes,
+                                        partial: false,
+                                    },
+                                );
+                                if matches!(
+                                    group_header(
+                                        ui,
+                                        pal,
+                                        &label,
+                                        Some(pal.accent),
+                                        *count,
+                                        open_t,
+                                        false,
+                                        false,
+                                        usage,
+                                        false,
+                                    ),
+                                    Some(GroupOutcome::Toggle)
+                                ) {
+                                    state.toggle(ui);
+                                    state.store(ui.ctx());
+                                }
+                            });
+                        }
+                        Slot::KubernetesPod(pod) => {
+                            ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
+                                let workload = kubernetes_workload(pod);
+                                let paused = workload.as_ref().is_some_and(|workload| {
+                                    self.config
+                                        .kubernetes_paused_workloads
+                                        .iter()
+                                        .any(|paused| paused.workload == *workload)
+                                });
+                                if let Some(outcome) =
+                                    kubernetes_pod_row(ui, pal, pod, workload.is_some(), paused)
+                                {
+                                    if matches!(outcome, KubernetesPodOutcome::Open) {
+                                        pending = Some(ListHit::OpenKubernetes((*pod).clone()));
+                                        return;
+                                    }
+                                    let action = match outcome {
+                                        KubernetesPodOutcome::Start => {
+                                            let replicas = workload
+                                                .as_ref()
+                                                .and_then(|workload| {
+                                                    self.config
+                                                        .kubernetes_paused_workloads
+                                                        .iter()
+                                                        .find_map(|paused| {
+                                                            (paused.workload == *workload)
+                                                                .then_some(paused.replicas)
+                                                        })
+                                                })
+                                                .unwrap_or(1);
+                                            KubernetesLifecycleAction::Start { replicas }
+                                        }
+                                        KubernetesPodOutcome::Stop => {
+                                            KubernetesLifecycleAction::Stop
+                                        }
+                                        KubernetesPodOutcome::Restart => {
+                                            KubernetesLifecycleAction::Restart
+                                        }
+                                        KubernetesPodOutcome::Open => unreachable!(),
+                                    };
+                                    pending = Some(ListHit::KubernetesAct((*pod).clone(), action));
+                                }
+                            });
+                        }
+                        Slot::KubernetesPaused(paused) => {
+                            ui.allocate_ui(egui::vec2(ui.available_width(), LIST_ROW_H), |ui| {
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    icons::draw(ui.painter(), Icon::Kubernetes, rect, pal.accent);
+                                    ui.add_space(style::SM);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&paused.workload.name)
+                                                .strong()
+                                                .color(pal.text),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} · {} · paused at {} replicas",
+                                                paused.workload.namespace,
+                                                paused.workload.kind,
+                                                paused.replicas
+                                            ))
+                                            .small()
+                                            .color(pal.text_muted),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if icons::icon_button(
+                                                ui,
+                                                pal,
+                                                Icon::Play,
+                                                Some(pal.accent),
+                                                "Start workload",
+                                            )
+                                            .clicked()
+                                            {
+                                                pending = Some(ListHit::KubernetesWorkloadAct(
+                                                    paused.workload.clone(),
+                                                    KubernetesLifecycleAction::Start {
+                                                        replicas: paused.replicas,
+                                                    },
+                                                ));
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        }
                     }
                 }
             });
@@ -1000,9 +1423,15 @@ impl RockerApp {
             ConnStatus::Connected { version } => Some(version.clone()),
             _ => None,
         };
+        let engine_status = match &self.status {
+            ConnStatus::Connecting => "Connecting",
+            ConnStatus::Connected { .. } => "Connected",
+            ConnStatus::Failed { .. } => "Unavailable",
+        };
         let about = About {
             app_version: env!("CARGO_PKG_VERSION"),
             engine: engine.as_deref(),
+            engine_status,
             config_path: &cfg_path,
         };
 
@@ -1013,9 +1442,18 @@ impl RockerApp {
         if let Some(edit) = settings::settings_screen(
             ui,
             &self.pal,
-            &mut self.config.settings,
-            &custom_themes,
-            about,
+            settings::SettingsScreenData {
+                settings: &mut self.config.settings,
+                connections: &mut self.config.connections,
+                kubernetes_kubeconfigs: &mut self.config.kubernetes_kubeconfigs,
+                kubernetes_engines: &self.kubernetes_engines,
+                kubernetes_pods: &self.kubernetes_pods,
+                kubernetes_loading: self.kubernetes_loading,
+                kubernetes_error: self.kubernetes_error.as_deref(),
+                custom_themes: &custom_themes,
+                discovery: self.extensions.discovery(),
+                about,
+            },
         ) {
             self.engine.send(Command::SetMaxStatsStreams(
                 self.config.settings.max_stats_streams,
@@ -1024,6 +1462,8 @@ impl RockerApp {
                 self.config.settings.stats_retention_hours,
             ));
             self.persist();
+            self.kubernetes_engines =
+                settings::discover_kubernetes_engines(&self.config.kubernetes_kubeconfigs);
             let tray_wanted_now =
                 self.config.settings.minimize_to_tray || self.config.settings.start_minimized;
             if tray_wanted_now != tray_wanted_before {
@@ -1034,6 +1474,21 @@ impl RockerApp {
             }
             if edit.autostart_changed {
                 crate::autostart::sync(self.config.settings.open_at_login);
+            }
+            if let Some(settings::DockerAction::Connect(connection)) = edit.docker_action {
+                self.engine.send(Command::Connect(connection));
+            }
+            if let Some(settings::KubernetesAction::RefreshPods {
+                kubeconfig,
+                context,
+            }) = edit.kubernetes_action
+            {
+                self.kubernetes_loading = true;
+                self.kubernetes_error = None;
+                self.engine.send(Command::RefreshKubernetesPods {
+                    kubeconfig,
+                    context,
+                });
             }
         }
     }
@@ -1053,7 +1508,10 @@ impl RockerApp {
                     self.reconnect();
                 }
             }
-            _ if self.containers.is_empty() => {
+            _ if self.containers.is_empty()
+                && self.kubernetes_pods.is_empty()
+                && self.config.kubernetes_paused_workloads.is_empty() =>
+            {
                 self.centered_state(
                     ui,
                     Icon::Cube,
@@ -1077,9 +1535,92 @@ impl RockerApp {
                     });
                 }
                 Some(ListHit::BulkAct(containers, action)) => self.bulk_act(containers, action),
+                Some(ListHit::KubernetesAct(pod, action)) => {
+                    let Some(workload) = kubernetes_workload(&pod) else {
+                        return;
+                    };
+                    let Some(kubeconfig) = settings::kubernetes_kubeconfig_for_context(
+                        &self.kubernetes_engines,
+                        &pod.connection,
+                    ) else {
+                        self.kubernetes_error =
+                            Some("Kubeconfig for this Pod is unavailable".into());
+                        return;
+                    };
+                    let verb = match action {
+                        KubernetesLifecycleAction::Start { .. } => "Start",
+                        KubernetesLifecycleAction::Stop => "Stop",
+                        KubernetesLifecycleAction::Restart => "Restart",
+                    };
+                    self.pending_kubernetes_action = Some(PendingKubernetesAction {
+                        kubeconfig,
+                        workload: workload.clone(),
+                        action,
+                        title: format!("{verb} {}?", workload.name),
+                        detail: format!(
+                            "This applies to the {} controller in namespace {}.",
+                            workload.kind, workload.namespace
+                        ),
+                    });
+                }
+                Some(ListHit::KubernetesWorkloadAct(workload, action)) => {
+                    let Some(kubeconfig) = settings::kubernetes_kubeconfig_for_context(
+                        &self.kubernetes_engines,
+                        &workload.connection,
+                    ) else {
+                        self.kubernetes_error =
+                            Some("Kubeconfig for this workload is unavailable".into());
+                        return;
+                    };
+                    self.pending_kubernetes_action = Some(PendingKubernetesAction {
+                        kubeconfig,
+                        title: format!("Start {}?", workload.name),
+                        detail: format!(
+                            "This restores {} replicas in namespace {}.",
+                            match action {
+                                KubernetesLifecycleAction::Start { replicas } => replicas,
+                                _ => 0,
+                            },
+                            workload.namespace
+                        ),
+                        workload,
+                        action,
+                    });
+                }
+                Some(ListHit::OpenKubernetes(pod)) => self.open_kubernetes_detail(pod),
                 None => {}
             },
         }
+    }
+
+    fn open_kubernetes_detail(&mut self, pod: KubernetesPod) {
+        let Some(kubeconfig) =
+            settings::kubernetes_kubeconfig_for_context(&self.kubernetes_engines, &pod.connection)
+        else {
+            self.kubernetes_error = Some("Kubeconfig for this Pod is unavailable".into());
+            return;
+        };
+        self.kubernetes_info = None;
+        self.kubernetes_logs.clear();
+        self.kubernetes_stats = None;
+        self.kubernetes_terminal = Screen::new(80, 24);
+        self.kubernetes_terminal_cache.clear();
+        self.kubernetes_terminal_started = false;
+        self.kubernetes_terminal_ready = false;
+        self.kubernetes_terminal_ended = None;
+        self.kubernetes_detail = Some(pod.clone());
+        self.kubernetes_detail_tab = DetailTab::Overview;
+        self.view = View::KubernetesDetail;
+        self.engine.send(Command::InspectKubernetesPod {
+            kubeconfig: kubeconfig.clone(),
+            pod: pod.clone(),
+        });
+        self.engine.send(Command::KubernetesPodLogs {
+            kubeconfig: kubeconfig.clone(),
+            pod: pod.clone(),
+        });
+        self.engine
+            .send(Command::KubernetesPodStats { kubeconfig, pod });
     }
 
     fn groups_view(&mut self, ui: &mut egui::Ui) {
@@ -1102,7 +1643,7 @@ impl RockerApp {
                 self.persist();
             }
             if let Some(err) = edit.error {
-                self.last_error = Some(format!("Couldn't save extensions: {err}"));
+                self.show_error(format!("Couldn't save extensions: {err}"));
             }
         }
     }
@@ -1155,7 +1696,7 @@ impl RockerApp {
             .and_then(|()| std::fs::write(&path, export.body.as_bytes()))
         {
             Ok(()) => self.last_notice = Some(format!("Logs exported to {}", path.display())),
-            Err(e) => self.last_error = Some(format!("Couldn't export logs: {e}")),
+            Err(e) => self.show_error(format!("Couldn't export logs: {e}")),
         }
     }
 }
@@ -1219,6 +1760,7 @@ impl eframe::App for RockerApp {
                     View::Settings => self.settings_view(ui, ctx),
                     View::Groups => self.groups_view(ui),
                     View::Extensions => self.extensions_view(ui),
+                    View::KubernetesDetail => kubernetes_detail_view(self, ui),
                     View::Containers if self.detail.is_some() => self.detail_view(ui),
                     View::Containers => self.containers_view(ui),
                 }
@@ -1234,5 +1776,268 @@ impl eframe::App for RockerApp {
                 None => {}
             }
         }
+        if let Some(pending) = &self.pending_kubernetes_action {
+            match confirm_dialog(
+                ctx,
+                &self.pal,
+                &pending.title,
+                &pending.detail,
+                &pending.title,
+            ) {
+                Some(true) => {
+                    let Some(PendingKubernetesAction {
+                        kubeconfig,
+                        workload,
+                        action,
+                        ..
+                    }) = self.pending_kubernetes_action.take()
+                    else {
+                        return;
+                    };
+                    self.engine.send(Command::KubernetesLifecycle {
+                        kubeconfig,
+                        workload,
+                        action,
+                    });
+                }
+                Some(false) => self.pending_kubernetes_action = None,
+                None => {}
+            }
+        }
+    }
+}
+
+fn kubernetes_detail_view(app: &mut RockerApp, ui: &mut egui::Ui) {
+    let Some(pod) = app.kubernetes_detail.clone() else {
+        app.view = View::Containers;
+        return;
+    };
+    let state = kubernetes_phase_state(&pod.phase);
+    let status = format!("{} · {} · {}", pod.namespace, pod.connection, pod.phase);
+    if detail::detail_header(
+        ui,
+        &app.pal,
+        DetailHeader {
+            name: &pod.name,
+            status: &status,
+            state,
+            source_icon: Some(Icon::Kubernetes),
+        },
+        |_| {},
+    ) {
+        app.engine.send(Command::CloseKubernetesExec);
+        app.kubernetes_detail = None;
+        app.view = View::Containers;
+        return;
+    }
+    ui.add_space(8.0);
+    detail::detail_tabstrip(ui, &app.pal, &mut app.kubernetes_detail_tab);
+    ui.add_space(12.0);
+
+    match app.kubernetes_detail_tab {
+        DetailTab::Overview => kubernetes_overview(ui, &app.pal, &pod),
+        DetailTab::Logs => detail::log_output(ui, &app.pal, &app.kubernetes_logs),
+        DetailTab::Stats => kubernetes_stats_panel(ui, &app.pal, app.kubernetes_stats.as_ref()),
+        DetailTab::Terminal => kubernetes_terminal_tab(app, ui, &pod),
+    }
+}
+
+fn kubernetes_overview(ui: &mut egui::Ui, pal: &Palette, pod: &KubernetesPod) {
+    let owner = pod
+        .owner
+        .as_ref()
+        .map(|owner| format!("{}/{}", owner.kind, owner.name))
+        .unwrap_or_else(|| "Bare Pod".to_owned());
+    detail::detail_properties(
+        ui,
+        pal,
+        "Status",
+        &[
+            ("Phase", &pod.phase),
+            ("Ready", &pod.ready),
+            ("Namespace", &pod.namespace),
+            ("Workload", &owner),
+            ("Context", &pod.connection),
+        ],
+    );
+}
+
+fn kubernetes_stats_panel(ui: &mut egui::Ui, pal: &Palette, usage: Option<&KubernetesPodUsage>) {
+    let Some(usage) = usage else {
+        ui.vertical_centered(|ui| {
+            ui.add_space(56.0);
+            ui.label(egui::RichText::new("Waiting for Metrics Server").color(pal.text_muted));
+        });
+        return;
+    };
+    let card_width = ((ui.available_width() - style::MD) / 2.0).max(180.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = style::MD;
+        ui.allocate_ui(egui::vec2(card_width, 96.0), |ui| {
+            detail::metric_snapshot(ui, pal, "CPU", &usage.cpu, "current Pod usage", pal.accent);
+        });
+        ui.allocate_ui(egui::vec2(card_width, 96.0), |ui| {
+            detail::metric_snapshot(
+                ui,
+                pal,
+                "Memory",
+                &usage.memory,
+                "current Pod usage",
+                pal.running,
+            );
+        });
+    });
+}
+
+fn kubernetes_terminal_tab(app: &mut RockerApp, ui: &mut egui::Ui, pod: &KubernetesPod) {
+    if !app.kubernetes_terminal_started {
+        ui.add_space(48.0);
+        ui.vertical_centered(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+            icons::draw(ui.painter(), Icon::Terminal, rect, app.pal.text_faint);
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("Open an interactive session")
+                    .size(14.0)
+                    .strong()
+                    .color(app.pal.text),
+            );
+            ui.add_space(4.0);
+            if let Some(reason) = &app.kubernetes_terminal_ended {
+                let text = if reason.is_empty() {
+                    "Previous session ended.".to_owned()
+                } else {
+                    format!("Previous session ended: {reason}")
+                };
+                ui.label(egui::RichText::new(text).color(app.pal.text_muted));
+            } else {
+                ui.label(
+                    egui::RichText::new("A shell inside this Pod via kubectl exec.")
+                        .color(app.pal.text_muted),
+                );
+            }
+            ui.add_space(14.0);
+            if icons::primary_button(ui, &app.pal, "Start session").clicked() {
+                start_kubernetes_terminal(app, pod);
+            }
+        });
+        return;
+    }
+
+    let rect = ui.allocate_space(egui::vec2(ui.available_width(), 280.0)).1;
+    let (_, focused) = crate::terminal::surface(
+        ui,
+        rect,
+        ui.make_persistent_id(("kubernetes-terminal", &pod.name)),
+    );
+    crate::terminal::paint(
+        ui,
+        &app.pal,
+        &app.kubernetes_terminal,
+        rect,
+        focused,
+        &mut app.kubernetes_terminal_cache,
+    );
+    if !app.kubernetes_terminal_ready {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "connecting…",
+            egui::FontId::proportional(12.0),
+            app.pal.text_muted,
+        );
+        ui.ctx().request_repaint();
+    }
+    if focused && app.kubernetes_terminal_started {
+        let input = crate::terminal::take_input(ui);
+        if !input.is_empty() {
+            app.engine.send(Command::KubernetesExecInput(input));
+        }
+        ui.ctx().request_repaint();
+    }
+}
+
+fn start_kubernetes_terminal(app: &mut RockerApp, pod: &KubernetesPod) {
+    let Some(kubeconfig) =
+        settings::kubernetes_kubeconfig_for_context(&app.kubernetes_engines, &pod.connection)
+    else {
+        app.kubernetes_error = Some("Kubeconfig for this Pod is unavailable".into());
+        return;
+    };
+    app.kubernetes_terminal = Screen::new(80, 24);
+    app.kubernetes_terminal_cache.clear();
+    app.kubernetes_terminal_started = true;
+    app.kubernetes_terminal_ready = false;
+    app.kubernetes_terminal_ended = None;
+    app.engine.send(Command::OpenKubernetesExec {
+        kubeconfig,
+        pod: pod.clone(),
+    });
+}
+
+fn kubernetes_phase_state(phase: &str) -> ContainerState {
+    match phase.to_ascii_lowercase().as_str() {
+        "running" => ContainerState::Running,
+        "pending" => ContainerState::Created,
+        "succeeded" | "failed" => ContainerState::Exited,
+        _ => ContainerState::Unknown,
+    }
+}
+
+/// Normalize `kubectl logs --timestamps` output before it reaches the shared
+/// log renderer. A malformed prefix remains visible as ordinary stdout.
+fn kubernetes_log_lines(text: &str) -> Vec<LogLine> {
+    text.lines()
+        .map(|line| match line.split_once(char::is_whitespace) {
+            Some((timestamp, message)) if timestamp.contains('T') => LogLine {
+                stream: LogStream::Stdout,
+                ts: Some(timestamp.to_owned()),
+                text: message.trim_start().to_owned(),
+            },
+            _ => LogLine {
+                stream: LogStream::Stdout,
+                ts: None,
+                text: line.to_owned(),
+            },
+        })
+        .collect()
+}
+
+/// Parse the one-row table returned by `kubectl top pod`. Units stay intact:
+/// Kubernetes CPU millicores are not percentages, and pretending otherwise
+/// would make the shared stats cards misleading.
+fn kubernetes_pod_usage(text: &str) -> Option<KubernetesPodUsage> {
+    let mut rows = text.lines().filter(|line| !line.trim().is_empty());
+    let _header = rows.next()?;
+    let row = rows.next()?;
+    let mut columns = row.split_whitespace();
+    let _name = columns.next()?;
+    Some(KubernetesPodUsage {
+        cpu: columns.next()?.to_owned(),
+        memory: columns.next()?.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod kubernetes_detail_tests {
+    use super::{kubernetes_log_lines, kubernetes_pod_usage};
+
+    #[test]
+    fn kubernetes_logs_keep_timestamped_lines_structured() {
+        let lines = kubernetes_log_lines("2026-09-16T12:30:45.123Z started\nplain output");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].ts.as_deref(), Some("2026-09-16T12:30:45.123Z"));
+        assert_eq!(lines[0].text, "started");
+        assert_eq!(lines[1].ts, None);
+    }
+
+    #[test]
+    fn kubernetes_top_row_keeps_native_cpu_and_memory_units() {
+        let usage = kubernetes_pod_usage("NAME CPU(cores) MEMORY(bytes)\napi-0 17m 128Mi\n");
+        assert_eq!(usage.as_ref().map(|usage| usage.cpu.as_str()), Some("17m"));
+        assert_eq!(
+            usage.as_ref().map(|usage| usage.memory.as_str()),
+            Some("128Mi")
+        );
     }
 }

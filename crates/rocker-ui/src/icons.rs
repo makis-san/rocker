@@ -21,6 +21,8 @@ pub enum Icon {
     Refresh,
     /// Stacked planes: a Compose project / group.
     Stack,
+    /// Six-node control-plane wheel for Kubernetes resources.
+    Kubernetes,
     /// Warning / unreachable.
     Alert,
     /// Dismiss.
@@ -154,6 +156,21 @@ pub fn draw(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
             line(&[(2.5, 5.5), (8.0, 2.5), (13.5, 5.5), (8.0, 8.5)], true);
             line(&[(2.5, 8.5), (8.0, 11.5), (13.5, 8.5)], false);
             line(&[(2.5, 11.3), (8.0, 14.3), (13.5, 11.3)], false);
+        }
+        Icon::Kubernetes => {
+            painter.circle_stroke(g.at(8.0, 8.0), 3.0 * g.unit, stroke);
+            painter.circle_filled(g.at(8.0, 8.0), 1.15 * g.unit, color);
+            for (x, y) in [
+                (8.0, 1.9),
+                (13.3, 5.0),
+                (13.3, 11.0),
+                (8.0, 14.1),
+                (2.7, 11.0),
+                (2.7, 5.0),
+            ] {
+                line(&[(8.0, 8.0), (x, y)], false);
+                painter.circle_filled(g.at(x, y), 1.05 * g.unit, color);
+            }
         }
         Icon::Alert => {
             line(&[(8.0, 2.0), (14.5, 13.5), (1.5, 13.5)], true);

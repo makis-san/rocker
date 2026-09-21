@@ -36,6 +36,35 @@ interface types {
     // vocabulary is still driven by real extension needs.
     type ui-node = string;
     type ui-context = string;
+
+    record cluster-context {
+        name: string,
+        cluster: string,
+        user: string,
+        current: bool,
+    }
+
+    record namespace {
+        name: string,
+        phase: string,
+    }
+
+    enum workload-kind {
+        pod,
+        deployment,
+        stateful-set,
+        daemon-set,
+        job,
+        cron-job,
+    }
+
+    record workload-summary {
+        kind: workload-kind,
+        name: string,
+        namespace: string,
+        status: string,
+        created-at: option<string>,
+    }
 }
 
 interface containers {
@@ -62,11 +91,24 @@ interface events {
     subscribe: func(kinds: list<string>);
 }
 
+// Kubernetes is intentionally a separate import rather than an extension of
+// `containers`: Kubernetes has distinct identity, RBAC, watch, and lifecycle
+// semantics. The host owns kubeconfig and network access; the component sees
+// only these normalized records.
+interface kubernetes {
+    use types.{cluster-context, namespace, workload-summary};
+
+    list-contexts: func() -> result<list<cluster-context>, string>;
+    list-namespaces: func(context: string) -> result<list<namespace>, string>;
+    list-workloads: func(context: string, namespace: string) -> result<list<workload-summary>, string>;
+}
+
 world rocker-extension {
     import containers;
     import storage;
     import notify;
     import events;
+    import kubernetes;
 
     export activate: func();
     export render-panel: func(ctx: string) -> string;

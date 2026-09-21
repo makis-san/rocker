@@ -15,14 +15,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command as ProcessCommand;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use rocker_core::{ConnectionId, ContainerId, ExecAudit};
+use rocker_core::{
+    Connection, ConnectionId, ContainerId, ExecAudit, KubernetesOwner, KubernetesPod,
+};
 use rocker_store::HistoryStore;
 
-use crate::protocol::{Command, Event, LogLine, LogStream, LogTail};
+use crate::protocol::{Command, Event, KubernetesLifecycleAction, LogLine, LogStream, LogTail};
 use crate::service::{self, DockerService, LocalDocker};
 
 /// Default retention window until the UI sends the persisted value.
@@ -106,6 +109,7 @@ pub fn start(
             stats_order: VecDeque::new(),
             max_stats_streams: DEFAULT_MAX_STATS_STREAMS,
             exec: None,
+            kubernetes_exec: None,
         };
         task.run(cmd_rx).await;
     });
@@ -147,6 +151,10 @@ struct ExecTask {
     input: UnboundedSender<ExecMsg>,
 }
 
+struct KubernetesExecTask {
+    input: UnboundedSender<Vec<u8>>,
+}
+
 impl Drop for ExecTask {
     fn drop(&mut self) {
         self.task.abort();
@@ -178,15 +186,190 @@ struct EngineTask {
     stats_order: VecDeque<ContainerId>,
     max_stats_streams: usize,
     exec: Option<ExecTask>,
+    kubernetes_exec: Option<KubernetesExecTask>,
+}
+
+#[derive(Clone, Copy)]
+enum KubernetesPodQuery {
+    Info,
+    Logs,
+    Stats,
+}
+
+fn parse_kubernetes_pods(output: &str, connection: &str) -> Vec<KubernetesPod> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let namespace = fields.next()?.to_owned();
+            let name = fields.next()?.to_owned();
+            let readiness = fields.next()?;
+            let ready = readiness
+                .split([',', ' '])
+                .filter(|value| *value == "true")
+                .count();
+            let total = readiness
+                .split([',', ' '])
+                .filter(|value| !value.is_empty() && *value != "<none>")
+                .count();
+            Some(KubernetesPod {
+                connection: connection.to_owned(),
+                namespace,
+                name,
+                owner: match (fields.next()?, fields.next()?) {
+                    (kind, name) if !kind.is_empty() && !name.is_empty() => Some(KubernetesOwner {
+                        kind: kind.to_owned(),
+                        name: name.to_owned(),
+                    }),
+                    _ => None,
+                },
+                ready: format!("{ready}/{total}"),
+                phase: fields.next()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn resolve_replica_set_owners(pods: &mut [KubernetesPod], output: &str) {
+    let owners: HashMap<(&str, &str), KubernetesOwner> = output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let namespace = fields.next()?;
+            let replica_set = fields.next()?;
+            let kind = fields.next()?;
+            let name = fields.next()?;
+            (!kind.is_empty() && !name.is_empty()).then(|| {
+                (
+                    (namespace, replica_set),
+                    KubernetesOwner {
+                        kind: kind.to_owned(),
+                        name: name.to_owned(),
+                    },
+                )
+            })
+        })
+        .collect();
+    for pod in pods {
+        let Some(owner) = &pod.owner else { continue };
+        if owner.kind == "ReplicaSet" {
+            if let Some(owner) = owners.get(&(pod.namespace.as_str(), owner.name.as_str())) {
+                pod.owner = Some(owner.clone());
+            }
+        }
+    }
+}
+
+async fn run_kubectl<const COMMON: usize, const ARGS: usize>(
+    common: &[&str; COMMON],
+    args: [&str; ARGS],
+) -> std::result::Result<String, String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        ProcessCommand::new("kubectl")
+            .args(common)
+            .args(args)
+            .output(),
+    )
+    .await
+    .map_err(|_| "Kubernetes command timed out after 10 seconds".to_owned())?
+    .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+fn parse_cpu_millicores(value: &str) -> Option<u64> {
+    value.strip_suffix('m').map_or_else(
+        || {
+            value
+                .parse::<u64>()
+                .ok()
+                .map(|cores| cores.saturating_mul(1000))
+        },
+        |milli| milli.parse().ok(),
+    )
+}
+
+fn parse_memory_bytes(value: &str) -> Option<u64> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("Ki") {
+        (number, 1024)
+    } else if let Some(number) = value.strip_suffix("Mi") {
+        (number, 1024 * 1024)
+    } else if let Some(number) = value.strip_suffix("Gi") {
+        (number, 1024 * 1024 * 1024)
+    } else {
+        (value, 1)
+    };
+    number.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+#[cfg(test)]
+mod kubernetes_tests {
+    use super::{parse_kubernetes_pods, resolve_replica_set_owners};
+
+    #[test]
+    fn parse_kubernetes_pods_reads_custom_column_output() {
+        let pods = parse_kubernetes_pods(
+            "kube-system\tcoredns-7f6c6f5c5b-abcde\ttrue true\tReplicaSet\tcoredns-7f6c6f5c5b\tRunning\ndefault\tapi-6c9d7d5d88-xyz12\ttrue\t\t\tRunning\n",
+            "rancher-desktop",
+        );
+
+        assert_eq!(pods.len(), 2);
+        assert_eq!(pods[0].ready, "2/2");
+        assert_eq!(pods[0].connection, "rancher-desktop");
+        assert_eq!(
+            pods[0].owner.as_ref().map(|owner| owner.kind.as_str()),
+            Some("ReplicaSet")
+        );
+    }
+
+    #[test]
+    fn resolve_replica_set_owners_promotes_pods_to_deployments() {
+        let mut pods = parse_kubernetes_pods(
+            "default\tapi-abc\ttrue\tReplicaSet\tapi-7d88f\tRunning\n",
+            "local",
+        );
+        resolve_replica_set_owners(&mut pods, "default\tapi-7d88f\tDeployment\tapi\n");
+
+        assert_eq!(
+            pods[0].owner.as_ref().map(|owner| owner.kind.as_str()),
+            Some("Deployment")
+        );
+    }
 }
 
 impl EngineTask {
     async fn run(&mut self, mut commands: UnboundedReceiver<Command>) {
         while let Some(cmd) = commands.recv().await {
             match cmd {
-                Command::Connect(id) => self.connect(id).await,
+                Command::Connect(connection) => self.connect(connection).await,
                 Command::RefreshContainers => self.refresh().await,
                 Command::RefreshDiskUsage => self.refresh_disk_usage(),
+                Command::RefreshKubernetesPods {
+                    kubeconfig,
+                    context,
+                } => self.refresh_kubernetes_pods(kubeconfig, context),
+                Command::RefreshKubernetesUsage {
+                    kubeconfig,
+                    context,
+                } => self.refresh_kubernetes_usage(kubeconfig, context),
+                Command::KubernetesLifecycle {
+                    kubeconfig,
+                    workload,
+                    action,
+                } => self.kubernetes_lifecycle(kubeconfig, workload, action),
+                Command::InspectKubernetesPod { kubeconfig, pod } => {
+                    self.kubernetes_pod_query(kubeconfig, pod, KubernetesPodQuery::Info)
+                }
+                Command::KubernetesPodLogs { kubeconfig, pod } => {
+                    self.kubernetes_pod_query(kubeconfig, pod, KubernetesPodQuery::Logs)
+                }
+                Command::KubernetesPodStats { kubeconfig, pod } => {
+                    self.kubernetes_pod_query(kubeconfig, pod, KubernetesPodQuery::Stats)
+                }
                 Command::Lifecycle { container, action } => self.lifecycle(container, action),
                 Command::BulkLifecycle { containers, action } => {
                     self.bulk_lifecycle(containers, action)
@@ -216,36 +399,45 @@ impl EngineTask {
                     }
                 }
                 Command::CloseExec => self.exec = None,
+                Command::OpenKubernetesExec { kubeconfig, pod } => {
+                    self.open_kubernetes_exec(kubeconfig, pod)
+                }
+                Command::KubernetesExecInput(bytes) => {
+                    if let Some(exec) = &self.kubernetes_exec {
+                        let _ = exec.input.send(bytes);
+                    }
+                }
+                Command::CloseKubernetesExec => self.kubernetes_exec = None,
                 Command::Shutdown => break,
             }
         }
     }
 
-    async fn connect(&mut self, id: ConnectionId) {
+    async fn connect(&mut self, connection: Connection) {
         // Dropping the streams stops anything pointed at the old connection.
         self.logs = None;
         self.stats.clear();
         self.stats_order.clear();
         self.exec = None;
-        self.connection = Some(id.clone());
+        self.connection = Some(connection.id.clone());
 
-        match LocalDocker::connect() {
+        match LocalDocker::connect(&connection) {
             Ok(docker) => match docker.version().await {
                 Ok(version) => {
                     self.docker = Some(docker);
                     self.emitter.emit(Event::Connected {
-                        connection: id,
+                        connection: connection.id,
                         version,
                     });
                     self.refresh().await;
                 }
                 Err(e) => self.emitter.emit(Event::Disconnected {
-                    connection: id,
+                    connection: connection.id,
                     reason: e.to_string(),
                 }),
             },
             Err(e) => self.emitter.emit(Event::Disconnected {
-                connection: id,
+                connection: connection.id,
                 reason: e.to_string(),
             }),
         }
@@ -276,6 +468,349 @@ impl EngineTask {
                 }
             }
         });
+    }
+
+    /// Run the installed Kubernetes CLI on the engine worker, never on the UI
+    /// thread. The CLI owns kubeconfig authentication, so certificate and
+    /// token material is not copied into Rocker's process protocol.
+    fn refresh_kubernetes_pods(&self, kubeconfig: String, context: String) {
+        let emitter = self.emitter.clone();
+        tokio::spawn(async move {
+            let output = tokio::time::timeout(
+                Duration::from_secs(10),
+                ProcessCommand::new("kubectl")
+                    .args([
+                        "--kubeconfig",
+                        &kubeconfig,
+                        "--context",
+                        &context,
+                        "get",
+                        "pods",
+                        "--all-namespaces",
+                        "--no-headers",
+                        "-o",
+                        "jsonpath={range .items[*]}{.metadata.namespace}{\"\\t\"}{.metadata.name}{\"\\t\"}{.status.containerStatuses[*].ready}{\"\\t\"}{.metadata.ownerReferences[0].kind}{\"\\t\"}{.metadata.ownerReferences[0].name}{\"\\t\"}{.status.phase}{\"\\n\"}{end}",
+                    ])
+                    .output(),
+            )
+            .await;
+            match output {
+                Ok(Ok(output)) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let mut pods = parse_kubernetes_pods(&stdout, &context);
+                    let common = [
+                        "--kubeconfig",
+                        kubeconfig.as_str(),
+                        "--context",
+                        context.as_str(),
+                    ];
+                    if let Ok(replica_sets) = run_kubectl(
+                        &common,
+                        [
+                            "get", "replicasets", "--all-namespaces", "-o",
+                            "jsonpath={range .items[*]}{.metadata.namespace}{\"\\t\"}{.metadata.name}{\"\\t\"}{.metadata.ownerReferences[0].kind}{\"\\t\"}{.metadata.ownerReferences[0].name}{\"\\n\"}{end}",
+                        ],
+                    )
+                    .await
+                    {
+                        resolve_replica_set_owners(&mut pods, &replica_sets);
+                    }
+                    emitter.emit(Event::KubernetesPods { context, pods });
+                }
+                Ok(Ok(output)) => emitter.emit(Event::KubernetesPodsFailed(
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                )),
+                Ok(Err(error)) => emitter.emit(Event::KubernetesPodsFailed(error.to_string())),
+                Err(_) => emitter.emit(Event::KubernetesPodsFailed(
+                    "Kubernetes query timed out after 10 seconds".to_owned(),
+                )),
+            }
+        });
+    }
+
+    fn refresh_kubernetes_usage(&self, kubeconfig: String, context: String) {
+        let emitter = self.emitter.clone();
+        tokio::spawn(async move {
+            let common = [
+                "--kubeconfig",
+                kubeconfig.as_str(),
+                "--context",
+                context.as_str(),
+            ];
+            let result =
+                run_kubectl(&common, ["top", "pods", "--all-namespaces", "--no-headers"]).await;
+            if let Ok(text) = result {
+                let (cpu_millicores, memory_bytes) = text.lines().fold((0, 0), |totals, line| {
+                    let mut fields = line.split_whitespace();
+                    let _namespace = fields.next();
+                    let _pod = fields.next();
+                    let cpu = fields.next().and_then(parse_cpu_millicores).unwrap_or(0);
+                    let memory = fields.next().and_then(parse_memory_bytes).unwrap_or(0);
+                    (totals.0 + cpu, totals.1 + memory)
+                });
+                emitter.emit(Event::KubernetesUsage {
+                    context,
+                    cpu_millicores,
+                    memory_bytes,
+                });
+            }
+        });
+    }
+
+    fn kubernetes_lifecycle(
+        &self,
+        kubeconfig: String,
+        workload: rocker_core::KubernetesWorkloadRef,
+        action: KubernetesLifecycleAction,
+    ) {
+        let emitter = self.emitter.clone();
+        tokio::spawn(async move {
+            let common = [
+                "--kubeconfig",
+                kubeconfig.as_str(),
+                "--context",
+                workload.connection.as_str(),
+            ];
+            let result: std::result::Result<Option<u32>, String> = async {
+                match action {
+                    KubernetesLifecycleAction::Stop => {
+                        let replicas = run_kubectl(
+                            &common,
+                            [
+                                "get",
+                                workload.kind.as_str(),
+                                workload.name.as_str(),
+                                "--namespace",
+                                workload.namespace.as_str(),
+                                "-o",
+                                "jsonpath={.spec.replicas}",
+                            ],
+                        )
+                        .await?
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or(1);
+                        run_kubectl(
+                            &common,
+                            [
+                                "scale",
+                                workload.kind.as_str(),
+                                workload.name.as_str(),
+                                "--namespace",
+                                workload.namespace.as_str(),
+                                "--replicas=0",
+                            ],
+                        )
+                        .await?;
+                        Ok(Some(replicas))
+                    }
+                    KubernetesLifecycleAction::Start { replicas } => {
+                        let replicas = format!("--replicas={replicas}");
+                        run_kubectl(
+                            &common,
+                            [
+                                "scale",
+                                workload.kind.as_str(),
+                                workload.name.as_str(),
+                                "--namespace",
+                                workload.namespace.as_str(),
+                                replicas.as_str(),
+                            ],
+                        )
+                        .await?;
+                        Ok(None)
+                    }
+                    KubernetesLifecycleAction::Restart => {
+                        run_kubectl(
+                            &common,
+                            [
+                                "rollout",
+                                "restart",
+                                workload.kind.as_str(),
+                                workload.name.as_str(),
+                                "--namespace",
+                                workload.namespace.as_str(),
+                            ],
+                        )
+                        .await?;
+                        Ok(None)
+                    }
+                }
+            }
+            .await;
+            match result {
+                Ok(previous_replicas) => emitter.emit(Event::KubernetesLifecycleDone {
+                    workload,
+                    action,
+                    previous_replicas,
+                }),
+                Err(error) => emitter.emit(Event::KubernetesLifecycleFailed(error)),
+            }
+        });
+    }
+
+    fn kubernetes_pod_query(
+        &self,
+        kubeconfig: String,
+        pod: KubernetesPod,
+        query: KubernetesPodQuery,
+    ) {
+        let emitter = self.emitter.clone();
+        tokio::spawn(async move {
+            let common = [
+                "--kubeconfig",
+                kubeconfig.as_str(),
+                "--context",
+                pod.connection.as_str(),
+            ];
+            let result = match query {
+                KubernetesPodQuery::Info => {
+                    run_kubectl(
+                        &common,
+                        [
+                            "get",
+                            "pod",
+                            pod.name.as_str(),
+                            "--namespace",
+                            pod.namespace.as_str(),
+                            "-o",
+                            "yaml",
+                        ],
+                    )
+                    .await
+                }
+                KubernetesPodQuery::Logs => {
+                    run_kubectl(
+                        &common,
+                        [
+                            "logs",
+                            pod.name.as_str(),
+                            "--namespace",
+                            pod.namespace.as_str(),
+                            "--all-containers=true",
+                            "--tail=400",
+                            "--timestamps=true",
+                        ],
+                    )
+                    .await
+                }
+                KubernetesPodQuery::Stats => {
+                    run_kubectl(
+                        &common,
+                        [
+                            "top",
+                            "pod",
+                            pod.name.as_str(),
+                            "--namespace",
+                            pod.namespace.as_str(),
+                        ],
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(text) => match query {
+                    KubernetesPodQuery::Info => {
+                        emitter.emit(Event::KubernetesPodInfo { pod, text })
+                    }
+                    KubernetesPodQuery::Logs => {
+                        emitter.emit(Event::KubernetesPodLogs { pod, text })
+                    }
+                    KubernetesPodQuery::Stats => {
+                        emitter.emit(Event::KubernetesPodStats { pod, text })
+                    }
+                },
+                Err(message) => emitter.emit(Event::KubernetesPodQueryFailed { pod, message }),
+            }
+        });
+    }
+
+    fn open_kubernetes_exec(&mut self, kubeconfig: String, pod: KubernetesPod) {
+        self.kubernetes_exec = None;
+        let history = self.history.clone();
+        let started_ms = now_ms();
+        let mut command = ProcessCommand::new("kubectl");
+        command
+            .args([
+                "--kubeconfig",
+                &kubeconfig,
+                "--context",
+                &pod.connection,
+                "exec",
+                "-i",
+                &pod.name,
+                "--namespace",
+                &pod.namespace,
+                "--",
+                "sh",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let Ok(mut child) = command.spawn() else {
+            self.emitter.emit(Event::KubernetesExecClosed {
+                pod,
+                reason: Some("could not start kubectl".to_owned()),
+            });
+            return;
+        };
+        let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            self.emitter.emit(Event::KubernetesExecClosed {
+                pod,
+                reason: Some("kubectl did not expose an interactive stream".to_owned()),
+            });
+            return;
+        };
+        let (input_tx, mut input_rx) = unbounded_channel::<Vec<u8>>();
+        let emitter = self.emitter.clone();
+        let input_emitter = emitter.clone();
+        let input_pod = pod.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = input_rx.recv().await {
+                if let Err(error) = stdin.write_all(&bytes).await {
+                    input_emitter.emit(Event::KubernetesExecClosed {
+                        pod: input_pod.clone(),
+                        reason: Some(error.to_string()),
+                    });
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            emitter.emit(Event::KubernetesExecReady { pod: pod.clone() });
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(count) => emitter.emit(Event::KubernetesExecOutput {
+                        pod: pod.clone(),
+                        bytes: buffer[..count].to_vec(),
+                    }),
+                    Err(error) => {
+                        emitter.emit(Event::KubernetesExecClosed {
+                            pod: pod.clone(),
+                            reason: Some(error.to_string()),
+                        });
+                        return;
+                    }
+                }
+            }
+            let reason = child.wait().await.err().map(|error| error.to_string());
+            if let Some(history) = history {
+                let row = ExecAudit {
+                    ts_ms: started_ms,
+                    connection_id: pod.connection.clone(),
+                    container: format!("{}/{}", pod.namespace, pod.name),
+                    container_name: pod.name.clone(),
+                    argv: vec!["kubectl".into(), "exec".into(), "sh".into()],
+                    exit_code: None,
+                    duration_secs: now_ms().checked_sub(started_ms).map(|ms| ms / 1000),
+                };
+                let _ = tokio::task::spawn_blocking(move || history.record_exec(&row)).await;
+            }
+            emitter.emit(Event::KubernetesExecClosed { pod, reason });
+        });
+        self.kubernetes_exec = Some(KubernetesExecTask { input: input_tx });
     }
 
     fn lifecycle(&self, container: ContainerId, action: crate::protocol::LifecycleAction) {

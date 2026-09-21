@@ -1,45 +1,150 @@
-//! The Settings view (PLAN §5.4: "settings system on the same tokens").
-//!
-//! One centered column of quiet, labelled sections. Every control is drawn from
-//! the same token set as the rest of the UI — a segmented control for the
-//! theme, a clamped stepper for the numeric limits — and edits are handed
-//! straight back to the caller, which persists them to the TOML config and
-//! re-applies the theme in place. No form-kit widgets, no rules between rows.
+//! Settings navigation and controls.
 
-use rocker_store::Settings;
+use rocker_core::{Connection, ConnectionId, ConnectionKind, KubernetesPod};
+use rocker_ext_api::Tier;
+use rocker_ext_host::Discovery;
+use rocker_store::{KubernetesKubeconfig, Settings};
 
 use crate::extensions::ThemeExtensionOption;
 use crate::style::{self, Palette};
 use crate::widgets::{dropdown, segmented, stepper};
 
-/// Read-only facts shown in the "About" section.
+/// Read-only facts shown in the About section.
 pub struct About<'a> {
     pub app_version: &'a str,
     pub engine: Option<&'a str>,
+    pub engine_status: &'a str,
     pub config_path: &'a str,
 }
 
-/// What changed this frame. `None` from [`settings_screen`] means nothing did.
-/// `theme_changed` tells the caller to re-apply the palette; `autostart_changed`
-/// tells it to reconcile the "open at login" entry on disk.
+/// State consumed by the Settings screen for one frame.
+pub struct SettingsScreenData<'a> {
+    pub settings: &'a mut Settings,
+    pub connections: &'a mut Vec<Connection>,
+    pub kubernetes_kubeconfigs: &'a mut Vec<KubernetesKubeconfig>,
+    pub kubernetes_engines: &'a [KubernetesEngine],
+    pub kubernetes_pods: &'a [KubernetesPod],
+    pub kubernetes_loading: bool,
+    pub kubernetes_error: Option<&'a str>,
+    pub custom_themes: &'a [ThemeExtensionOption],
+    pub discovery: &'a Discovery,
+    pub about: About<'a>,
+}
+/// An engine connection selected from the Docker pane.
+pub enum DockerAction {
+    Connect(Connection),
+}
+/// A read-only Kubernetes query selected from the settings pane.
+pub enum KubernetesAction {
+    RefreshPods { kubeconfig: String, context: String },
+}
+/// Changes made while drawing the settings screen.
 pub struct Edit {
     pub theme_changed: bool,
     pub autostart_changed: bool,
+    pub docker_action: Option<DockerAction>,
+    pub kubernetes_action: Option<KubernetesAction>,
 }
 
-/// Fixed column width, so the screen holds one measured measure regardless of
-/// window size.
-const COLUMN_W: f32 = 552.0;
-/// Width reserved for every row's control cluster, so controls share a right
-/// edge down the whole screen no matter how long the label is (anti-slop:
-/// ragged parallel columns).
+const CONTENT_W: f32 = 552.0;
 const CONTROL_W: f32 = 232.0;
-/// Every row is this tall, and both columns centre within it, so titles and
-/// controls sit on one shared grid regardless of description length.
 const ROW_H: f32 = 44.0;
-
 const THEME_OPTS: [&str; 4] = ["System", "Light", "Dark", "Custom"];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Appearance,
+    History,
+    System,
+    Docker,
+    Kubernetes,
+    Plugins,
+    About,
+}
+impl Page {
+    const CORE: [Self; 6] = [
+        Self::Appearance,
+        Self::History,
+        Self::System,
+        Self::Docker,
+        Self::Kubernetes,
+        Self::About,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::History => "Usage history",
+            Self::System => "System",
+            Self::Docker => "Docker engines",
+            Self::Kubernetes => "Kubernetes engines",
+            Self::Plugins => "Plugins",
+            Self::About => "About",
+        }
+    }
+}
+#[derive(Clone, Default)]
+struct EngineDraft {
+    name: String,
+    endpoint: String,
+}
+
+#[derive(Clone, Default)]
+struct KubeconfigDraft {
+    name: String,
+    path: String,
+}
+
+struct KubernetesPageData<'a> {
+    enabled: &'a mut bool,
+    kubeconfigs: &'a mut Vec<KubernetesKubeconfig>,
+    engines: &'a [KubernetesEngine],
+    pods: &'a [KubernetesPod],
+    loading: bool,
+    error: Option<&'a str>,
+    changed: &'a mut bool,
+    action: &'a mut Option<KubernetesAction>,
+}
+
+/// A Kubernetes context found in a kubeconfig on the current device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesEngine {
+    pub name: String,
+    pub cluster: String,
+    pub user: String,
+    pub current: bool,
+    pub source: String,
+    kubeconfig: String,
+}
+
+/// Select the current context (or first available context) for a Pod refresh.
+pub fn kubernetes_pod_query(engines: &[KubernetesEngine]) -> Option<(String, String)> {
+    engines
+        .iter()
+        .find(|engine| engine.current)
+        .or_else(|| engines.first())
+        .map(|engine| (engine.kubeconfig.clone(), engine.name.clone()))
+}
+
+/// Queries for every distinct context discovered on this device.
+pub fn kubernetes_pod_queries(engines: &[KubernetesEngine]) -> Vec<(String, String)> {
+    let mut contexts = std::collections::HashSet::new();
+    engines
+        .iter()
+        .filter(|engine| contexts.insert(engine.name.as_str()))
+        .map(|engine| (engine.kubeconfig.clone(), engine.name.clone()))
+        .collect()
+}
+
+/// Find the local kubeconfig file for one discovered Kubernetes context.
+pub fn kubernetes_kubeconfig_for_context(
+    engines: &[KubernetesEngine],
+    context: &str,
+) -> Option<String> {
+    engines
+        .iter()
+        .find(|engine| engine.name == context)
+        .map(|engine| engine.kubeconfig.clone())
+}
 fn theme_index(id: &str) -> usize {
     match id {
         "light" => 1,
@@ -48,7 +153,6 @@ fn theme_index(id: &str) -> usize {
         _ => 0,
     }
 }
-
 fn theme_id(index: usize) -> &'static str {
     match index {
         1 => "light",
@@ -58,167 +162,666 @@ fn theme_id(index: usize) -> &'static str {
     }
 }
 
+/// Draw the persistent settings sidebar and selected settings page.
 pub fn settings_screen(
     ui: &mut egui::Ui,
     pal: &Palette,
-    settings: &mut Settings,
-    custom_themes: &[ThemeExtensionOption],
-    about: About<'_>,
+    data: SettingsScreenData<'_>,
 ) -> Option<Edit> {
+    let SettingsScreenData {
+        settings,
+        connections,
+        kubernetes_kubeconfigs,
+        kubernetes_engines,
+        kubernetes_pods,
+        kubernetes_loading,
+        kubernetes_error,
+        custom_themes,
+        discovery,
+        about,
+    } = data;
+    let id = ui.make_persistent_id("settings-page");
+    let mut page = ui.data_mut(|data| data.get_temp::<Page>(id).unwrap_or(Page::Appearance));
+    let plugin_menu_id = ui.make_persistent_id("settings-plugins-expanded");
+    let mut plugins_expanded =
+        ui.data_mut(|data| data.get_temp::<bool>(plugin_menu_id).unwrap_or(false));
+    let selected_plugin_id = ui.make_persistent_id("settings-selected-plugin");
+    let mut selected_plugin = ui.data_mut(|data| data.get_temp::<String>(selected_plugin_id));
+    let has_plugin_settings = plugin_settings_extensions(discovery).next().is_some();
+    if !has_plugin_settings && page == Page::Plugins {
+        page = Page::Appearance;
+        selected_plugin = None;
+    }
     let mut theme_changed = false;
     let mut autostart_changed = false;
-    let mut other_changed = false;
-
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let full = ui.available_width();
-            let col = COLUMN_W.min(full - 4.0);
-            let side = ((full - col) * 0.5).max(0.0);
-
-            ui.horizontal(|ui| {
-                ui.add_space(side);
+    let mut changed = false;
+    let mut docker_action = None;
+    let mut kubernetes_action = None;
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(164.0, ui.available_height()),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.add_space(7.0);
+                ui.label(
+                    egui::RichText::new("SETTINGS")
+                        .small()
+                        .strong()
+                        .color(pal.text_muted),
+                );
+                ui.add_space(8.0);
+                for candidate in Page::CORE {
+                    let selected = page == candidate;
+                    if ui
+                        .selectable_label(
+                            selected,
+                            egui::RichText::new(candidate.label()).color(if selected {
+                                pal.text
+                            } else {
+                                pal.text_muted
+                            }),
+                        )
+                        .clicked()
+                    {
+                        page = candidate;
+                    }
+                }
+                if has_plugin_settings {
+                    let plugins_selected = page == Page::Plugins;
+                    if ui
+                        .selectable_label(
+                            plugins_selected,
+                            egui::RichText::new("Plugins").color(if plugins_selected {
+                                pal.text
+                            } else {
+                                pal.text_muted
+                            }),
+                        )
+                        .clicked()
+                    {
+                        plugins_expanded = !plugins_expanded;
+                    }
+                    if plugins_expanded {
+                        ui.indent("plugin-settings-submenu", |ui| {
+                            for extension in plugin_settings_extensions(discovery) {
+                                let selected = selected_plugin.as_deref()
+                                    == Some(extension.manifest.id.as_str());
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        egui::RichText::new(&extension.manifest.name)
+                                            .small()
+                                            .color(if selected {
+                                                pal.text
+                                            } else {
+                                                pal.text_muted
+                                            }),
+                                    )
+                                    .clicked()
+                                {
+                                    page = Page::Plugins;
+                                    selected_plugin = Some(extension.manifest.id.clone());
+                                }
+                            }
+                        });
+                    }
+                }
+            },
+        );
+        ui.separator();
+        ui.add_space(style::MD);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // Scroll areas inherit the parent horizontal layout. Make the
+                // pane explicit so headings and setting rows always stack.
                 ui.vertical(|ui| {
-                    ui.set_width(col);
+                    ui.set_width(CONTENT_W.min(ui.available_width()));
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("Settings")
+                        egui::RichText::new(page.label())
                             .size(19.0)
                             .strong()
                             .color(pal.text),
                     );
-
-                    section(ui, pal, "Appearance");
-                    row(ui, pal, "Theme", "Match your OS, or pick one.", |ui| {
-                        let current = theme_index(&settings.theme);
-                        if let Some(next) = segmented(ui, pal, "theme", &THEME_OPTS, current) {
-                            settings.theme = theme_id(next).to_string();
-                            theme_changed = true;
+                    match page {
+                        Page::Appearance => {
+                            row(ui, pal, "Theme", "Match your OS, or pick one.", |ui| {
+                                if let Some(next) = segmented(
+                                    ui,
+                                    pal,
+                                    "theme",
+                                    &THEME_OPTS,
+                                    theme_index(&settings.theme),
+                                ) {
+                                    settings.theme = theme_id(next).to_string();
+                                    theme_changed = true;
+                                }
+                            });
+                            if settings.theme == "custom" {
+                                theme_changed |=
+                                    custom_theme_rows(ui, pal, settings, custom_themes);
+                            }
                         }
-                    });
-                    if settings.theme == "custom" {
-                        theme_changed |= custom_theme_rows(ui, pal, settings, custom_themes);
-                    }
-
-                    section(ui, pal, "Usage history");
-                    row(
-                        ui,
-                        pal,
-                        "Retention",
-                        "How long usage history is kept.",
-                        |ui| {
-                            let v = settings.stats_retention_hours as i64;
-                            if let Some(next) = stepper(ui, pal, "retention", v, 12..=336, 12, "h")
-                            {
-                                settings.stats_retention_hours = next as u32;
-                                other_changed = true;
-                            }
-                        },
-                    );
-                    row(
-                        ui,
-                        pal,
-                        "Live graphs",
-                        "Cap on containers streaming stats at once.",
-                        |ui| {
-                            let v = settings.max_stats_streams as i64;
-                            if let Some(next) = stepper(ui, pal, "streams", v, 4..=64, 4, "") {
-                                settings.max_stats_streams = next as usize;
-                                other_changed = true;
-                            }
-                        },
-                    );
-
-                    section(ui, pal, "System");
-                    row(
-                        ui,
-                        pal,
-                        "Minimize to tray",
-                        "Closing or minimizing hides Rocker to the tray.",
-                        |ui| {
-                            if let Some(next) =
-                                toggle(ui, pal, "min-to-tray", settings.minimize_to_tray)
-                            {
-                                settings.minimize_to_tray = next;
-                                other_changed = true;
-                            }
-                        },
-                    );
-                    row(
-                        ui,
-                        pal,
-                        "Start hidden",
-                        "Launch straight to the tray, no window.",
-                        |ui| {
-                            if let Some(next) =
-                                toggle(ui, pal, "start-hidden", settings.start_minimized)
-                            {
-                                settings.start_minimized = next;
-                                other_changed = true;
-                            }
-                        },
-                    );
-                    row(
-                        ui,
-                        pal,
-                        "Open at login",
-                        "Start Rocker automatically when you sign in.",
-                        |ui| {
-                            if let Some(next) =
-                                toggle(ui, pal, "open-at-login", settings.open_at_login)
-                            {
-                                settings.open_at_login = next;
-                                autostart_changed = true;
-                            }
-                        },
-                    );
-
-                    section(ui, pal, "About");
-                    row(ui, pal, "Version", "The build you're running.", |ui| {
-                        value(ui, pal, about.app_version)
-                    });
-                    row(
-                        ui,
-                        pal,
-                        "Docker Engine",
-                        "Version reported by the daemon.",
-                        |ui| value(ui, pal, about.engine.unwrap_or("not connected")),
-                    );
-
-                    ui.add_space(16.0);
-                    ui.label(
-                        egui::RichText::new("Config file")
-                            .small()
-                            .strong()
-                            .color(pal.text_muted),
-                    );
-                    ui.add_space(3.0);
-                    ui.label(
-                        egui::RichText::new(about.config_path)
-                            .monospace()
-                            .size(11.5)
-                            .color(pal.text_muted),
-                    );
-                    ui.add_space(30.0);
+                        Page::History => {
+                            row(
+                                ui,
+                                pal,
+                                "Retention",
+                                "How long usage history is kept.",
+                                |ui| {
+                                    if let Some(next) = stepper(
+                                        ui,
+                                        pal,
+                                        "retention",
+                                        settings.stats_retention_hours as i64,
+                                        12..=336,
+                                        12,
+                                        "h",
+                                    ) {
+                                        settings.stats_retention_hours = next as u32;
+                                        changed = true;
+                                    }
+                                },
+                            );
+                            row(
+                                ui,
+                                pal,
+                                "Live graphs",
+                                "Cap on containers streaming stats at once.",
+                                |ui| {
+                                    if let Some(next) = stepper(
+                                        ui,
+                                        pal,
+                                        "streams",
+                                        settings.max_stats_streams as i64,
+                                        4..=64,
+                                        4,
+                                        "",
+                                    ) {
+                                        settings.max_stats_streams = next as usize;
+                                        changed = true;
+                                    }
+                                },
+                            );
+                        }
+                        Page::System => {
+                            row(
+                                ui,
+                                pal,
+                                "Minimize to tray",
+                                "Closing or minimizing hides Rocker to the tray.",
+                                |ui| {
+                                    if let Some(next) =
+                                        toggle(ui, pal, "min-to-tray", settings.minimize_to_tray)
+                                    {
+                                        settings.minimize_to_tray = next;
+                                        changed = true;
+                                    }
+                                },
+                            );
+                            row(
+                                ui,
+                                pal,
+                                "Start hidden",
+                                "Launch straight to the tray, no window.",
+                                |ui| {
+                                    if let Some(next) =
+                                        toggle(ui, pal, "start-hidden", settings.start_minimized)
+                                    {
+                                        settings.start_minimized = next;
+                                        changed = true;
+                                    }
+                                },
+                            );
+                            row(
+                                ui,
+                                pal,
+                                "Open at login",
+                                "Start Rocker automatically when you sign in.",
+                                |ui| {
+                                    if let Some(next) =
+                                        toggle(ui, pal, "open-at-login", settings.open_at_login)
+                                    {
+                                        settings.open_at_login = next;
+                                        autostart_changed = true;
+                                    }
+                                },
+                            );
+                        }
+                        Page::Docker => docker_page(
+                            ui,
+                            pal,
+                            connections,
+                            about.engine_status,
+                            &mut changed,
+                            &mut docker_action,
+                        ),
+                        Page::Kubernetes => kubernetes_page(
+                            ui,
+                            pal,
+                            KubernetesPageData {
+                                enabled: &mut settings.kubernetes_enabled,
+                                kubeconfigs: kubernetes_kubeconfigs,
+                                engines: kubernetes_engines,
+                                pods: kubernetes_pods,
+                                loading: kubernetes_loading,
+                                error: kubernetes_error,
+                                changed: &mut changed,
+                                action: &mut kubernetes_action,
+                            },
+                        ),
+                        Page::Plugins => {
+                            plugins_page(ui, pal, discovery, selected_plugin.as_deref())
+                        }
+                        Page::About => {
+                            row(ui, pal, "Version", "The build you're running.", |ui| {
+                                value(ui, pal, about.app_version)
+                            });
+                            row(
+                                ui,
+                                pal,
+                                "Docker Engine",
+                                "Version reported by the daemon.",
+                                |ui| value(ui, pal, about.engine.unwrap_or("not connected")),
+                            );
+                            section(ui, pal, "Config file");
+                            ui.label(
+                                egui::RichText::new(about.config_path)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(pal.text_muted),
+                            );
+                        }
+                    };
+                    ui.add_space(28.0);
                 });
             });
-        });
-
-    (theme_changed || autostart_changed || other_changed).then_some(Edit {
+    });
+    ui.data_mut(|data| data.insert_temp(id, page));
+    ui.data_mut(|data| data.insert_temp(plugin_menu_id, plugins_expanded));
+    if let Some(selected_plugin) = selected_plugin {
+        ui.data_mut(|data| data.insert_temp(selected_plugin_id, selected_plugin));
+    }
+    (theme_changed
+        || autostart_changed
+        || changed
+        || docker_action.is_some()
+        || kubernetes_action.is_some())
+    .then_some(Edit {
         theme_changed,
         autostart_changed,
+        docker_action,
+        kubernetes_action,
     })
 }
 
-/// The rows shown under "Theme" once "Custom" is picked: a dropdown of every
-/// installed, enabled theme extension, and — only when that extension ships
-/// more than one look — a second dropdown for its variant. With none
-/// installed, a quiet pointer to Extensions stands in for the dropdown rather
-/// than leaving it looking like a dead control. Keeps `settings.theme_*`
-/// pointed at a real extension and variant whenever one is available, so a
-/// stale reference (the extension was uninstalled, or an id changed) is
-/// corrected here rather than left pointing at nothing. Returns whether the
-/// resolved theme selection changed.
+fn docker_page(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    connections: &mut Vec<Connection>,
+    engine_status: &str,
+    changed: &mut bool,
+    action: &mut Option<DockerAction>,
+) {
+    section(ui, pal, "Configured engines");
+    let mut selected = None;
+    for (index, connection) in connections.iter().enumerate() {
+        let endpoint = endpoint(&connection.kind);
+        let active = connection.default;
+        row(ui, pal, &connection.name, &endpoint, |ui| {
+            if active {
+                ui.horizontal(|ui| {
+                    value(ui, pal, engine_status);
+                    if ui.button("Reconnect").clicked() {
+                        selected = Some(index);
+                    }
+                });
+            } else if ui.button("Switch").clicked() {
+                selected = Some(index);
+            }
+        });
+    }
+    if let Some(index) = selected {
+        for connection in connections.iter_mut() {
+            connection.default = false;
+        }
+        let connection = &mut connections[index];
+        connection.default = true;
+        *action = Some(DockerAction::Connect(connection.clone()));
+        *changed = true;
+    }
+    section(ui, pal, "Add engine");
+    let draft_id = ui.make_persistent_id("new-engine-draft");
+    let mut draft = ui.data_mut(|data| data.get_temp::<EngineDraft>(draft_id).unwrap_or_default());
+    ui.label(egui::RichText::new("Add a local socket or SSH host. TLS TCP connections remain supported from existing config files.").small().color(pal.text_muted));
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        ui.text_edit_singleline(&mut draft.name);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Endpoint");
+        ui.text_edit_singleline(&mut draft.endpoint);
+    });
+    if ui.button("Add engine").clicked()
+        && !draft.name.trim().is_empty()
+        && !draft.endpoint.trim().is_empty()
+    {
+        let number = connections.len() + 1;
+        connections.push(Connection {
+            id: ConnectionId::new(format!("engine-{number}")),
+            name: draft.name.trim().to_owned(),
+            kind: draft_kind(draft.endpoint.trim()),
+            default: false,
+        });
+        *changed = true;
+        draft = EngineDraft::default();
+    }
+    ui.data_mut(|data| data.insert_temp(draft_id, draft));
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Docker's API cannot safely start or stop the daemon that serves it. Use the host's service manager for daemon controls; this pane reports connection status and switches engines.").small().color(pal.text_faint));
+}
+
+fn kubernetes_page(ui: &mut egui::Ui, pal: &Palette, data: KubernetesPageData<'_>) {
+    let KubernetesPageData {
+        enabled,
+        kubeconfigs,
+        engines,
+        pods,
+        loading,
+        error,
+        changed,
+        action,
+    } = data;
+    row(
+        ui,
+        pal,
+        "Enable Kubernetes",
+        "Query every discovered context for pods and usage. This can reach production clusters and may trigger exec-credential prompts.",
+        |ui| {
+            if let Some(next) = toggle(ui, pal, "kubernetes-enabled", *enabled) {
+                *enabled = next;
+                *changed = true;
+                if next {
+                    if let Some((kubeconfig, context)) = kubernetes_pod_query(engines) {
+                        *action = Some(KubernetesAction::RefreshPods { kubeconfig, context });
+                    }
+                }
+            }
+        },
+    );
+    if !*enabled {
+        return;
+    }
+    section(ui, pal, "Engines on this device");
+    if engines.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "No Kubernetes contexts were found. Rocker checks ~/.kube/config, KUBECONFIG, and the files below.",
+            )
+            .small()
+            .color(pal.text_muted),
+        );
+    }
+    for engine in engines {
+        let details = if engine.user.is_empty() {
+            format!("{} · {}", engine.cluster, engine.source)
+        } else {
+            format!("{} · {} · {}", engine.cluster, engine.user, engine.source)
+        };
+        row(ui, pal, &engine.name, &details, |ui| {
+            if engine.current {
+                value(ui, pal, "Current context");
+            }
+        });
+    }
+
+    section(ui, pal, "Pods");
+    if loading {
+        value(ui, pal, "Loading Pods…");
+    } else if let Some(error) = error {
+        ui.label(egui::RichText::new(error).small().color(pal.unhealthy));
+    } else if pods.is_empty() {
+        ui.label(
+            egui::RichText::new("No Pods in this context.")
+                .small()
+                .color(pal.text_muted),
+        );
+    } else {
+        for pod in pods {
+            row(ui, pal, &pod.name, &pod.namespace, |ui| {
+                value(ui, pal, &format!("{} · {}", pod.ready, pod.phase));
+            });
+        }
+    }
+    if let Some((kubeconfig, context)) = kubernetes_pod_query(engines) {
+        if ui.button("Refresh Pods").clicked() {
+            *action = Some(KubernetesAction::RefreshPods {
+                kubeconfig,
+                context,
+            });
+        }
+    }
+
+    section(ui, pal, "Additional kubeconfigs");
+    let mut remove = None;
+    for (index, kubeconfig) in kubeconfigs.iter().enumerate() {
+        row(ui, pal, &kubeconfig.name, &kubeconfig.path, |ui| {
+            if ui.button("Remove").clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        kubeconfigs.remove(index);
+        *changed = true;
+    }
+
+    let draft_id = ui.make_persistent_id("new-kubeconfig-draft");
+    let mut draft = ui.data_mut(|data| {
+        data.get_temp::<KubeconfigDraft>(draft_id)
+            .unwrap_or_default()
+    });
+    ui.label(
+        egui::RichText::new(
+            "Add another kubeconfig file from this device. Its credentials stay local.",
+        )
+        .small()
+        .color(pal.text_muted),
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        ui.text_edit_singleline(&mut draft.name);
+    });
+    ui.horizontal(|ui| {
+        ui.label("File path");
+        ui.text_edit_singleline(&mut draft.path);
+    });
+    if ui.button("Add kubeconfig").clicked() && !draft.path.trim().is_empty() {
+        let path = draft.path.trim().to_owned();
+        let name = if draft.name.trim().is_empty() {
+            std::path::Path::new(&path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Kubeconfig")
+                .to_owned()
+        } else {
+            draft.name.trim().to_owned()
+        };
+        if !kubeconfigs.iter().any(|source| source.path == path) {
+            kubeconfigs.push(KubernetesKubeconfig { name, path });
+            *changed = true;
+        }
+        draft = KubeconfigDraft::default();
+    }
+    ui.data_mut(|data| data.insert_temp(draft_id, draft));
+}
+
+/// Discover contexts from kubeconfig files available on this device.
+///
+/// The parser intentionally reads only context metadata: it does not load a
+/// certificate, token, or exec credential from the file.
+pub fn discover_kubernetes_engines(
+    additional_kubeconfigs: &[KubernetesKubeconfig],
+) -> Vec<KubernetesEngine> {
+    let mut sources = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        sources.push((
+            "Default kubeconfig".to_owned(),
+            std::path::PathBuf::from(home).join(".kube/config"),
+        ));
+    }
+    if let Some(paths) = std::env::var_os("KUBECONFIG") {
+        sources.extend(std::env::split_paths(&paths).map(|path| ("KUBECONFIG".to_owned(), path)));
+    }
+    sources.extend(
+        additional_kubeconfigs
+            .iter()
+            .map(|source| (source.name.clone(), std::path::PathBuf::from(&source.path))),
+    );
+
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut engines = Vec::new();
+    for (source, path) in sources {
+        let path = path.to_string_lossy().into_owned();
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        engines.extend(parse_kubeconfig_contexts(&contents, &source, &path));
+    }
+    engines.sort_by(|left, right| {
+        right
+            .current
+            .cmp(&left.current)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    engines
+}
+
+fn parse_kubeconfig_contexts(
+    contents: &str,
+    source: &str,
+    kubeconfig: &str,
+) -> Vec<KubernetesEngine> {
+    #[derive(Default)]
+    struct ContextDraft {
+        name: String,
+        cluster: String,
+        user: String,
+    }
+
+    let current = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("current-context:").map(yaml_value));
+    let mut contexts = Vec::new();
+    let mut in_contexts = false;
+    let mut draft: Option<ContextDraft> = None;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed == "contexts:" {
+            in_contexts = true;
+            continue;
+        }
+        if in_contexts
+            && !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && !trimmed.starts_with('-')
+        {
+            break;
+        }
+        if !in_contexts {
+            continue;
+        }
+        if trimmed.starts_with("- context:") || trimmed.starts_with("- name:") {
+            if let Some(draft) = draft.take().filter(|draft| !draft.name.is_empty()) {
+                contexts.push(draft);
+            }
+            draft = Some(ContextDraft {
+                name: trimmed
+                    .strip_prefix("- name:")
+                    .map(yaml_value)
+                    .unwrap_or_default(),
+                ..ContextDraft::default()
+            });
+        } else if let Some(draft) = &mut draft {
+            if let Some(value) = trimmed.strip_prefix("cluster:") {
+                draft.cluster = yaml_value(value);
+            } else if let Some(value) = trimmed.strip_prefix("user:") {
+                draft.user = yaml_value(value);
+            } else if let Some(value) = trimmed.strip_prefix("name:") {
+                draft.name = yaml_value(value);
+            }
+        }
+    }
+    if let Some(draft) = draft.filter(|draft| !draft.name.is_empty()) {
+        contexts.push(draft);
+    }
+    contexts
+        .into_iter()
+        .map(|context| KubernetesEngine {
+            current: current.as_deref() == Some(context.name.as_str()),
+            name: context.name,
+            cluster: context.cluster,
+            user: context.user,
+            source: source.to_owned(),
+            kubeconfig: kubeconfig.to_owned(),
+        })
+        .collect()
+}
+
+fn yaml_value(value: &str) -> String {
+    value.trim().trim_matches(['\'', '"']).to_owned()
+}
+fn plugin_settings_extensions(
+    discovery: &Discovery,
+) -> impl Iterator<Item = &rocker_ext_host::InstalledExtension> {
+    discovery.extensions.iter().filter(|extension| {
+        extension.settings.enabled
+            && matches!(extension.manifest.tier, Tier::Script | Tier::Component)
+    })
+}
+
+fn plugins_page(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    discovery: &Discovery,
+    selected_plugin: Option<&str>,
+) {
+    let Some(extension) = plugin_settings_extensions(discovery)
+        .find(|extension| Some(extension.manifest.id.as_str()) == selected_plugin)
+    else {
+        ui.label(egui::RichText::new("Choose a plugin from the sidebar.").color(pal.text_muted));
+        return;
+    };
+    section(ui, pal, &extension.manifest.name);
+    ui.label(
+        egui::RichText::new("Plugin settings are provided by the plugin's settings panel.")
+            .color(pal.text_muted),
+    );
+}
+fn endpoint(kind: &ConnectionKind) -> String {
+    match kind {
+        ConnectionKind::Socket { path } | ConnectionKind::NamedPipe { path } => path.clone(),
+        ConnectionKind::Tcp { host, port, .. } => format!("tcp://{host}:{port}"),
+        ConnectionKind::Ssh { uri } => uri.clone(),
+    }
+}
+fn draft_kind(endpoint: &str) -> ConnectionKind {
+    if endpoint.starts_with("ssh://") {
+        ConnectionKind::Ssh {
+            uri: endpoint.to_owned(),
+        }
+    } else {
+        ConnectionKind::Socket {
+            path: endpoint.trim_start_matches("unix://").to_owned(),
+        }
+    }
+}
 fn custom_theme_rows(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -230,14 +833,12 @@ fn custom_theme_rows(
             ui,
             pal,
             "Custom theme",
-            "No enabled theme extensions installed. Install one from Extensions.",
-            |_ui| {},
+            "No enabled theme extensions installed.",
+            |_| {},
         );
         return false;
     }
-
     let mut changed = false;
-
     let mut ext_idx = custom_themes
         .iter()
         .position(|t| Some(t.id.as_str()) == settings.theme_extension.as_deref())
@@ -247,7 +848,6 @@ fn custom_theme_rows(
         settings.theme_variant = None;
         changed = true;
     }
-
     let names: Vec<&str> = custom_themes.iter().map(|t| t.name.as_str()).collect();
     row(
         ui,
@@ -263,7 +863,6 @@ fn custom_theme_rows(
             }
         },
     );
-
     let ext = &custom_themes[ext_idx];
     let mut variant_idx = ext
         .variants
@@ -275,17 +874,15 @@ fn custom_theme_rows(
         settings.theme_variant = ext.variants.get(variant_idx).map(|(id, _)| id.clone());
         changed = true;
     }
-
     if ext.variants.len() > 1 {
-        let variant_names: Vec<&str> = ext.variants.iter().map(|(_, name)| name.as_str()).collect();
+        let names: Vec<&str> = ext.variants.iter().map(|(_, name)| name.as_str()).collect();
         row(
             ui,
             pal,
             "Variant",
             "This theme ships more than one look.",
             |ui| {
-                if let Some(next) = dropdown(ui, pal, "theme-variant", &variant_names, variant_idx)
-                {
+                if let Some(next) = dropdown(ui, pal, "theme-variant", &names, variant_idx) {
                     variant_idx = next;
                     settings.theme_variant = Some(ext.variants[variant_idx].0.clone());
                     changed = true;
@@ -293,18 +890,11 @@ fn custom_theme_rows(
             },
         );
     }
-
     changed
 }
-
-/// An Off/On segmented control for a boolean row. Returns the new value only
-/// when it actually flips.
-fn toggle(ui: &mut egui::Ui, pal: &Palette, id_salt: &str, value: bool) -> Option<bool> {
-    segmented(ui, pal, id_salt, &["Off", "On"], value as usize).map(|i| i == 1)
+fn toggle(ui: &mut egui::Ui, pal: &Palette, id: &str, value: bool) -> Option<bool> {
+    segmented(ui, pal, id, &["Off", "On"], value as usize).map(|i| i == 1)
 }
-
-/// A quiet section label with air above and below. Not a heading — the rows
-/// under it carry the weight, so it stays small and muted.
 fn section(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     ui.add_space(20.0);
     ui.label(
@@ -315,12 +905,6 @@ fn section(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     );
     ui.add_space(6.0);
 }
-
-/// One setting: title + one-line description on the left, a control cluster of
-/// fixed width on the right. Both columns are pinned to a fixed width and
-/// centred in a fixed-height row, so every title and every control lands on one
-/// shared grid (anti-slop: ragged parallel columns). Rows are set off by space
-/// alone, never a rule.
 fn row(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -335,7 +919,6 @@ fn row(
             egui::vec2(text_w, ROW_H),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.set_min_width(text_w);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.label(egui::RichText::new(title).strong().color(pal.text));
@@ -346,15 +929,10 @@ fn row(
         ui.allocate_ui_with_layout(
             egui::vec2(CONTROL_W, ROW_H),
             egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                ui.set_min_width(CONTROL_W);
-                control(ui);
-            },
+            control,
         );
     });
 }
-
-/// A right-aligned read-only value: data, so it is set in mono.
 fn value(ui: &mut egui::Ui, pal: &Palette, text: &str) {
     ui.label(
         egui::RichText::new(text)
@@ -369,124 +947,105 @@ mod tests {
     use super::*;
 
     #[test]
-    fn theme_id_and_index_round_trip() {
-        for id in ["system", "light", "dark"] {
-            assert_eq!(theme_id(theme_index(id)), id);
-        }
-        // An unknown / future file-stem id lands on the "System" cell rather
-        // than dropping off the control.
-        assert_eq!(theme_index("solarized"), 0);
-        assert_eq!(theme_id(99), "system");
-    }
-
-    /// Lay the whole screen out headlessly at a few widths: catches layout-math
-    /// panics (bad rects, negative sizes) and confirms a no-input frame reports
-    /// no edit. Pointer-driven checks of the controls happen in the running app.
-    #[test]
-    fn screen_lays_out_without_panic() {
+    fn settings_sidebar_lays_out_without_an_edit() {
         let ctx = egui::Context::default();
         let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
-
-        for width in [420.0_f32, 700.0, 1200.0] {
-            let mut settings = rocker_store::Settings::default();
-            let input = egui::RawInput {
+        let mut settings = Settings::default();
+        let mut connections = vec![Connection::local_default()];
+        let mut edit = None;
+        let _ = ctx.run(
+            egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(width, 640.0),
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 640.0),
                 )),
                 ..Default::default()
-            };
-            let mut edit = None;
-            let _ = ctx.run(input, |ctx| {
+            },
+            |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     edit = settings_screen(
                         ui,
                         &pal,
-                        &mut settings,
-                        &[],
-                        About {
-                            app_version: "0.0.0",
-                            engine: None,
-                            config_path: "/tmp/rocker/config.toml",
+                        SettingsScreenData {
+                            settings: &mut settings,
+                            connections: &mut connections,
+                            kubernetes_kubeconfigs: &mut Vec::new(),
+                            kubernetes_engines: &[],
+                            kubernetes_pods: &[],
+                            kubernetes_loading: false,
+                            kubernetes_error: None,
+                            custom_themes: &[],
+                            discovery: &Discovery::default(),
+                            about: About {
+                                app_version: "0.0.0",
+                                engine: None,
+                                engine_status: "Not connected",
+                                config_path: "/tmp/rocker/config.toml",
+                            },
                         },
                     );
                 });
-            });
-            assert!(edit.is_none(), "no pointer input, so nothing should change");
-            assert_eq!(settings.theme, rocker_store::Settings::default().theme);
-        }
+            },
+        );
+        assert!(edit.is_none());
     }
 
-    /// With "Custom" already selected and a couple of installed theme
-    /// extensions on hand, the screen must lay out (and settle on a valid
-    /// extension/variant) without panicking, whether the chosen extension
-    /// has one variant or several. A first pass may repair a stale or empty
-    /// selection even with no pointer input (PLAN §5.4: always resolve to a
-    /// real installed theme); a second pass against the now-settled state
-    /// must report nothing left to fix.
     #[test]
-    fn custom_theme_rows_settle_without_panic() {
-        let ctx = egui::Context::default();
-        let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
-        let custom_themes = [
-            ThemeExtensionOption {
-                id: "acme.mono".into(),
-                name: "Mono".into(),
-                variants: vec![("only".into(), "Only".into())],
-            },
-            ThemeExtensionOption {
-                id: "acme.catppuccin".into(),
-                name: "Catppuccin".into(),
-                variants: vec![
-                    ("mocha".into(), "Mocha".into()),
-                    ("latte".into(), "Latte".into()),
-                ],
-            },
-        ];
-        let mut settings = rocker_store::Settings {
-            theme: "custom".into(),
-            ..rocker_store::Settings::default()
-        };
+    fn endpoint_parser_preserves_ssh_and_socket_targets() {
+        assert!(matches!(
+            draft_kind("ssh://docker@example.test"),
+            ConnectionKind::Ssh { .. }
+        ));
+        assert!(matches!(
+            draft_kind("unix:///run/docker.sock"),
+            ConnectionKind::Socket { .. }
+        ));
+    }
 
-        let run = |ctx: &egui::Context, settings: &mut rocker_store::Settings| -> Option<Edit> {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(700.0, 640.0),
-                )),
-                ..Default::default()
-            };
-            let mut edit = None;
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    edit = settings_screen(
-                        ui,
-                        &pal,
-                        settings,
-                        &custom_themes,
-                        About {
-                            app_version: "0.0.0",
-                            engine: None,
-                            config_path: "/tmp/rocker/config.toml",
-                        },
-                    );
-                });
-            });
-            edit
-        };
-
-        let first = run(&ctx, &mut settings);
-        assert!(
-            first.is_some_and(|edit| edit.theme_changed),
-            "an empty selection must be repaired to a real installed theme"
+    #[test]
+    fn kubeconfig_parser_reads_context_metadata_without_credentials() {
+        let contexts = parse_kubeconfig_contexts(
+            r#"
+current-context: local-dev
+contexts:
+  - context:
+      cluster: docker-desktop
+      user: docker-desktop
+    name: local-dev
+  - context:
+      cluster: staging
+      user: deployer
+    name: staging
+users:
+  - name: deployer
+    user:
+      token: secret-not-read
+"#,
+            "Default kubeconfig",
+            "/tmp/config",
         );
-        assert_eq!(settings.theme_extension.as_deref(), Some("acme.mono"));
-        assert_eq!(settings.theme_variant.as_deref(), Some("only"));
 
-        let second = run(&ctx, &mut settings);
-        assert!(
-            second.is_none(),
-            "a settled selection with no pointer input must report no further change"
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].name, "local-dev");
+        assert!(contexts[0].current);
+    }
+
+    #[test]
+    fn kubeconfig_parser_reads_rancher_desktop_context_ordering() {
+        let contexts = parse_kubeconfig_contexts(
+            r#"
+contexts:
+  - name: rancher-desktop
+    context:
+      cluster: rancher-desktop
+      user: rancher-desktop
+current-context: rancher-desktop
+"#,
+            "Default kubeconfig",
+            "/tmp/config",
         );
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].name, "rancher-desktop");
     }
 }

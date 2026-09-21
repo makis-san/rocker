@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use rocker_core::{Connection, Group};
+use rocker_core::{Connection, Group, KubernetesWorkloadRef};
 
 use crate::paths::AppPaths;
 use crate::{Result, StoreError};
@@ -12,6 +12,12 @@ use crate::{Result, StoreError};
 pub struct Config {
     pub settings: Settings,
     pub connections: Vec<Connection>,
+    /// Extra kubeconfig files to include alongside the current device's
+    /// default kubeconfig and any paths named by `KUBECONFIG`.
+    pub kubernetes_kubeconfigs: Vec<KubernetesKubeconfig>,
+    /// Managed workloads Rocker scaled to zero, with their replica count kept
+    /// so a later Start restores the workload rather than guessing a value.
+    pub kubernetes_paused_workloads: Vec<PausedKubernetesWorkload>,
     pub groups: Vec<Group>,
     /// Signed extension catalogs the user has chosen to browse.
     pub extension_registries: Vec<ExtensionRegistrySource>,
@@ -22,10 +28,34 @@ impl Default for Config {
         Self {
             settings: Settings::default(),
             connections: vec![Connection::local_default()],
+            kubernetes_kubeconfigs: Vec::new(),
+            kubernetes_paused_workloads: Vec::new(),
             groups: Vec::new(),
             extension_registries: vec![ExtensionRegistrySource::official()],
         }
     }
+}
+
+/// A workload paused through Rocker’s Kubernetes controls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PausedKubernetesWorkload {
+    /// The workload that was scaled down.
+    #[serde(flatten)]
+    pub workload: KubernetesWorkloadRef,
+    /// Replica count immediately before Rocker paused the workload.
+    pub replicas: u32,
+}
+
+/// An additional local kubeconfig file selected in Kubernetes settings.
+///
+/// Rocker reads contexts from this file on the current device. Credentials
+/// remain in the kubeconfig and never cross an extension boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesKubeconfig {
+    /// Human-friendly source name shown in Settings.
+    pub name: String,
+    /// Absolute or home-relative path to a kubeconfig YAML file.
+    pub path: String,
 }
 
 /// A user-trusted extension registry.
@@ -89,6 +119,12 @@ pub struct Settings {
     pub start_minimized: bool,
     /// Register Rocker to start automatically when you log in.
     pub open_at_login: bool,
+    /// Query discovered Kubernetes contexts for pods and usage. Off by
+    /// default: enabling it queries every context in every kubeconfig on
+    /// this device, which can reach production clusters and trigger
+    /// exec-credential plugins (cloud auth, MFA) on every launch.
+    #[serde(default)]
+    pub kubernetes_enabled: bool,
 }
 
 impl Default for Settings {
@@ -102,6 +138,7 @@ impl Default for Settings {
             minimize_to_tray: true,
             start_minimized: false,
             open_at_login: false,
+            kubernetes_enabled: false,
         }
     }
 }
@@ -150,5 +187,6 @@ mod tests {
             cfg.extension_registries,
             vec![ExtensionRegistrySource::official()]
         );
+        assert!(cfg.kubernetes_paused_workloads.is_empty());
     }
 }
