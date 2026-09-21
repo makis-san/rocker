@@ -66,8 +66,15 @@ impl LocalDocker {
                 120,
                 bollard::API_DEFAULT_VERSION,
             ),
+            #[cfg(unix)]
             ConnectionKind::Ssh { uri } => {
                 bollard::Docker::connect_with_ssh(uri, 120, bollard::API_DEFAULT_VERSION, None)
+            }
+            #[cfg(not(unix))]
+            ConnectionKind::Ssh { .. } => {
+                return Err(EngineError::Unreachable(
+                    "SSH connections are only available on Unix".to_string(),
+                ));
             }
         }
         .map_err(|e| EngineError::Unreachable(e.to_string()))?;
