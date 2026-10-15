@@ -29,7 +29,7 @@ fn isolated_host_emits_intents_and_completes_requests() {
     .expect("script is written");
 
     let mut host = HostProcess::spawn(
-        env!("CARGO_BIN_EXE_rocker-ext-host"),
+        env!("CARGO_BIN_EXE_rocker-ext-host-test-helper"),
         extension.path(),
         &[Capability::ContainersRead, Capability::Notifications],
     )
@@ -93,7 +93,7 @@ fn supervisor_activates_enabled_extensions_and_returns_intents() {
         .expect("settings save");
 
     let mut supervisor = ExtensionSupervisor::new(
-        env!("CARGO_BIN_EXE_rocker-ext-host"),
+        env!("CARGO_BIN_EXE_rocker-ext-host-test-helper"),
         std::sync::Arc::new(NoDataSource),
     );
     supervisor
@@ -202,7 +202,7 @@ fn component_extension_activates_and_renders_a_panel_through_the_isolated_host()
         .expect("settings save");
 
     let mut supervisor = ExtensionSupervisor::new(
-        env!("CARGO_BIN_EXE_rocker-ext-host"),
+        env!("CARGO_BIN_EXE_rocker-ext-host-test-helper"),
         std::sync::Arc::new(NoDataSource),
     );
     supervisor

@@ -16,7 +16,7 @@ authors.workspace = true
 dist = false
 
 [[bin]]
-name = "rocker-ext-host"
+name = "rocker-ext-host-test-helper"
 path = "src/bin/main.rs"
 
 [package.metadata.wix]

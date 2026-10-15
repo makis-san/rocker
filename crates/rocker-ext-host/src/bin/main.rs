@@ -1,5 +1,5 @@
 // This crate's own binary target, kept only so `cargo test -p rocker-ext-host`
-// can spawn `CARGO_BIN_EXE_rocker-ext-host` for process-isolation tests. The
+// can spawn `CARGO_BIN_EXE_rocker-ext-host-test-helper` for process-isolation tests. The
 // build the app ships uses `rocker`'s bin wrapper, which `include!`s
 // `rocker-ext-host.rs` into the main distribution package instead.
 #[path = "rocker-ext-host.rs"]

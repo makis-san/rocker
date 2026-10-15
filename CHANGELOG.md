@@ -8,7 +8,7 @@ and this project adheres to
 
 ## [Unreleased]
 
-## [0.3.3] - 2026-10-15
+## [0.3.4] - 2026-10-15
 
 ### Added
 
@@ -16,8 +16,6 @@ and this project adheres to
   after a warning and explicit confirmation. Catalog and package signatures are
   skipped for that registry; package checksum, size, manifest, and extraction
   checks remain active. Registries with signatures disabled show a warning.
-
-## [0.3.2] - 2026-10-15
 
 ### Fixed
 
@@ -27,6 +25,8 @@ and this project adheres to
   load. Custom registry keys and locations are preserved.
 - Configuration and signature verification now share one compiled-in registry
   identity, with regression coverage against the published signed catalog.
+- The extension host's process-test helper has a distinct executable name,
+  preventing collisions with the shipped helper during Windows release linking.
 
 ## [0.2.1] - 2026-09-11
 
