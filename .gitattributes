@@ -1,0 +1,2 @@
+# Detached signatures authenticate exact bytes; never rewrite these on checkout.
+/crates/rocker-ext-host/tests/fixtures/official-registry/* -text
