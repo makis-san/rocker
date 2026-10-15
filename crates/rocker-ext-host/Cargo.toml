@@ -26,6 +26,7 @@ license = false
 eula = false
 
 [dependencies]
+rocker-core = { workspace = true }
 rhai = { version = "1.20", default-features = false, features = ["std"] }
 rocker-ext-api = { workspace = true }
 serde = { workspace = true }
@@ -42,5 +43,6 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ureq = "3"
 
 [dev-dependencies]
+rocker-store = { workspace = true }
 tempfile = "3.27.0"
 wat = "1.243.0"

@@ -27,19 +27,10 @@ const MAX_PACKAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 256;
 const MAX_UNPACKED_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Stable identifier for Rocker's built-in, curated extension registry.
-pub const OFFICIAL_REGISTRY_ID: &str = "official";
-/// Detached signed index served by the official GitHub registry repository.
-pub const OFFICIAL_REGISTRY_INDEX_URL: &str =
-    "https://raw.githubusercontent.com/makis-san/rocker-registry/main/index-v1.json";
-/// Detached signature corresponding to [`OFFICIAL_REGISTRY_INDEX_URL`].
-pub const OFFICIAL_REGISTRY_SIGNATURE_URL: &str =
-    "https://raw.githubusercontent.com/makis-san/rocker-registry/main/index-v1.sig";
-/// Pinned Ed25519 public key for the official registry index and packages.
-pub const OFFICIAL_REGISTRY_PUBLIC_KEY: [u8; 32] = [
-    0xa1, 0xd8, 0x55, 0x7a, 0x08, 0x06, 0x5f, 0x34, 0x9b, 0x96, 0x99, 0x9a, 0x69, 0xd4, 0x3c, 0xc4,
-    0x90, 0x0a, 0xad, 0x0b, 0x8a, 0x21, 0x6d, 0xd3, 0x2e, 0xb0, 0x22, 0xa2, 0x4b, 0xf7, 0x45, 0xf6,
-];
+pub use rocker_core::registry::{
+    OFFICIAL_REGISTRY_ID, OFFICIAL_REGISTRY_INDEX_URL, OFFICIAL_REGISTRY_PUBLIC_KEY,
+    OFFICIAL_REGISTRY_SIGNATURE_URL,
+};
 
 /// Build Rocker's built-in curated registry with its compiled-in trust root.
 pub fn official_registry() -> Result<TrustedRegistry> {
@@ -494,6 +485,60 @@ mod tests {
         let registry = official_registry().expect("official registry is valid");
 
         assert_eq!(registry.id(), OFFICIAL_REGISTRY_ID);
+    }
+
+    // Exact published bytes from rocker-registry commit
+    // 043f2037ba9c80cebf07ce87d345af4e809c788e; keep the detached signature.
+    const OFFICIAL_INDEX: &[u8] =
+        include_bytes!("../tests/fixtures/official-registry/index-v1.json");
+    const OFFICIAL_SIGNATURE: &str =
+        include_str!("../tests/fixtures/official-registry/index-v1.sig");
+
+    fn verify_configured_official_registry(config: &rocker_store::config::Config) {
+        let source = &config.extension_registries[0];
+        let official = official_registry().expect("official registry is valid");
+        assert_eq!(source.id, official.id());
+        assert_eq!(source.index_url, official.index_url());
+        assert_eq!(source.signature_url, official.signature_url());
+        let expected_key: String = OFFICIAL_REGISTRY_PUBLIC_KEY
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(source.public_key, expected_key);
+        RegistryIndex::verify(OFFICIAL_INDEX, OFFICIAL_SIGNATURE, official.verifying_key())
+            .expect("published catalog verifies with the configured default key");
+    }
+
+    #[test]
+    fn fresh_install_and_saved_config_verify_published_official_catalog() {
+        let root = tempdir().expect("temporary config directory");
+        let paths = rocker_store::paths::AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+        };
+        let config = rocker_store::config::Config::load(&paths).expect("fresh config loads");
+        verify_configured_official_registry(&config);
+        config.save(&paths).expect("config saves");
+        let reloaded = rocker_store::config::Config::load(&paths).expect("saved config loads");
+        verify_configured_official_registry(&reloaded);
+    }
+
+    #[test]
+    fn existing_install_repairs_the_old_default_registry_key() {
+        let root = tempdir().expect("temporary config directory");
+        let paths = rocker_store::paths::AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+        };
+        let mut config = rocker_store::config::Config::default();
+        config.extension_registries[0].public_key =
+            "21bc5889a2e5293ee6a22da5678f0497e90b2c67a2c55fd79f1ca0434af21e0a".into();
+        config.save(&paths).expect("legacy config saves");
+        let migrated = rocker_store::config::Config::load(&paths).expect("legacy config loads");
+        verify_configured_official_registry(&migrated);
+        migrated.save(&paths).expect("migrated config saves");
+        let reloaded = rocker_store::config::Config::load(&paths).expect("migrated config loads");
+        verify_configured_official_registry(&reloaded);
     }
 
     fn signature(bytes: &[u8]) -> String {

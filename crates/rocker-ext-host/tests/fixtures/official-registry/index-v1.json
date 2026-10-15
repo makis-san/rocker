@@ -1,0 +1,29 @@
+{
+  "format": 1,
+  "releases": [
+    {
+      "id": "catppuccin.theme",
+      "version": "0.1.0",
+      "package_url": "https://github.com/makis-san/rocker-registry/raw/main/packages/catppuccin.theme-0.1.0.rockerext",
+      "sha256": "0ee2657242bb5bf74a0877205803f2432dc91b81c28bf9f65750a4119d54e5a4",
+      "signature": "b27vXTK47NQ92MWGKBTQPxPza+82zUA1+EA/+z9bqCa6QPxZajJyAvuOBfrDxe9DDUCXF0krplXGLhKC/5ywCQ==",
+      "min_rocker_version": null
+    },
+    {
+      "id": "catppuccin.theme",
+      "version": "0.2.0",
+      "package_url": "https://github.com/makis-san/rocker-registry/raw/main/packages/catppuccin.theme-0.2.0.rockerext",
+      "sha256": "3d5762e32cab48883d9f660d59478b0f8a8adaea7b08b4cdb49e3c628ffbed08",
+      "signature": "lqNh3aN+oFEiRH7wi8ZE0guz7fid2S6fs++ezTDmgjJYydvcitfTpsZWuCHoFR+HuR3rhbM3EHZmnO8wd9ruBw==",
+      "min_rocker_version": null
+    },
+    {
+      "id": "rocker.kubernetes",
+      "version": "0.1.0",
+      "package_url": "https://github.com/makis-san/rocker-registry/raw/main/packages/rocker.kubernetes-0.1.0.rockerext",
+      "sha256": "defd5d6c54432b70f8e4791f53046f51cf77ce6f7b4bce0487d480389f53f23b",
+      "signature": "9A7vf/YoK8qROZynGo1+425pW38cuf5AOtJhKnlaaN+2rDZGP5vRC6L8LciOCKY6Ui5EScFWMQgo2bP87HQhCg==",
+      "min_rocker_version": null
+    }
+  ]
+}

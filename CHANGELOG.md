@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-15
+
+### Fixed
+
+- Fresh installations now use the correct official extension registry signing
+  key, fixing the invalid-signature error when browsing extensions.
+- Existing configurations using the old official default key are repaired on
+  load. Custom registry keys and locations are preserved.
+- Configuration and signature verification now share one compiled-in registry
+  identity, with regression coverage against the published signed catalog.
+
 ## [0.2.1] - 2026-09-11
 
 ### Changed

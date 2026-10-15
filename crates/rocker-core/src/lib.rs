@@ -9,6 +9,7 @@ pub mod container;
 pub mod detail;
 pub mod group;
 pub mod kubernetes;
+pub mod registry;
 pub mod stat;
 
 pub use audit::ExecAudit;

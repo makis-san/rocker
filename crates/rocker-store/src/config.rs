@@ -79,15 +79,13 @@ impl ExtensionRegistrySource {
     /// Rocker's curated registry, enabled for new configurations.
     pub fn official() -> Self {
         Self {
-            id: "official".to_string(),
-            index_url:
-                "https://raw.githubusercontent.com/makis-san/rocker-registry/main/index-v1.json"
-                    .to_string(),
-            signature_url:
-                "https://raw.githubusercontent.com/makis-san/rocker-registry/main/index-v1.sig"
-                    .to_string(),
-            public_key: "21bc5889a2e5293ee6a22da5678f0497e90b2c67a2c55fd79f1ca0434af21e0a"
-                .to_string(),
+            id: rocker_core::registry::OFFICIAL_REGISTRY_ID.to_string(),
+            index_url: rocker_core::registry::OFFICIAL_REGISTRY_INDEX_URL.to_string(),
+            signature_url: rocker_core::registry::OFFICIAL_REGISTRY_SIGNATURE_URL.to_string(),
+            public_key: rocker_core::registry::OFFICIAL_REGISTRY_PUBLIC_KEY
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         }
     }
 }
@@ -148,9 +146,30 @@ impl Config {
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let file = paths.config_file();
         match std::fs::read_to_string(&file) {
-            Ok(text) => toml::from_str(&text).map_err(|e| StoreError::Parse(e.to_string())),
+            Ok(text) => {
+                let mut config: Self =
+                    toml::from_str(&text).map_err(|e| StoreError::Parse(e.to_string()))?;
+                config.migrate_official_registry_key();
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
+    // Repair only the exact default shipped before the registry key rotation.
+    // Custom keys, URLs, and explicitly removed registries remain user choices.
+    fn migrate_official_registry_key(&mut self) {
+        let official = ExtensionRegistrySource::official();
+        for source in &mut self.extension_registries {
+            if source.id == official.id
+                && source.index_url == official.index_url
+                && source.signature_url == official.signature_url
+                && source.public_key
+                    == "21bc5889a2e5293ee6a22da5678f0497e90b2c67a2c55fd79f1ca0434af21e0a"
+            {
+                source.public_key.clone_from(&official.public_key);
+            }
         }
     }
 
@@ -166,6 +185,33 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_migration_preserves_user_trust_choices() {
+        let mut legacy = ExtensionRegistrySource::official();
+        legacy.public_key =
+            "21bc5889a2e5293ee6a22da5678f0497e90b2c67a2c55fd79f1ca0434af21e0a".into();
+        let mut custom_id = legacy.clone();
+        custom_id.id = "custom".into();
+        let mut custom_index = legacy.clone();
+        custom_index.index_url = "https://example.com/index.json".into();
+        let mut custom_signature = legacy.clone();
+        custom_signature.signature_url = "https://example.com/index.sig".into();
+        let mut custom_key = legacy;
+        custom_key.public_key = "07".repeat(32);
+        for registries in [
+            vec![],
+            vec![custom_id, custom_index, custom_signature, custom_key],
+            vec![ExtensionRegistrySource::official()],
+        ] {
+            let mut config = Config {
+                extension_registries: registries.clone(),
+                ..Config::default()
+            };
+            config.migrate_official_registry_key();
+            assert_eq!(config.extension_registries, registries);
+        }
+    }
 
     /// A config written before the tray/autostart keys existed still loads,
     /// with the new keys taking their defaults rather than `false`.
