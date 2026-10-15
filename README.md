@@ -92,6 +92,19 @@ Start-menu shortcut, an "Apps & features" entry, and both binaries under
 `%LOCALAPPDATA%\Programs\Rocker`. A `.msi` is also
 attached to each release for a double-click install.
 
+### Registry signature settings
+
+Extension registries verify catalog and package signatures by default. In
+**Extensions → Extensions Registry**, each registry has an **Ignore signatures**
+checkbox. Enabling it requires confirming a warning with **Enable anyway**;
+Cancel leaves verification enabled. The choice is saved for that registry only.
+Uncheck it to restore verification.
+
+Registries with this setting enabled show a warning, and extensions installed
+without signature verification retain a “signature unverified” origin label.
+Package checksums, size limits, manifest validation, and safe extraction still
+apply. A checksum from an unverified catalog does not authenticate its publisher.
+
 ### Other ways
 
 - **Homebrew** (macOS / Linux): `brew install makis-san/tap/rocker` — installs

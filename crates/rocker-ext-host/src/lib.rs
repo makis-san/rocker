@@ -342,16 +342,23 @@ struct ExtensionStateFile {
     provenance: BTreeMap<String, RegistryProvenance>,
 }
 
-/// Immutable origin information recorded after a verified registry install.
+/// Immutable origin information recorded after a registry install.
 ///
 /// It lets a future update flow compare the publisher and exact package hash
 /// before changing an extension's executable files or permission decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryProvenance {
-    /// Stable identifier of the trusted registry that signed the release.
+    /// Stable identifier of the registry that supplied the release.
     pub registry_id: String,
     /// SHA-256 digest of the installed package, lowercase hexadecimal.
     pub package_sha256: String,
+    /// Whether signatures were required when this package was installed.
+    #[serde(default = "default_signature_verified")]
+    pub signature_verified: bool,
+}
+
+fn default_signature_verified() -> bool {
+    true
 }
 
 /// An extension discovered in the local installation directory.
@@ -439,7 +446,7 @@ impl ExtensionRegistry {
         release: &RegistryRelease,
         package: &[u8],
     ) -> Result<InstalledExtension> {
-        release.verify_package(package, registry.verifying_key())?;
+        registry.verify_package(release, package)?;
         if let Some(installed) = self.installed_version(&release.id)? {
             match registry::compare_versions(&release.version, &installed) {
                 Some(std::cmp::Ordering::Greater) => {}
@@ -476,6 +483,7 @@ impl ExtensionRegistry {
                 RegistryProvenance {
                     registry_id: registry.id().to_owned(),
                     package_sha256: release.sha256.clone(),
+                    signature_verified: registry.verifies_signatures(),
                 },
             );
             self.save()?;
@@ -499,7 +507,7 @@ impl ExtensionRegistry {
         Ok(Some(read_manifest(&destination)?.version))
     }
 
-    /// Return the verified registry origin recorded for an installed extension.
+    /// Return the recorded registry origin recorded for an installed extension.
     pub fn provenance(&self, extension_id: &str) -> Option<&RegistryProvenance> {
         self.state.provenance.get(extension_id)
     }

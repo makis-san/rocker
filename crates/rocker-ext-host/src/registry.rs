@@ -3,6 +3,8 @@
 //! A registry is deliberately only a transport and discovery mechanism. The
 //! client authenticates the exact index bytes and each package with the
 //! registry's pinned Ed25519 key before `ExtensionRegistry` extracts anything.
+//! A per-registry, user-confirmed opt-out skips signatures while retaining
+//! format, checksum, size, manifest, and archive extraction checks.
 
 use std::{
     cmp::Ordering,
@@ -49,6 +51,7 @@ pub struct TrustedRegistry {
     index_url: String,
     signature_url: String,
     verifying_key: VerifyingKey,
+    ignore_signatures: bool,
 }
 
 impl TrustedRegistry {
@@ -76,7 +79,29 @@ impl TrustedRegistry {
             index_url,
             signature_url,
             verifying_key,
+            ignore_signatures: false,
         })
+    }
+
+    /// Opt out of catalog and package signatures for this registry only.
+    /// Callers should obtain explicit user confirmation before enabling this.
+    /// Package size, digest, manifest, and extraction checks still apply.
+    pub fn with_ignored_signatures(mut self, ignore: bool) -> Self {
+        self.ignore_signatures = ignore;
+        self
+    }
+
+    /// Whether this registry requires authenticated catalogs and packages.
+    pub fn verifies_signatures(&self) -> bool {
+        !self.ignore_signatures
+    }
+
+    pub(crate) fn verify_package(&self, release: &RegistryRelease, package: &[u8]) -> Result<()> {
+        release.verify_integrity(package)?;
+        if self.verifies_signatures() {
+            verify_signature(package, &release.signature, self.verifying_key())?;
+        }
+        Ok(())
     }
 
     /// Stable local identifier used for provenance records.
@@ -128,6 +153,15 @@ impl RegistryIndex {
         verifying_key: &VerifyingKey,
     ) -> Result<Self> {
         verify_signature(bytes, signature_base64, verifying_key)?;
+        Self::parse(bytes)
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_INDEX_BYTES {
+            return Err(HostError::Registry(
+                "registry index exceeds size limit".into(),
+            ));
+        }
         let index: Self = serde_json::from_slice(bytes)
             .map_err(|error| HostError::Registry(format!("index JSON: {error}")))?;
         index.validate()?;
@@ -203,7 +237,9 @@ pub struct RegistryRelease {
     pub package_url: String,
     /// Lowercase hexadecimal SHA-256 of the archive bytes.
     pub sha256: String,
-    /// Base64 Ed25519 signature over the archive bytes.
+    /// Base64 Ed25519 signature over the archive bytes. Required by the
+    /// default policy; may be absent when the user opts out for this registry.
+    #[serde(default)]
     pub signature: String,
     /// Optional minimum compatible Rocker version for the caller's install UI
     /// and compatibility policy.
@@ -215,6 +251,11 @@ impl RegistryRelease {
     /// Verify archive size, digest, and detached package signature before it
     /// can be extracted or inspected as an extension.
     pub fn verify_package(&self, package: &[u8], verifying_key: &VerifyingKey) -> Result<()> {
+        self.verify_integrity(package)?;
+        verify_signature(package, &self.signature, verifying_key)
+    }
+
+    fn verify_integrity(&self, package: &[u8]) -> Result<()> {
         self.validate()?;
         if package.len() > MAX_PACKAGE_BYTES {
             return Err(HostError::ArchiveTooLarge {
@@ -225,7 +266,7 @@ impl RegistryRelease {
         if digest != self.sha256 {
             return Err(HostError::PackageDigestMismatch);
         }
-        verify_signature(package, &self.signature, verifying_key)
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -277,6 +318,9 @@ where
         let index = self
             .transport
             .fetch(self.registry.index_url(), MAX_INDEX_BYTES)?;
+        if !self.registry.verifies_signatures() {
+            return RegistryIndex::parse(&index);
+        }
         let signature = self
             .transport
             .fetch(self.registry.signature_url(), MAX_SIGNATURE_BYTES)?;
@@ -291,7 +335,7 @@ where
         let package = self
             .transport
             .fetch(&release.package_url, MAX_PACKAGE_BYTES)?;
-        release.verify_package(&package, self.registry.verifying_key())?;
+        self.registry.verify_package(release, &package)?;
         Ok(package)
     }
 
@@ -845,6 +889,98 @@ mod tests {
         let verified = client.fetch_index().expect("index is verified");
 
         assert!(verified.releases.is_empty());
+    }
+
+    #[test]
+    fn ignored_signatures_skip_signature_fetch_for_only_the_opted_out_registry() {
+        let index = br#"{"format":1,"releases":[]}"#.to_vec();
+        let strict = trusted_test_registry();
+        assert!(strict.verifies_signatures());
+        let transport = MemoryTransport(BTreeMap::from([
+            (strict.index_url().to_owned(), index.clone()),
+            (
+                strict.signature_url().to_owned(),
+                b"invalid signature".to_vec(),
+            ),
+        ]));
+        let strict_client = RegistryClient::new(strict.clone(), transport);
+        assert!(matches!(
+            strict_client.fetch_index(),
+            Err(HostError::InvalidSignature)
+        ));
+        // No signature resource at all: opt-out must not even fetch it.
+        let unsigned_client = RegistryClient::new(
+            strict.clone().with_ignored_signatures(true),
+            MemoryTransport(BTreeMap::from([(strict.index_url().to_owned(), index)])),
+        );
+        assert!(unsigned_client
+            .fetch_index()
+            .expect("unsigned index loads")
+            .releases
+            .is_empty());
+        assert!(strict.verifies_signatures());
+        assert!(unsigned_client
+            .registry()
+            .clone()
+            .with_ignored_signatures(false)
+            .verifies_signatures());
+    }
+
+    #[test]
+    fn ignored_signatures_install_packages_but_keep_integrity_checks() {
+        let package = versioned_package("1.2.3");
+        let mut release = release(&package);
+        release.signature = "invalid signature".into();
+        let strict = trusted_test_registry();
+        let root = tempdir().expect("temporary extension directory");
+        let mut installed = crate::ExtensionRegistry::load(root.path().to_path_buf())
+            .expect("extension registry loads");
+        assert!(matches!(
+            installed.install_registry_package(&strict, &release, &package),
+            Err(HostError::InvalidSignature)
+        ));
+        let unsigned = strict.with_ignored_signatures(true);
+        let client = RegistryClient::new(
+            unsigned.clone(),
+            MemoryTransport(BTreeMap::from([(
+                release.package_url.clone(),
+                package.clone(),
+            )])),
+        );
+        client
+            .download_package(&release)
+            .expect("unsigned package downloads");
+        let mut corrupt = package.clone();
+        corrupt[0] ^= 1;
+        assert!(matches!(
+            installed.install_registry_package(&unsigned, &release, &corrupt),
+            Err(HostError::PackageDigestMismatch)
+        ));
+        installed
+            .install_registry_package(&unsigned, &release, &package)
+            .expect("unsigned package installs after opt-out");
+        assert!(
+            !installed
+                .provenance(&release.id)
+                .expect("provenance recorded")
+                .signature_verified
+        );
+    }
+
+    #[test]
+    fn ignored_signatures_still_reject_invalid_catalogs() {
+        let registry = trusted_test_registry().with_ignored_signatures(true);
+        for bytes in [
+            b"not JSON".to_vec(),
+            br#"{"format":2,"releases":[]}"#.to_vec(),
+            vec![b' '; MAX_INDEX_BYTES + 1],
+        ] {
+            let transport =
+                MemoryTransport(BTreeMap::from([(registry.index_url().to_owned(), bytes)]));
+            assert!(RegistryClient::new(registry.clone(), transport)
+                .fetch_index()
+                .is_err());
+        }
     }
 
     #[test]

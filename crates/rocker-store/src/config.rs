@@ -73,6 +73,10 @@ pub struct ExtensionRegistrySource {
     pub signature_url: String,
     /// Hex-encoded, 32-byte Ed25519 public key.
     pub public_key: String,
+    /// Skip catalog and package signatures for this registry, after user confirmation.
+    /// Size, digest, manifest, and extraction checks remain enabled.
+    #[serde(default)]
+    pub ignore_signatures: bool,
 }
 
 impl ExtensionRegistrySource {
@@ -86,6 +90,7 @@ impl ExtensionRegistrySource {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
+            ignore_signatures: false,
         }
     }
 }
@@ -211,6 +216,22 @@ mod tests {
             config.migrate_official_registry_key();
             assert_eq!(config.extension_registries, registries);
         }
+    }
+
+    #[test]
+    fn registry_signature_opt_out_defaults_off_and_round_trips_per_registry() {
+        let mut config = Config::default();
+        let text = toml::to_string(&config).expect("config serializes");
+        let legacy = text.replace("ignore_signatures = false\n", "");
+        let loaded: Config = toml::from_str(&legacy).expect("legacy registry loads");
+        assert!(!loaded.extension_registries[0].ignore_signatures);
+        let mut custom = ExtensionRegistrySource::official();
+        custom.id = "custom".into();
+        custom.ignore_signatures = true;
+        config.extension_registries.push(custom);
+        let text = toml::to_string(&config).expect("config serializes");
+        let loaded: Config = toml::from_str(&text).expect("config loads");
+        assert_eq!(loaded.extension_registries, config.extension_registries);
     }
 
     /// A config written before the tray/autostart keys existed still loads,

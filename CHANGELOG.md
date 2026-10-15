@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-15
+
+### Added
+
+- Per-registry “Ignore signatures” setting, disabled by default and enabled only
+  after a warning and explicit confirmation. Catalog and package signatures are
+  skipped for that registry; package checksum, size, manifest, and extraction
+  checks remain active. Registries with signatures disabled show a warning.
+
 ## [0.3.2] - 2026-10-15
 
 ### Fixed

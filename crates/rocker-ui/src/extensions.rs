@@ -97,6 +97,7 @@ struct RegistryDraft {
     index_url: String,
     signature_url: String,
     public_key: String,
+    pending_ignore_signatures: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +248,7 @@ impl ExtensionsScreen {
 fn trusted_registry(source: &ExtensionRegistrySource) -> Result<TrustedRegistry, HostError> {
     let key = decode_public_key(&source.public_key).map_err(HostError::Registry)?;
     TrustedRegistry::new(&source.id, &source.index_url, &source.signature_url, key)
+        .map(|registry| registry.with_ignored_signatures(source.ignore_signatures))
 }
 
 /// Kick off a background fetch of one registry's signed catalog. The thread
@@ -486,6 +488,33 @@ pub fn extensions_screen(
             Some(false) => screen.pending_delete = None,
             None => {}
         }
+    }
+
+    if let Some(id) = screen.registry_draft.pending_ignore_signatures.clone() {
+        let title = format!("Ignore signatures for {id}?");
+        match confirm_dialog(
+            ui.ctx(),
+            pal,
+            &title,
+            "Warning: Rocker will stop verifying catalog and package signatures for this registry. Modified catalogs or extensions could run malicious code or access data you grant them. HTTPS, package size limits, and checksums still apply, but cannot prove who published an extension.",
+            "Enable anyway",
+        ) {
+            Some(true) => {
+                if let Some(source) = registries.iter_mut().find(|source| source.id == id) {
+                    source.ignore_signatures = true;
+                    registries_changed = true;
+                }
+                screen.registry_draft.pending_ignore_signatures = None;
+            }
+            Some(false) => screen.registry_draft.pending_ignore_signatures = None,
+            None => {}
+        }
+    }
+    if registries_changed {
+        // Discard results fetched under the previous trust policy, including
+        // background installs that have not yet been applied to disk.
+        screen.catalogs.clear();
+        screen.installs.clear();
     }
 
     (changed || registries_changed || error.is_some()).then_some(Edit {
@@ -755,6 +784,12 @@ fn release_card(
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            if source.ignore_signatures {
+                ui.label(
+                    RichText::new("Warning: signatures are ignored for this registry.")
+                        .color(pal.unhealthy),
+                );
+            }
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -867,10 +902,21 @@ fn registry_sources_section(
     ui.add_space(8.0);
 
     let mut remove = None;
-    for (index, source) in registries.iter().enumerate() {
+    for (index, source) in registries.iter_mut().enumerate() {
         if registry_catalog_card(ui, pal, source, true) {
             remove = Some(index);
         }
+        ui.push_id(&source.id, |ui| {
+            let mut ignore = source.ignore_signatures;
+            if ui.checkbox(&mut ignore, "Ignore signatures").changed() {
+                if ignore {
+                    draft.pending_ignore_signatures = Some(source.id.clone());
+                } else {
+                    source.ignore_signatures = false;
+                    changed = true;
+                }
+            }
+        });
         ui.add_space(6.0);
     }
     if let Some(index) = remove {
@@ -951,6 +997,12 @@ fn registry_catalog_card(
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            if source.ignore_signatures {
+                ui.label(
+                    RichText::new("Warning: signatures are ignored for this registry.")
+                        .color(pal.unhealthy),
+                );
+            }
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -1022,6 +1074,7 @@ fn registry_from_draft(draft: &RegistryDraft) -> Result<ExtensionRegistrySource,
         index_url: draft.index_url.trim().to_owned(),
         signature_url: draft.signature_url.trim().to_owned(),
         public_key: draft.public_key.trim().to_ascii_lowercase(),
+        ignore_signatures: false,
     })
 }
 
@@ -1118,7 +1171,12 @@ fn extension_origin(
         .iter()
         .find(|source| source.id == provenance.registry_id)
         .and_then(|source| github_repository(&source.index_url).map(|(_, url)| url));
-    (provenance.registry_id.clone(), github_url)
+    let label = if provenance.signature_verified {
+        provenance.registry_id.clone()
+    } else {
+        format!("{} (signature unverified)", provenance.registry_id)
+    };
+    (label, github_url)
 }
 
 /// One compact installed-extension card. Enablement is persisted immediately
@@ -1585,6 +1643,7 @@ mod tests {
             index_url: "https://example.com/index-v1.json".into(),
             signature_url: "https://example.com/index-v1.sig".into(),
             public_key: "0".repeat(64),
+            ignore_signatures: false,
         };
         let key = "test::example.bad@1.0.0".to_string();
         let state = Arc::new(Mutex::new(InstallState::Downloaded(Box::new(
@@ -1640,12 +1699,75 @@ mod tests {
     }
 
     #[test]
+    fn signature_opt_out_requires_confirmation_and_applies_to_one_registry() {
+        for (button, enabled) in [("Cancel", false), ("Enable anyway", true)] {
+            let ctx = egui::Context::default();
+            let pal = crate::style::install(&ctx, &rocker_theme::Theme::dark());
+            let mut screen = screen_with(vec![], vec![]);
+            screen.tab = ExtensionsTab::Registries;
+            screen.registry_draft.pending_ignore_signatures = Some("official".into());
+            let mut other = ExtensionRegistrySource::official();
+            other.id = "other".into();
+            let mut registries = vec![ExtensionRegistrySource::official(), other];
+            let mut frame = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(900.0, 800.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            extensions_screen(ui, &pal, &mut screen, &mut registries);
+                        });
+                    },
+                )
+            };
+            // Let egui settle the dialog's position before sending a click.
+            let _ = frame(vec![]);
+            let output = frame(vec![]);
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == button => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .expect("confirmation button is visible");
+            let _ = frame(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            let _ = frame(vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            assert_eq!(registries[0].ignore_signatures, enabled);
+            assert!(!registries[1].ignore_signatures);
+            assert!(screen.registry_draft.pending_ignore_signatures.is_none());
+        }
+    }
+
+    #[test]
     fn registry_draft_accepts_a_signed_https_source() {
         let draft = RegistryDraft {
             id: "community".into(),
             index_url: "https://registry.example/index-v1.json".into(),
             signature_url: "https://registry.example/index-v1.sig".into(),
             public_key: "21bc5889a2e5293ee6a22da5678f0497e90b2c67a2c55fd79f1ca0434af21e0a".into(),
+            ..RegistryDraft::default()
         };
 
         let source = registry_from_draft(&draft).expect("valid registry draft");
