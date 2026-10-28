@@ -15,7 +15,7 @@ rocker-ext-host = { workspace = true }
 rocker-store = { workspace = true }
 rocker-term = { workspace = true }
 rocker-theme = { workspace = true }
-eframe = "0.33.3"
+eframe = "0.37.0"
 egui = "0.33.3"
 # The Stats tab's history chart. 0.34 tracks egui 0.33 (its version no longer
 # matches egui's), so this resolves to a single egui in the tree.
