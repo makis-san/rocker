@@ -35,7 +35,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 toml = "1.1.5"
 # The patched 36.x LTS supports our Rust 1.90 MSRV; newer patched lines require 1.95.
-wasmtime = { version = "36.0.19", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "50.0.0", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 base64 = "0.23.1"
 ed25519-dalek = "3.0.0"
 sha2 = "0.11.0"
