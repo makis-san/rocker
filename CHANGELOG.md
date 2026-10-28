@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-27
+
+### Security
+
+- Refresh vulnerable Wasmtime, ZIP, and TLS dependencies; use patched Wasmtime
+  36.x LTS to preserve the Rust 1.90 minimum. Update Tokio and replace a yanked
+  Windows clipboard dependency. Adapt ZIP filename decoding and verify archive
+  symlink rejection.
+- Audit dependencies daily in CI and check for weekly dependency updates with
+  Dependabot. See `docs/dependency-security.md` for remaining upstream warnings.
+
 ## [0.3.4] - 2026-10-15
 
 ### Added

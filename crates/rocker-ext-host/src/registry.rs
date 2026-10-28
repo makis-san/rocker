@@ -392,12 +392,16 @@ pub(crate) fn extract_package(package: &[u8], destination: &Path) -> Result<()> 
         let mut file = archive
             .by_index(index)
             .map_err(|error| HostError::Archive(error.to_string()))?;
-        let path = safe_archive_path(file.name())?;
+        let name = file
+            .name()
+            .map_err(|error| HostError::Archive(error.to_string()))?
+            .into_owned();
+        let path = safe_archive_path(&name)?;
         if !paths.insert(path.clone()) {
-            return Err(HostError::UnsafeArchiveEntry(file.name().to_owned()));
+            return Err(HostError::UnsafeArchiveEntry(name));
         }
         if is_symbolic_link(file.unix_mode()) {
-            return Err(HostError::UnsafeArchiveEntry(file.name().to_owned()));
+            return Err(HostError::UnsafeArchiveEntry(name));
         }
         if file.is_dir() {
             fs::create_dir_all(destination.join(path))?;
@@ -699,6 +703,25 @@ mod tests {
             extract_package(&package, destination.path()).expect_err("traversal is rejected");
 
         assert!(matches!(error, HostError::UnsafeArchiveEntry(_)));
+    }
+
+    #[test]
+    fn extract_package_rejects_symlink_to_outside_destination() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            writer
+                .add_symlink("escape", "../outside", SimpleFileOptions::default())
+                .expect("test symlink writes");
+            writer.finish().expect("test archive finishes");
+        }
+        let destination = tempdir().expect("destination exists");
+
+        let error = extract_package(&cursor.into_inner(), destination.path())
+            .expect_err("symlink is rejected");
+
+        assert!(matches!(error, HostError::UnsafeArchiveEntry(_)));
+        assert!(!destination.path().join("escape").exists());
     }
 
     fn trusted_test_registry() -> TrustedRegistry {

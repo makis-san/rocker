@@ -14,7 +14,7 @@ rocker-store = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net", "process"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net", "process"] }
 tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
